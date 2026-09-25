@@ -19,6 +19,26 @@ const pendingWriteCodex = fileURLToPath(new URL("../../test/pending-write-codex.
 const lateResponseCodex = fileURLToPath(new URL("../../test/late-response-codex.mjs", import.meta.url));
 const duplicateRequestCodex = fileURLToPath(new URL("../../test/duplicate-request-codex.mjs", import.meta.url));
 
+test("history response above 10 MiB remains a fatal app-server inbound limitation", async () => {
+  const manager = new AppServerManager(undefined, {
+    executable: process.execPath,
+    prefixArgs: [fakeCodex],
+    requestTimeoutMs: 5_000,
+  });
+  try {
+    await assert.rejects(
+      new ControlSurface(manager).call("codex_threads", {
+        thread_id: "thread-big", history: { kind: "turns", cursor: "oversized-inbound", limit: 1 },
+      }),
+      /app-server JSONL line exceeded 10 MiB/,
+    );
+    await assert.rejects(manager.request("thread/read", { threadId: "thread-big", includeTurns: false }),
+      /unavailable and will not be auto-restarted/);
+  } finally {
+    await manager.close();
+  }
+});
+
 function delay(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
@@ -122,11 +142,21 @@ test("control surface starts asynchronously, steers the same turn, uses raw requ
     );
 
     await delay(30);
-    const completed = await control.call("codex_observe", {
-      thread_id: "thread-1",
-    }) as Record<string, unknown>;
-    assert.equal(completed.runtime_status, "completed");
-    assert.equal((completed.terminal as Record<string, unknown>).final_result, "FAKE_FINAL");
+    let cursor = active.next_cursor as number;
+    let observedFinal: string | undefined;
+    for (let attempt = 0; attempt < 10 && observedFinal === undefined; attempt += 1) {
+      const completed = await control.call("codex_observe", {
+        thread_id: "thread-1", cursor,
+      }) as Record<string, unknown>;
+      assert.equal(completed.runtime_status, "completed");
+      const events = (completed.events ?? []) as Array<Record<string, unknown>>;
+      const message = events.find((entry) => entry.type === "message");
+      observedFinal = (message?.text ?? (completed.terminal as Record<string, unknown>)?.final_result) as string | undefined;
+      const next = completed.next_cursor as number;
+      if (next === cursor) break;
+      cursor = next;
+    }
+    assert.equal(observedFinal, "FAKE_FINAL");
   } finally {
     await manager.close();
   }

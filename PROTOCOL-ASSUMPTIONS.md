@@ -24,6 +24,12 @@ LCB remains a thin supervisory MCP adapter. The native Codex thread/session is t
 | App-server responses are extensible. Bridge validates required envelopes/fields where needed, then applies bounded sanitization/projection; model entries are not closed-world rejected merely for future fields. | Upstream extensibility assumption + Bridge defensive policy | `src/tools.ts`: `responseRecord`, `modelListPage`, `sanitizedModelEntry`, `#models`; `test/tools.test.ts`: malformed bounds and preserved future-field case | Verified by current tests | Recheck required-field validation and transport bounds when upstream adds nesting, larger values, or new identifier/support shapes. |
 | Runtime app-server `clientInfo.version` and MCP `serverInfo.version` share the code constant `VERSION`. Package, documentation, and platform release anchors are separate consistency checks, not app-server protocol assumptions. | Bridge-local consistency | `src/version.ts`: `VERSION`; `src/app-server.ts`: initialize `clientInfo`; `src/mcp.ts`: initialize `serverInfo`; `test/version.test.ts`: release-anchor guard | Verified by current tests | On a release bump, update the canonical constant and every guarded external anchor together; keep upstream compatibility conclusions separate. |
 
+## Compact projection qualification (working-tree implementation)
+
+Compact policies and structural descriptors are qualified against `codex-cli 0.155.0-alpha.16.4` experimental output: 84 notification methods and 19 ThreadItem types. Routing inspects the original notification before transport truncation, then retains only a bounded, redacted projection in the existing event ring. Unknown methods, item types, or incompatible known shapes wake with bounded diagnostic evidence; raw retains its existing sanitized replay semantics.
+
+`npm run check:compact-schema` uses the executable selected by `CODEX_EXE` to generate fresh schemas without starting a native session. It compares JSON structural descriptors and TypeScript method/item coverage. It does not fingerprint the transitive TypeScript dependency graph or prove TS/JSON field equivalence. For example, `rawResponse/completed` usage fields are required-nullable in generated TS but optional-nullable in standalone JSON; compact follows the JSON shape. On upgrades, review TS-only field changes where they affect supervision semantics, alongside this check and the relevant runtime tests.
+
 ## Revalidation triggers
 
 Revisit this checklist when:

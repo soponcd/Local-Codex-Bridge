@@ -1,13 +1,23 @@
 export type RpcId = string | number;
 
-export const MAX_OBSERVE_WAIT_MS = 10_000;
+export const MAX_OBSERVE_WAIT_MS = 120_000;
 export const MAX_STREAMED_AGENT_TEXT_CHARS = 48_000;
 
+import { performance } from "node:perf_hooks";
+import { createHash } from "node:crypto";
 import type {
   UxCounts,
   UxProjectionSink,
   UxSignalInput,
 } from "./ux-projection.js";
+import { COMPACT_DRAIN_CEILING, COMPACT_DRAIN_CHUNK, CompactAccumulator, prepareCompactRoute, type Route } from "./observe-compact.js";
+
+// The digest is the only plan dedup state retained by a thread runtime.
+export function compactPlanSignatureFor(plan: readonly { step: string; status: string }[]): string {
+  const hash = createHash("sha256");
+  for (const step of plan) hash.update(JSON.stringify([step.step, step.status]));
+  return hash.digest("hex");
+}
 
 export type EventCategory =
   | "agent"
@@ -24,6 +34,11 @@ export interface RuntimeEvent {
   category: EventCategory;
   turn_id?: string;
   data: unknown;
+  // Non-enumerable ingestion metadata; raw event JSON remains unchanged.
+  compactPlanChanged?: boolean;
+  compactSettingsChanged?: boolean;
+  compactBoundaryChanged?: boolean;
+  compactRoute?: Route;
 }
 
 export interface PendingServerRequest {
@@ -86,6 +101,13 @@ interface ThreadRuntime {
   events: RuntimeEvent[];
   terminal: TerminalSnapshot | null;
   agentText: string;
+  compactPlanSignature: string | null;
+  compactSettingsSignature: string | null;
+  compactBoundarySignature: string | null;
+  agentMessageCursors: Map<string, number>;
+  finalMessageCursor: number | null;
+  finalMessageItemId: string | null;
+  terminalCursor: number | null;
 }
 
 export interface RuntimeObservation {
@@ -100,6 +122,14 @@ export interface RuntimeObservation {
   has_more: boolean;
   pending_requests: unknown[];
   terminal: TerminalSnapshot | null;
+}
+
+export interface RuntimeNoChangeObservation {
+  runtime_available: true;
+  runtime_status: string;
+  active_turn_id: string;
+  next_cursor: number;
+  no_change: true;
 }
 
 interface SanitizeOptions {
@@ -354,6 +384,64 @@ function extractFinalFromTurn(params: unknown): string | undefined {
   return undefined;
 }
 
+// Preserve the raw wait's pre-drainage wake timing. Raw pagination and replay
+// must not inherit compact's new classification decisions.
+function hasRawWake(observation: RuntimeObservation): boolean {
+  return observation.events.some((event) => {
+    const data = asRecord(event.data);
+    if (!data) return true;
+    const scopedStream = typeof data.threadId === "string" && typeof data.turnId === "string" && typeof data.itemId === "string";
+    if (["item/agentMessage/delta", "item/plan/delta", "item/commandExecution/outputDelta", "item/fileChange/outputDelta"].includes(event.method)) {
+      return !(scopedStream && typeof data.delta === "string");
+    }
+    if (event.method === "item/mcpToolCall/progress") return !(scopedStream && typeof data.message === "string");
+    if (event.method === "thread/tokenUsage/updated") {
+      const usage = asRecord(data.tokenUsage);
+      const valid = (value: unknown): boolean => {
+        const part = asRecord(value);
+        return !!part && ["cachedInputTokens", "inputTokens", "outputTokens", "reasoningOutputTokens", "totalTokens"].every((key) => Number.isInteger(part[key]));
+      };
+      return !(typeof data.threadId === "string" && typeof data.turnId === "string" && usage && valid(usage.last) && valid(usage.total));
+    }
+    if (event.method === "turn/diff/updated") return !(typeof data.threadId === "string" && typeof data.turnId === "string" && typeof data.diff === "string");
+    if (event.method === "mcpServer/startupStatus/updated") return typeof data.name !== "string" ||
+      !["starting", "ready", "failed", "cancelled"].includes(String(data.status)) ||
+      data.status === "failed" || data.status === "cancelled" || typeof data.error === "string" ||
+      data.failureReason === "reauthenticationRequired";
+    if (event.method === "turn/started") return !(typeof data.threadId === "string" && typeof asRecord(data.turn)?.id === "string" && asRecord(data.turn)?.status === "inProgress");
+    if (event.method === "thread/status/changed") {
+      const status = asRecord(data.status);
+      return !(typeof data.threadId === "string" && status?.type === "active" && Array.isArray(status.activeFlags) && status.activeFlags.length === 0);
+    }
+    if (event.method === "serverRequest/resolved") return !(typeof data.threadId === "string" && (typeof data.requestId === "string" || typeof data.requestId === "number"));
+    if (event.method === "item/started" || event.method === "item/completed") {
+      const item = asRecord(data.item);
+      const complete = event.method === "item/completed";
+      if (!item || typeof item.id !== "string" || typeof data.threadId !== "string" || typeof data.turnId !== "string" ||
+          !Number.isInteger(data[complete ? "completedAtMs" : "startedAtMs"])) return true;
+      if (item.type === "agentMessage") return typeof item.text !== "string" || complete;
+      if (item.type === "reasoning") return false;
+      if (item.type === "userMessage") return !Array.isArray(item.content);
+      if (item.type === "commandExecution") {
+        if (typeof item.command !== "string" || typeof item.cwd !== "string" || !Array.isArray(item.commandActions) ||
+            !["inProgress", "completed", "failed", "declined"].includes(String(item.status)) ||
+            (complete ? item.status === "inProgress" : item.status !== "inProgress")) return true;
+        return complete && (item.status === "failed" || item.status === "declined" || (typeof item.exitCode === "number" && item.exitCode !== 0));
+      }
+      if (item.type === "fileChange" || item.type === "mcpToolCall" || item.type === "dynamicToolCall") {
+        const shape = item.type === "fileChange" ? Array.isArray(item.changes) :
+          item.type === "mcpToolCall" ? typeof item.server === "string" && typeof item.tool === "string" && "arguments" in item :
+            typeof item.tool === "string" && "arguments" in item;
+        const states = item.type === "fileChange" ? ["inProgress", "completed", "failed", "declined"] : ["inProgress", "completed", "failed"];
+        if (!shape || !states.includes(String(item.status)) || (complete ? item.status === "inProgress" : item.status !== "inProgress")) return true;
+        return complete && (item.status === "failed" || item.status === "declined" || item.success === false || item.error != null);
+      }
+      return true;
+    }
+    return true;
+  });
+}
+
 export class RuntimeStore {
   readonly #threads = new Map<string, ThreadRuntime>();
   readonly #pending = new Map<string, PendingServerRequest>();
@@ -390,6 +478,13 @@ export class RuntimeStore {
         events: [],
         terminal: null,
         agentText: "",
+        compactPlanSignature: null,
+        compactSettingsSignature: null,
+        compactBoundarySignature: null,
+        agentMessageCursors: new Map(),
+        finalMessageCursor: null,
+        finalMessageItemId: null,
+        terminalCursor: null,
       });
     }
   }
@@ -404,6 +499,11 @@ export class RuntimeStore {
     runtime.status = "inProgress";
     runtime.terminal = null;
     runtime.agentText = "";
+    runtime.compactPlanSignature = null;
+    runtime.agentMessageCursors.clear();
+    runtime.finalMessageCursor = null;
+    runtime.finalMessageItemId = null;
+    runtime.terminalCursor = null;
     this.#turnToThread.set(turnId, threadId);
     this.#signalChange(runtime);
     this.#publishUx();
@@ -486,6 +586,13 @@ export class RuntimeStore {
       reason = "runtime_idle";
     }
 
+    if (action === "turn_activated") {
+      runtime.compactPlanSignature = null;
+      runtime.agentMessageCursors.clear();
+      runtime.finalMessageCursor = null;
+      runtime.finalMessageItemId = null;
+      runtime.terminalCursor = null;
+    }
     this.#appendEvent(
       runtime,
       "appServer/lateResponseReconciled",
@@ -544,6 +651,14 @@ export class RuntimeStore {
       }
     }
     if (!threadId) {
+      // Connection-scoped notifications, including warnings and unknown
+      // methods, have no native thread target. Let active supervisors see
+      // them without inventing a native turn scope or a global event store.
+      for (const active of this.#threads.values()) {
+        if (active.activeTurnId !== null) {
+          this.#appendEvent(active, method, params, undefined);
+        }
+      }
       return;
     }
 
@@ -554,6 +669,11 @@ export class RuntimeStore {
       runtime.status = "inProgress";
       runtime.terminal = null;
       runtime.agentText = "";
+      runtime.compactPlanSignature = null;
+      runtime.agentMessageCursors.clear();
+      runtime.finalMessageCursor = null;
+      runtime.finalMessageItemId = null;
+      runtime.terminalCursor = null;
       this.#turnToThread.set(turnId, threadId);
     }
 
@@ -575,6 +695,7 @@ export class RuntimeStore {
         const final = extractFinalFromTurn(params) ?? (runtime.agentText || null);
         runtime.status = status;
         runtime.activeTurnId = null;
+        runtime.compactPlanSignature = null;
         runtime.terminal = {
           turn_id: terminalTurnId,
           status,
@@ -600,7 +721,29 @@ export class RuntimeStore {
           : stringField(asRecord(status), "type") ?? runtime.status;
     }
 
-    this.#appendEvent(runtime, method, params, turnId);
+    const appendedCursor = this.#appendEvent(runtime, method, params, turnId);
+    if (method === "item/completed" && runtime.events.at(-1)?.compactRoute?.fact?.type === "message") {
+      const completedItem = asRecord(asRecord(params)?.item);
+      if (completedItem?.type === "agentMessage" && typeof completedItem.id === "string") {
+        runtime.agentMessageCursors.set(completedItem.id, appendedCursor);
+        if (runtime.agentMessageCursors.size > this.ringLimit) {
+          runtime.agentMessageCursors.delete(runtime.agentMessageCursors.keys().next().value!);
+        }
+        if (completedItem.phase === "final_answer") {
+          runtime.finalMessageCursor = appendedCursor;
+          runtime.finalMessageItemId = completedItem.id;
+        }
+      }
+    }
+    if (method === "turn/completed") {
+      runtime.terminalCursor = appendedCursor;
+      const items = asRecord(asRecord(params)?.turn)?.items;
+      const lastAgent = Array.isArray(items)
+        ? [...items].reverse().map(asRecord).find((candidate) => candidate?.type === "agentMessage")
+        : undefined;
+      if (typeof lastAgent?.id === "string") runtime.finalMessageCursor = runtime.agentMessageCursors.get(lastAgent.id) ??
+        (lastAgent.id === runtime.finalMessageItemId ? runtime.finalMessageCursor : null);
+    }
   }
 
   recordServerRequest(
@@ -615,6 +758,15 @@ export class RuntimeStore {
     const extractedTurnId = extractTurnId(params);
     const threadId = extractThreadId(params) ?? (extractedTurnId ? this.#turnToThread.get(extractedTurnId) : undefined);
     if (!threadId) {
+      for (const active of this.#threads.values()) {
+        if (active.activeTurnId !== null) {
+          this.#appendEvent(active, "appServer/unscopedRequest", {
+            request_id: id,
+            native_method: method,
+            params,
+          }, undefined);
+        }
+      }
       return "threadless";
     }
     this.ensureThread(threadId);
@@ -698,6 +850,7 @@ export class RuntimeStore {
         const turnId = runtime.activeTurnId;
         runtime.status = "appServerExited";
         runtime.activeTurnId = null;
+        runtime.compactPlanSignature = null;
         runtime.terminal = {
           turn_id: turnId,
           status: "appServerExited",
@@ -706,7 +859,7 @@ export class RuntimeStore {
           error: { message: redactText(message) },
           turn: null,
         };
-        this.#appendEvent(runtime, "appServer/exited", { message }, turnId);
+        runtime.terminalCursor = this.#appendEvent(runtime, "appServer/exited", { message }, turnId);
         this.#publishUx({
           kind: "terminal",
           thread_id: runtime.threadId,
@@ -765,7 +918,7 @@ export class RuntimeStore {
     limit: number,
     waitMs: number,
     signal?: AbortSignal,
-  ): Promise<RuntimeObservation | null> {
+  ): Promise<RuntimeObservation | RuntimeNoChangeObservation | null> {
     if (!Number.isInteger(waitMs) || waitMs < 0 || waitMs > MAX_OBSERVE_WAIT_MS) {
       throw new Error(`wait_ms must be an integer from 0 to ${MAX_OBSERVE_WAIT_MS}`);
     }
@@ -773,22 +926,109 @@ export class RuntimeStore {
     if (!runtime) {
       return null;
     }
-    const revision = runtime.revision;
-    const initial = this.observe(threadId, cursor, limit);
-    if (
-      initial === null ||
-      waitMs === 0 ||
-      initial.events.length > 0 ||
-      initial.pending_requests.length > 0 ||
-      initial.terminal !== null ||
-      initial.cursor_lost ||
-      initial.active_turn_id === null
-    ) {
-      return initial;
+    const startedRevision = runtime.revision;
+    const deadline = performance.now() + waitMs;
+    while (true) {
+      const revision = runtime.revision;
+      const snapshot = this.observe(threadId, cursor, limit);
+      if (snapshot === null || waitMs === 0 || snapshot.pending_requests.length > 0 ||
+          snapshot.terminal !== null || snapshot.cursor_lost || snapshot.active_turn_id === null ||
+          snapshot.has_more || snapshot.events.length >= limit || hasRawWake(snapshot)) {
+        return snapshot;
+      }
+      if (performance.now() >= deadline) {
+        if (snapshot.events.length === 0 && runtime.revision === startedRevision) {
+          return {
+            runtime_available: true,
+            runtime_status: snapshot.runtime_status,
+            active_turn_id: snapshot.active_turn_id,
+            next_cursor: snapshot.next_cursor,
+            no_change: true,
+          };
+        }
+        return snapshot;
+      }
+      await this.#waitForChange(runtime, revision, deadline, signal);
+      if (signal?.aborted) return this.observe(threadId, cursor, limit);
+      // A revision without native events can carry a status or pending-request
+      // transition. Return it rather than presenting true silence.
+      if (runtime.revision !== revision && runtime.nextCursor - 1 === (snapshot.current_cursor ?? 0)) {
+        return this.observe(threadId, cursor, limit);
+      }
     }
+  }
 
-    await this.#waitForChange(runtime, revision, waitMs, signal);
-    return this.observe(threadId, cursor, limit);
+  async observeCompactWithWait(
+    threadId: string,
+    cursor: number | undefined,
+    factLimit: number,
+    waitMs: number,
+    signal?: AbortSignal,
+  ): Promise<Record<string, unknown> | RuntimeNoChangeObservation | null> {
+    if (!Number.isInteger(waitMs) || waitMs < 0 || waitMs > MAX_OBSERVE_WAIT_MS) {
+      throw new Error(`wait_ms must be an integer from 0 to ${MAX_OBSERVE_WAIT_MS}`);
+    }
+    const runtime = this.#threads.get(threadId);
+    if (!runtime) return null;
+    const startedRevision = runtime.revision;
+    const deadline = performance.now() + waitMs;
+    const initial = this.observe(threadId, cursor, COMPACT_DRAIN_CHUNK)!;
+    let cursorLost = initial.cursor_lost;
+    let cursorFloor = initial.cursor_floor;
+    const requested = cursor ?? initial.cursor_floor;
+    const scan = new CompactAccumulator(requested, factLimit, {
+      threadId, ...(runtime.activeTurnId ? { activeTurnId: runtime.activeTurnId } : {}),
+    }, cursorLost ? cursorFloor : Math.min(requested, initial.current_cursor));
+    const finalIdentity = () => ({
+      itemCursor: runtime.finalMessageCursor,
+      terminalCursor: runtime.terminalCursor,
+      turnId: runtime.terminal?.turn_id ?? null,
+    });
+    let last = initial;
+    const result = (more = false): Record<string, unknown> =>
+      scan.result(last, finalIdentity(), more, cursorLost, cursorFloor);
+
+    while (true) {
+      const revision = runtime.revision;
+      const snapshot = this.observe(threadId, scan.nextCursor, Math.min(COMPACT_DRAIN_CHUNK, COMPACT_DRAIN_CEILING - scan.scanned))!;
+      last = snapshot;
+      if (snapshot.cursor_lost) {
+        cursorLost = true;
+        cursorFloor = Math.max(cursorFloor, snapshot.cursor_floor);
+        scan.nextCursor = snapshot.cursor_floor;
+      }
+      for (let index = 0; index < snapshot.events.length; index += 1) {
+        if (!scan.consume(snapshot.events[index]!)) return result(true);
+        if (scan.wake) return result(runtime.nextCursor - 1 > scan.nextCursor);
+        if (scan.scanned >= COMPACT_DRAIN_CEILING) {
+          if (snapshot.has_more || index + 1 < snapshot.events.length || waitMs > 0) {
+            scan.continuation = "drainage_yield";
+            return result(true);
+          }
+          return result(false);
+        }
+      }
+      if (snapshot.has_more) {
+        if (waitMs > 0 && performance.now() >= deadline) return result(true);
+        continue;
+      }
+      if (snapshot.pending_requests.length > 0 || snapshot.terminal !== null || snapshot.active_turn_id === null || cursorLost || waitMs === 0 || performance.now() >= deadline) {
+        if (scan.scanned === 0 && runtime.revision === startedRevision && snapshot.pending_requests.length === 0 && snapshot.terminal === null &&
+            snapshot.active_turn_id !== null && !cursorLost && waitMs > 0 && performance.now() >= deadline) {
+          return {
+            runtime_available: true,
+            runtime_status: snapshot.runtime_status,
+            active_turn_id: snapshot.active_turn_id,
+            next_cursor: scan.nextCursor,
+            no_change: true,
+          };
+        }
+        return result(false);
+      }
+      await this.#waitForChange(runtime, revision, deadline, signal);
+      if (signal?.aborted) return result(runtime.nextCursor - 1 > scan.nextCursor);
+      if (runtime.revision !== revision && runtime.nextCursor - 1 === snapshot.current_cursor) return result(false);
+    }
   }
 
   pendingForThread(threadId: string): unknown[] {
@@ -850,21 +1090,48 @@ export class RuntimeStore {
     method: string,
     data: unknown,
     turnId: string | undefined,
-  ): void {
+  ): number {
     const event: RuntimeEvent = {
       cursor: runtime.nextCursor,
       at: new Date().toISOString(),
       method,
       category: classifyEvent(method),
-      data: sanitizeForTransport(data, EVENT_SANITIZE),
+      data,
       ...(turnId ? { turn_id: turnId } : {}),
     };
+    const compactRoute = prepareCompactRoute(event, () => {
+    if (method === "turn/plan/updated") {
+      const plan = asRecord(data)?.plan;
+      if (Array.isArray(plan) && plan.every((step) => typeof asRecord(step)?.step === "string" && typeof asRecord(step)?.status === "string")) {
+        const signature = compactPlanSignatureFor(plan.map((step) => ({ step: asRecord(step)!.step as string, status: asRecord(step)!.status as string })));
+        Object.defineProperty(event, "compactPlanChanged", { value: signature !== runtime.compactPlanSignature });
+        runtime.compactPlanSignature = signature;
+      }
+    }
+    if (method === "thread/settings/updated") {
+      const settings = asRecord(asRecord(data)?.threadSettings);
+      if (settings) {
+        const signature = (value: unknown): string => createHash("sha256").update(JSON.stringify(value)).digest("hex");
+        const boundary = signature([settings.approvalPolicy, settings.sandboxPolicy, settings.cwd, settings.activePermissionProfile, settings.approvalsReviewer]);
+        const collaboration = asRecord(settings.collaborationMode);
+        const modeSettings = asRecord(collaboration?.settings);
+        const selected = signature([boundary, settings.model, settings.modelProvider, settings.effort, collaboration?.mode, modeSettings?.model, modeSettings?.reasoning_effort]);
+        Object.defineProperty(event, "compactSettingsChanged", { value: selected !== runtime.compactSettingsSignature });
+        Object.defineProperty(event, "compactBoundaryChanged", { value: boundary !== runtime.compactBoundarySignature });
+        runtime.compactSettingsSignature = selected;
+        runtime.compactBoundarySignature = boundary;
+      }
+    }
+    });
+    Object.defineProperty(event, "compactRoute", { value: compactRoute });
+    event.data = sanitizeForTransport(data, EVENT_SANITIZE);
     runtime.nextCursor += 1;
     runtime.events.push(event);
     if (runtime.events.length > this.ringLimit) {
       runtime.events.splice(0, runtime.events.length - this.ringLimit);
     }
     this.#signalChange(runtime);
+    return event.cursor;
   }
 
   #signalChange(runtime: ThreadRuntime): void {
@@ -882,20 +1149,18 @@ export class RuntimeStore {
   async #waitForChange(
     runtime: ThreadRuntime,
     afterRevision: number,
-    waitMs: number,
+    deadline: number,
     signal?: AbortSignal,
   ): Promise<void> {
     await new Promise<void>((resolve) => {
       let settled = false;
-      let timer: NodeJS.Timeout | undefined;
+      let deadlineTimer: NodeJS.Timeout | undefined;
       const finish = (): void => {
         if (settled) {
           return;
         }
         settled = true;
-        if (timer) {
-          clearTimeout(timer);
-        }
+        if (deadlineTimer) clearTimeout(deadlineTimer);
         signal?.removeEventListener("abort", onAbort);
         const waiters = this.#changeWaiters.get(runtime.threadId);
         waiters?.delete(finish);
@@ -905,7 +1170,7 @@ export class RuntimeStore {
         resolve();
       };
       const onAbort = (): void => finish();
-      if (signal?.aborted) {
+      if (signal?.aborted || performance.now() >= deadline) {
         resolve();
         return;
       }
@@ -913,9 +1178,10 @@ export class RuntimeStore {
       waiters.add(finish);
       this.#changeWaiters.set(runtime.threadId, waiters);
       signal?.addEventListener("abort", onAbort, { once: true });
-      timer = setTimeout(finish, waitMs);
-      timer.unref();
-      if (runtime.revision !== afterRevision) {
+      // Every revision waits only for the remaining time of this call.
+      deadlineTimer = setTimeout(finish, Math.max(0, deadline - performance.now()));
+      deadlineTimer.unref();
+      if (runtime.revision !== afterRevision || signal?.aborted || performance.now() >= deadline) {
         finish();
       }
     });

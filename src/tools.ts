@@ -10,6 +10,7 @@ import {
   type RpcId,
 } from "./runtime.js";
 import { platformPolicyFor, type PlatformPolicy } from "./platform.js";
+import { exactHistoryResponse, validateHistoryPage } from "./history.js";
 
 export interface ToolDefinition {
   name: string;
@@ -65,6 +66,8 @@ const SUPPORTED_RESPOND_METHODS = new Set([
 const MODEL_LIST_PAGE_LIMIT = 100;
 const MAX_MODEL_CATALOG_PAGES = 100;
 const MAX_MODEL_CATALOG_ENTRIES = 10_000;
+const HISTORY_TURN_LIMIT = 50;
+const HISTORY_ITEM_LIMIT = 20;
 
 interface ModelListPage {
   data: Record<string, unknown>[];
@@ -76,7 +79,7 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
     name: "codex_threads",
     title: "Codex Threads",
     description:
-      "List or search persistent local Codex threads through thread/list, or read one thread through thread/read. This does not reconstruct live Bridge events.",
+      "List or search persistent threads; read one thread's metadata; or page native persisted turns/items through history. History cursors are opaque and separate from thread/list and live observe cursors. include_turns:true now returns a migration error; use history instead. No history read reconstructs live Bridge events.",
     inputSchema: {
       type: "object",
       properties: {
@@ -88,8 +91,35 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
         },
         include_turns: {
           type: "boolean",
-          default: false,
-          description: "Include persisted turns when reading one thread.",
+          description: "Legacy parameter: false reads metadata; true returns a migration error directing callers to history.",
+        },
+        history: {
+          oneOf: [
+            {
+              type: "object",
+              properties: {
+                kind: { const: "turns" },
+                cursor: { type: "string", minLength: 1, maxLength: 10_000 },
+                limit: { type: "integer", minimum: 1, maximum: HISTORY_TURN_LIMIT, default: 20 },
+                sort_direction: { type: "string", enum: ["asc", "desc"], default: "desc" },
+              },
+              required: ["kind"],
+              additionalProperties: false,
+            },
+            {
+              type: "object",
+              properties: {
+                kind: { const: "items" },
+                turn_id: { type: "string", minLength: 1, maxLength: 200 },
+                cursor: { type: "string", minLength: 1, maxLength: 10_000 },
+                limit: { type: "integer", minimum: 1, maximum: HISTORY_ITEM_LIMIT, default: 10 },
+                sort_direction: { type: "string", enum: ["asc", "desc"], default: "asc" },
+              },
+              required: ["kind", "turn_id"],
+              additionalProperties: false,
+            },
+          ],
+          description: "One native persisted history page. Keep cursor, scope, and sort direction together for continuation; reverse cursors use the opposite sort direction.",
         },
         cwd: {
           type: "string",
@@ -116,6 +146,11 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
           description: "Maximum threads in the returned page.",
         },
       },
+      oneOf: [
+        { not: { anyOf: [{ required: ["thread_id"] }, { required: ["history"] }, { required: ["include_turns"] }] } },
+        { required: ["thread_id"], not: { anyOf: [{ required: ["history"] }, { required: ["cwd"] }, { required: ["search_term"] }, { required: ["cursor"] }, { required: ["limit"] }] } },
+        { required: ["thread_id", "history"], not: { anyOf: [{ required: ["include_turns"] }, { required: ["cwd"] }, { required: ["search_term"] }, { required: ["cursor"] }, { required: ["limit"] }] } },
+      ],
       additionalProperties: false,
     },
     annotations: {
@@ -219,7 +254,7 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
     name: "codex_observe",
     title: "Observe Codex Turn",
     description:
-      "Read bounded incremental sanitized Bridge runtime events, pending requests, and terminal output for a thread. Optional wait_ms performs one bounded event-driven wait only when the live turn is active and the current snapshot has nothing useful; it is not polling or stall detection. After Bridge process loss, falls back to persistent thread/read history and marks live state unreconstructable. A long interval with no new command or output can still mean Codex is actively reasoning; absence of new command activity alone is not evidence of a stall. When actively supervising an in-progress turn, use repeated bounded-wait observe calls until terminal unless the user explicitly pauses or stops; do not end supervision merely because one snapshot is inProgress. After every wake or deadline return, inspect the newly available events/state and decide whether steer, respond, or interruption is needed before starting the next bounded wait.",
+      "Read bounded incremental sanitized Bridge runtime events, pending requests, and terminal output for a thread. Default compact view projects native facts; raw returns the existing sanitized event envelope. Compact drains silent native events across chunks and wakes on completed supervision facts; raw retains its existing native page and wait behavior. Optional wait_ms performs one bounded event-driven wait with a fixed per-call deadline (maximum 120 seconds); 0 returns immediately. A true-silence deadline returns only runtime_available, runtime_status, active_turn_id, next_cursor, and no_change: true. Reuse next_cursor to continue observing. Use view=raw with a chosen native cursor and wait_ms=0 for replay while the ring retains those events. After Bridge process loss, metadata-only thread/read cannot reconstruct live events, pending requests, cursor, active turn, or terminal; page persistent history through codex_threads.history if needed. A long interval with no new command or output can still mean Codex is actively reasoning; absence of new command activity alone is not evidence of a stall. When actively supervising an in-progress turn, use repeated bounded-wait observe calls until terminal unless the user explicitly pauses or stops; do not end supervision merely because one snapshot is inProgress. After every wake or deadline return, inspect the newly available events/state and decide whether steer, respond, or interruption is needed before starting the next bounded wait.",
     inputSchema: {
       type: "object",
       properties: {
@@ -227,14 +262,14 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
         cursor: {
           type: "integer",
           minimum: 0,
-          description: "Return runtime events with a cursor greater than this value.",
+          description: "Continue from this native runtime cursor; deliberate older values replay retained events.",
         },
         limit: {
           type: "integer",
           minimum: 1,
           maximum: 100,
           default: 50,
-          description: "Maximum runtime events to return.",
+          description: "Maximum compact facts or raw native events to return; compact may scan more silent native events internally.",
         },
         wait_ms: {
           type: "integer",
@@ -242,7 +277,13 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
           maximum: MAX_OBSERVE_WAIT_MS,
           default: 0,
           description:
-            "Optional per-call wait for the next live runtime change when nothing useful is ready; 0 returns immediately. This is event-driven waiting, not stall detection.",
+            "Optional fixed per-call wait for a supervision wake or deadline in compact view; raw retains its existing event wait. 0 drains currently available events immediately. This is not stall detection.",
+        },
+        view: {
+          type: "string",
+          enum: ["compact", "raw"],
+          default: "compact",
+          description: "Compact facts by default; raw returns the existing sanitized native event envelope. Raw retains native pagination and its existing wait behavior.",
         },
       },
       required: ["thread_id"],
@@ -688,43 +729,6 @@ function extractApprovalPolicy(
   return effectiveApprovalPolicy;
 }
 
-function storedTerminal(threadResult: unknown): unknown {
-  const result = asObject(threadResult, "thread/read result");
-  const thread = asObject(result.thread, "thread/read result.thread");
-  const turns = Array.isArray(thread.turns) ? thread.turns : [];
-  const turn = turns.length > 0 ? asObject(turns.at(-1), "stored turn") : null;
-  if (!turn || typeof turn.id !== "string") {
-    return null;
-  }
-  const status = typeof turn.status === "string" ? turn.status : "unknown";
-  if (!["completed", "failed", "interrupted"].includes(status)) {
-    return null;
-  }
-  const items = Array.isArray(turn.items) ? turn.items : [];
-  let finalResult: string | null = null;
-  for (let index = items.length - 1; index >= 0; index -= 1) {
-    const item = items[index];
-    if (
-      item !== null &&
-      typeof item === "object" &&
-      !Array.isArray(item) &&
-      (item as Record<string, unknown>).type === "agentMessage" &&
-      typeof (item as Record<string, unknown>).text === "string"
-    ) {
-      finalResult = (item as Record<string, unknown>).text as string;
-      break;
-    }
-  }
-  return sanitizeForTransport({
-    turn_id: turn.id,
-    status,
-    completed_at: null,
-    final_result: finalResult,
-    error: turn.error ?? null,
-    source: "codex_app_server_thread_read",
-  });
-}
-
 function throwIfAborted(signal?: AbortSignal): void {
   if (signal?.aborted) {
     throw new Error("MCP request cancelled");
@@ -860,20 +864,69 @@ export class ControlSurface {
   }
 
   async #threads(args: Record<string, unknown>): Promise<unknown> {
-    onlyKeys(args, ["thread_id", "include_turns", "cwd", "search_term", "cursor", "limit"]);
+    onlyKeys(args, ["thread_id", "include_turns", "history", "cwd", "search_term", "cursor", "limit"]);
     const threadId = optionalString(args, "thread_id", 200);
     if (threadId) {
-      if (args.cwd !== undefined || args.search_term !== undefined || args.cursor !== undefined || args.limit !== undefined) {
+      if (["cwd", "search_term", "cursor", "limit"].some((key) => Object.hasOwn(args, key))) {
         throw new Error("thread_id cannot be combined with list/search fields");
       }
+      if (Object.hasOwn(args, "history")) {
+        if (Object.hasOwn(args, "include_turns")) {
+          throw new Error("history cannot be combined with include_turns");
+        }
+        const history = asObject(args.history, "history");
+        onlyKeys(history, ["kind", "turn_id", "cursor", "limit", "sort_direction"]);
+        const kind = enumValue(history, "kind", ["turns", "items"]);
+        if (kind === undefined) throw new Error("history.kind is required");
+        if (kind === "turns" && Object.hasOwn(history, "turn_id")) {
+          throw new Error("history.turn_id is valid only for items");
+        }
+        if (kind === "items" && !Object.hasOwn(history, "turn_id")) {
+          throw new Error("history.turn_id is required for items");
+        }
+        const turnId = kind === "items" ? requiredString(history, "turn_id", 200) : undefined;
+        const cursor = optionalString(history, "cursor", 10_000);
+        const limit = optionalInteger(history, "limit", 1, kind === "turns" ? HISTORY_TURN_LIMIT : HISTORY_ITEM_LIMIT)
+          ?? (kind === "turns" ? 20 : 10);
+        const sortDirection = enumValue(history, "sort_direction", ["asc", "desc"])
+          ?? (kind === "turns" ? "desc" : "asc");
+        const page = validateHistoryPage(await this.appServer.request(
+          kind === "turns" ? "thread/turns/list" : "thread/items/list",
+          {
+            threadId,
+            ...(turnId ? { turnId } : {}),
+            ...(cursor ? { cursor } : {}),
+            limit,
+            sortDirection,
+            ...(kind === "turns" ? { itemsView: "notLoaded" } : {}),
+          },
+        ), limit, kind);
+        return exactHistoryResponse({
+          source: "codex_app_server",
+          mode: "history",
+          coverage: "native_persisted_history",
+          kind,
+          thread_id: threadId,
+          ...(turnId ? { turn_id: turnId } : {}),
+          data: page.data,
+          nextCursor: page.nextCursor,
+          backwardsCursor: page.backwardsCursor,
+        });
+      }
       const includeTurns = optionalBoolean(args, "include_turns") ?? false;
+      if (includeTurns) {
+        throw new Error("include_turns:true is no longer supported; use codex_threads(thread_id, history:{kind:'turns'}) and page items by turn_id");
+      }
       const result = await this.appServer.request("thread/read", {
         threadId,
-        includeTurns,
+        includeTurns: false,
       });
       return sanitizeForTransport({ source: "codex_app_server", mode: "read", ...responseRecord(result, "thread/read") });
     }
-    if (args.include_turns !== undefined) {
+    if (Object.hasOwn(args, "history")) {
+      throw new Error("history is valid only with thread_id");
+    }
+    if (Object.hasOwn(args, "include_turns")) {
       throw new Error("include_turns is valid only with thread_id");
     }
     const cwd = this.#cwd(args);
@@ -1069,14 +1122,18 @@ export class ControlSurface {
 
   async #observe(args: Record<string, unknown>, signal?: AbortSignal): Promise<unknown> {
     throwIfAborted(signal);
-    onlyKeys(args, ["thread_id", "cursor", "limit", "wait_ms"]);
+    onlyKeys(args, ["thread_id", "cursor", "limit", "wait_ms", "view"]);
     const threadId = requiredString(args, "thread_id", 200);
     const cursor = optionalInteger(args, "cursor", 0, Number.MAX_SAFE_INTEGER);
     const limit = optionalInteger(args, "limit", 1, 100) ?? 50;
     const waitMs = optionalInteger(args, "wait_ms", 0, MAX_OBSERVE_WAIT_MS) ?? 0;
-    const runtime = waitMs === 0
-      ? this.appServer.runtime.observe(threadId, cursor, limit)
-      : await this.appServer.runtime.observeWithWait(threadId, cursor, limit, waitMs, signal);
+    const view = args.view ?? "compact";
+    if (view !== "compact" && view !== "raw") throw new Error("view must be compact or raw");
+    const runtime = view === "compact"
+      ? await this.appServer.runtime.observeCompactWithWait(threadId, cursor, limit, waitMs, signal)
+      : waitMs === 0
+        ? this.appServer.runtime.observe(threadId, cursor, limit)
+        : await this.appServer.runtime.observeWithWait(threadId, cursor, limit, waitMs, signal);
     throwIfAborted(signal);
     if (runtime) {
       return runtime;
@@ -1084,13 +1141,14 @@ export class ControlSurface {
     throwIfAborted(signal);
     const result = await this.appServer.request("thread/read", {
       threadId,
-      includeTurns: true,
+      includeTurns: false,
     });
     throwIfAborted(signal);
+    const storedThread = asObject(responseRecord(result, "thread/read").thread, "thread/read result.thread");
     return sanitizeForTransport({
       runtime_available: false,
       live_state_reconstructable: false,
-      note: "This Bridge process has no in-memory runtime for the thread. Live event ring and pending requests cannot be reconstructed after process loss.",
+      note: "This Bridge process has no live runtime for the thread. Live events, pending requests, live cursor, active turn, and terminal are unknown. Page persisted history with codex_threads.history.",
       runtime_status: "not_reconstructable",
       active_turn_id: null,
       events: [],
@@ -1100,9 +1158,10 @@ export class ControlSurface {
       cursor_lost: false,
       has_more: false,
       pending_requests: [],
-      terminal: storedTerminal(result),
-      stored_thread: responseRecord(result, "thread/read").thread,
-      source: "codex_app_server_thread_read",
+      terminal: null,
+      unavailable_live_fields: ["events", "next_cursor", "current_cursor", "cursor_floor", "cursor_lost", "has_more", "pending_requests"],
+      stored_thread: { ...storedThread, turns: [] },
+      source: "codex_app_server_thread_read_metadata",
     });
   }
 

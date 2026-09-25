@@ -154,6 +154,10 @@ lines.on("line", (line) => {
     });
     return;
   }
+  if (message.method === "thread/turns/list" && message.params.cursor === "oversized-inbound") {
+    send({ id: message.id, result: { data: [{ id: "turn-big", text: "x".repeat(10 * 1024 * 1024 + 1) }], nextCursor: null, backwardsCursor: null } });
+    return;
+  }
   if (message.method === "test/exit") {
     process.exit(23);
   }

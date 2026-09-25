@@ -358,8 +358,15 @@ test("observe wait defaults to immediate and buffered events bypass waiting", as
   const immediate = await within(control.call("codex_observe", {
     thread_id: "thread-immediate",
     cursor: 0,
+    view: "raw",
   }));
-  assert.deepEqual((immediate as Record<string, unknown>).events, []);
+  assert.deepEqual(immediate, runtime.observe("thread-immediate", 0, 50));
+  assert.deepEqual(await within(control.call("codex_observe", {
+    thread_id: "thread-immediate",
+    cursor: 0,
+    wait_ms: 0,
+    view: "raw",
+  })), immediate);
 
   runtime.recordNotification("item/started", {
     threadId: "thread-immediate",
@@ -370,6 +377,7 @@ test("observe wait defaults to immediate and buffered events bypass waiting", as
     thread_id: "thread-immediate",
     cursor: 0,
     wait_ms: MAX_OBSERVE_WAIT_MS,
+    view: "raw",
   }));
   const events = (buffered as Record<string, unknown>).events as Array<Record<string, unknown>>;
   assert.equal(events.length, 1);
@@ -384,7 +392,7 @@ test("active observe wait wakes on an injected runtime event and otherwise times
   const waiting = control.call("codex_observe", {
     thread_id: "thread-wait",
     cursor: 0,
-    wait_ms: 1_000,
+    wait_ms: 120_000,
   });
   runtime.recordNotification("item/started", {
     threadId: "thread-wait",
@@ -405,7 +413,139 @@ test("active observe wait wakes on an injected runtime event and otherwise times
   const elapsed = performance.now() - startedAt;
   assert.ok(elapsed >= 25, `observe returned too early after ${elapsed.toFixed(1)} ms`);
   assert.ok(elapsed < 500, `observe exceeded its bounded deadline: ${elapsed.toFixed(1)} ms`);
-  assert.deepEqual((timedOut as Record<string, unknown>).events, []);
+  assert.deepEqual(timedOut, {
+    runtime_available: true,
+    runtime_status: "inProgress",
+    active_turn_id: "turn-wait",
+    next_cursor: runtime.currentCursor("thread-wait"),
+    no_change: true,
+  });
+});
+
+test("observe no-change deadlines omit seen output and preserve the continuation cursor", async () => {
+  const runtime = new RuntimeStore();
+  runtime.markTurnAccepted("thread-quiet", "turn-quiet");
+  runtime.recordNotification("item/completed", {
+    threadId: "thread-quiet",
+    turnId: "turn-quiet",
+    item: { type: "commandExecution", id: "seen-command", aggregatedOutput: "SEEN_OUTPUT" },
+  });
+  const control = controlFor(runtime);
+  const seen = await control.call("codex_observe", {
+    thread_id: "thread-quiet",
+    cursor: 0,
+    view: "raw",
+  }) as RuntimeObservation;
+  assert.match(JSON.stringify(seen), /SEEN_OUTPUT/);
+
+  for (let index = 0; index < 2; index += 1) {
+    const quiet = await within(control.call("codex_observe", {
+      thread_id: "thread-quiet",
+      cursor: seen.next_cursor,
+      wait_ms: 10,
+      view: "raw",
+    }));
+    assert.deepEqual(quiet, {
+      runtime_available: true,
+      runtime_status: "inProgress",
+      active_turn_id: "turn-quiet",
+      next_cursor: seen.next_cursor,
+      no_change: true,
+    });
+    assert.equal(runtime.currentCursor("thread-quiet"), seen.next_cursor);
+  }
+
+  const waiting = control.call("codex_observe", {
+    thread_id: "thread-quiet",
+    cursor: seen.next_cursor,
+    wait_ms: 40,
+    view: "raw",
+  });
+  runtime.recordNotification("item/commandExecution/outputDelta", {
+    threadId: "thread-quiet",
+    turnId: "turn-quiet",
+    itemId: "new-command",
+    delta: "NEW_OUTPUT",
+  });
+  const changed = await within(waiting);
+  assert.deepEqual(changed, runtime.observe("thread-quiet", seen.next_cursor, 50));
+  assert.match(JSON.stringify(changed), /NEW_OUTPUT/);
+  assert.doesNotMatch(JSON.stringify(changed), /SEEN_OUTPUT/);
+});
+
+test("observe waits preserve full snapshots on native and revision-only changes", async () => {
+  const changes: Array<{ name: string; mutate: (runtime: RuntimeStore) => void }> = [
+    {
+      name: "native status event",
+      mutate: (runtime) => runtime.recordNotification("thread/status/changed", {
+        threadId: "thread-change",
+        status: { type: "active" },
+      }),
+    },
+    {
+      name: "pending request",
+      mutate: (runtime) => runtime.recordServerRequest(7, "item/fileChange/requestApproval", {
+        threadId: "thread-change",
+        turnId: "turn-change",
+      }),
+    },
+    {
+      name: "terminal result",
+      mutate: (runtime) => runtime.recordNotification("turn/completed", {
+        threadId: "thread-change",
+        turn: {
+          id: "turn-change",
+          status: "completed",
+          items: [{ type: "agentMessage", text: "NEW_FINAL_OUTPUT" }],
+        },
+      }),
+    },
+    {
+      name: "turn accepted without a native event",
+      mutate: (runtime) => runtime.markTurnAccepted("thread-change", "turn-next"),
+    },
+    {
+      name: "app-server exit",
+      mutate: (runtime) => runtime.markAppServerExited("test exit"),
+    },
+  ];
+  for (const { name, mutate } of changes) {
+    const runtime = new RuntimeStore();
+    runtime.markTurnAccepted("thread-change", "turn-change");
+    const waiting = controlFor(runtime).call("codex_observe", {
+      thread_id: "thread-change",
+      cursor: 0,
+      wait_ms: 40,
+      view: "raw",
+    });
+    mutate(runtime);
+    assert.deepEqual(await within(waiting), runtime.observe("thread-change", 0, 50), name);
+  }
+});
+
+test("observe cursor recovery and buffered pagination retain full snapshots", async () => {
+  const runtime = new RuntimeStore(2);
+  runtime.markTurnAccepted("thread-cursors", "turn-cursors");
+  for (let index = 0; index < 3; index += 1) {
+    runtime.recordNotification("item/started", {
+      threadId: "thread-cursors",
+      turnId: "turn-cursors",
+      item: { type: "commandExecution", id: "command-" + index },
+    });
+  }
+  const control = controlFor(runtime);
+  for (const cursor of [0, 1]) {
+    const observed = await within(control.call("codex_observe", {
+      thread_id: "thread-cursors",
+      cursor,
+      limit: 1,
+      wait_ms: MAX_OBSERVE_WAIT_MS,
+      view: "raw",
+    }));
+    assert.deepEqual(observed, runtime.observe("thread-cursors", cursor, 1));
+    assert.equal((observed as RuntimeObservation).cursor_lost, cursor === 0);
+    assert.equal((observed as RuntimeObservation).has_more, true);
+  }
 });
 
 test("cancelling one same-thread observe wait leaves the other waiter intact", async () => {
@@ -484,8 +624,9 @@ test("observe wait handoff cannot lose a mutation between snapshot and registrat
   const observed = await within(
     runtime.observeWithWait("thread-handoff", 0, 10, 1_000),
   );
-  assert.equal(observed?.events.length, 1);
-  assert.equal(observed?.events[0]?.method, "item/started");
+  assert.ok(observed && "events" in observed);
+  assert.equal(observed.events.length, 1);
+  assert.equal(observed.events[0]?.method, "item/started");
 });
 
 test("completed, pending, inactive, and unavailable observe states do not wait", async () => {
@@ -542,26 +683,37 @@ test("observe wait schema and validation preserve bounded optional semantics", a
   assert.deepEqual(properties.wait_ms, {
     type: "integer",
     minimum: 0,
-    maximum: MAX_OBSERVE_WAIT_MS,
+    maximum: 120_000,
     default: 0,
     description:
-      "Optional per-call wait for the next live runtime change when nothing useful is ready; 0 returns immediately. This is event-driven waiting, not stall detection.",
+      "Optional fixed per-call wait for a supervision wake or deadline in compact view; raw retains its existing event wait. 0 drains currently available events immediately. This is not stall detection.",
   });
   assert.match(observeTool?.description ?? "", /Optional wait_ms performs one bounded event-driven wait/);
+  assert.match(observeTool?.description ?? "", /fixed per-call deadline/);
   assert.match(observeTool?.description ?? "", /absence of new command activity alone is not evidence of a stall/);
   assert.match(observeTool?.description ?? "", /repeated bounded-wait observe calls until terminal.*one snapshot is inProgress/);
   assert.match(observeTool?.description ?? "", /After every wake or deadline return, inspect the newly available events\/state.*before starting the next bounded wait/);
+  assert.deepEqual(properties.view, {
+    type: "string",
+    enum: ["compact", "raw"],
+    default: "compact",
+    description: "Compact facts by default; raw returns the existing sanitized native event envelope. Raw retains native pagination and its existing wait behavior.",
+  });
 
   const runtime = new RuntimeStore();
   runtime.ensureThread("thread-validation");
   const control = controlFor(runtime);
-  for (const waitMs of [-1, MAX_OBSERVE_WAIT_MS + 1, 1.5]) {
+  for (const waitMs of [-1, 120_001, 1.5]) {
     await assert.rejects(
       control.call("codex_observe", {
         thread_id: "thread-validation",
         wait_ms: waitMs,
       }),
-      /wait_ms must be an integer from 0 to 10000/,
+      /wait_ms must be an integer from 0 to 120000/,
+    );
+    await assert.rejects(
+      runtime.observeWithWait("thread-validation", undefined, 50, waitMs),
+      /wait_ms must be an integer from 0 to 120000/
     );
   }
   await within(control.call("codex_observe", {

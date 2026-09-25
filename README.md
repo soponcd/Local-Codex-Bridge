@@ -85,16 +85,20 @@ Windows 与 macOS 共用同一核心 Bridge，实现差异只保留在平台原�
 
 | Tool               | 用途                                                         | 边界                                                         |
 | ------------------ | ------------------------------------------------------------ | ------------------------------------------------------------ |
-| `codex_threads`    | 列出、搜索、读取原生 Codex 持久线程                          | `cwd` / search 只是筛选条件，不是 ACL                        |
+| `codex_threads`    | 列出、搜索、读取原生 Codex 持久线程元数据及按需分页历史      | `cwd` / search 只是筛选条件，不是 ACL                        |
 | `codex_models`     | 按需读取一页原生 `model/list`                                | 不缓存模型目录，不维护 current-model registry                |
 | `codex_turn`       | 创建或恢复原生 thread，并启动一个 turn                       | 返回 accepted 不等于任务完成；model / effort 都是可选 override |
-| `codex_observe`    | 有界读取实时事件、持久历史、pending requests、terminal state 与 cursor | 支持一次 bounded wait；安静不等于卡死                        |
+| `codex_observe`    | 有界读取实时事件、pending requests、terminal state 与 live cursor | runtime 缺失时只读持久元数据；支持一次 bounded wait          |
 | `codex_steer`      | 对同一个 active turn 追加语义纠正或新意图                    | 不是 timer、polling 或 retry 机制                            |
 | `codex_respond`    | 回答真实存在且 Bridge 明确支持的 approval / user-input / permission request | 必须保留原始 request id 和准确 scope；不支持 elicitation     |
 | `codex_interrupt`  | 中断准确的 active thread / turn                              | 只发送原生 interrupt，不重启 Bridge 或 app-server            |
 | `codex_checkpoint` | 保存可选、精简、有界的 supervisory anchor                    | 不是 transcript、job id 或 Codex history 的替代品            |
 
 完整 schema 与运行时限制以 [`src/tools.ts`](src/tools.ts) 为准。
+
+`codex_threads(thread_id)` 和 `include_turns:false` 只读 `thread/read(includeTurns:false)` 元数据。旧参数 `include_turns:true` 现在返回 migration error；持久历史请用 `history:{kind:"turns", cursor?, limit?, sort_direction?}` 获取 turn 页，再用 `history:{kind:"items", turn_id, cursor?, limit?, sort_direction?}` 获取指定 turn 的 item 页。turn 页固定 `itemsView:"notLoaded"`；默认 limit 分别为 20 / 10，上限分别为 50 / 20。原生 `nextCursor:null` 才表示当前方向结束；反向 `backwardsCursor` 要配合相反的 `sort_direction`。turn 反向页可能再次包含 anchor turn；Bridge 不去重。历史 cursor、顶层 thread/list cursor、`codex_observe` live 数字 cursor 互不通用。
+
+历史页必须能按当前 sanitizer 原样交付，且完整 MCP JSON 结果须在 256 KiB 预算内（其中 1 KiB 留给 framing/request id）。已完整接收的超预算页返回 `history_page_too_large:`；会被脱敏或裁剪的页返回 `history_page_not_lossless:`；原生页结构不完整返回 `history_upstream_invalid:`。错误不会附带部分 data/cursor。App Server 单行入站超过 10 MiB 仍是连接级 fatal protocol failure，无法保证转成普通分页错误。cursor 有效期与分页期间的快照一致性由 upstream 决定。
 
 ------
 
@@ -149,6 +153,10 @@ Bridge 不尝试推断当前 thread 正在使用哪个模型。
 `codex_turn` 的成功返回只表示 native `turn/start` 已被接受。
 
 长任务通常应继续通过 `codex_observe` 监督，而不是把“请求已接受”误认为“任务已经完成”。
+
+可选的 `wait_ms` 上限为 `120000` 毫秒（120 秒），截止时间从本次调用开始固定；省略或设为 `0` 时立即读取。completed agent message、待处理请求、明确失败／警告、终态和无法识别的 native 事件会提前唤醒；已识别的 delta、成功命令等活动累计到下次唤醒或本次截止时间。Bridge 不进行 polling 或 stall detection。
+
+默认 `view: "compact"` 跨 native chunks 排掉 silent events，仅交付有界的 typed supervision facts 与活动计数；`limit` 约束投影后的 facts。正常结果用 `next_cursor` 续读，只有 ring 缺口才附 `cursor_lost` / `cursor_floor`；命中内部排水上限会明确返回 `continuation: "drainage_yield"`。`view: "raw"` 保留原有 native 事件分页和等待行为，可用指定 native cursor 与 `wait_ms: 0` 下钻。真的没有 native 变化、待处理请求或终态时，截止返回仅含 `runtime_available`、`runtime_status`、`active_turn_id`、`next_cursor`、`no_change: true` 五字段。发生过活动不会标成 `no_change`；它也不表示 stalled。
 
 一个典型流程是：
 
@@ -412,7 +420,7 @@ Bridge 的：
 
 主要存在于内存中。
 
-Bridge 重启后，`codex_observe` 可以从 native persisted history 回退恢复有限观察信息，但不会伪造已经丢失的 live state。
+Bridge 重启且缺失 live runtime 时，`codex_observe` 只读 `thread/read(includeTurns:false)` 元数据；`terminal:null` 和 `active_turn_id:null` 表示未知。返回的零值 live cursor、空 events / pending requests 只是 unavailable placeholders，不能重建 live state。需要持久历史时按需调用 `codex_threads.history`。runtime 仍存在但 ring 已淘汰事件时，`cursor_lost` / `cursor_floor` 继续表示真实的 live 缺口。
 
 ### Checkpoint
 
@@ -468,7 +476,6 @@ Local Codex Bridge 当前刻意不做：
 以下 upstream 能力也没有因为“存在”就自动加入 Bridge：
 
 - `command/exec`
-- `thread/turns/list`
 - `sourceKinds`
 - elicitation response
 - provider / `serviceTier` capability abstraction
