@@ -80,11 +80,11 @@ export function exactHistoryResponse(response: Record<string, unknown>): Record<
     throw new Error("history_page_too_large: received page exceeds the lossless MCP byte budget; paginated pages may retry the same cursor with a smaller limit; a legacy turn at limit:1 cannot be made smaller");
   }
 
-  // Keep the current transport sanitizer as the eligibility policy, then
-  // return the original response so successful pages are never rewritten.
+  // Let History strings fit the MCP byte cap while retaining all other
+  // transport limits. Return the original only when the projection is exact.
   let transportProjection: unknown;
   try {
-    transportProjection = sanitizeForTransport(response);
+    transportProjection = sanitizeForTransport(response, { maxStringChars: MAX_HISTORY_MCP_BYTES });
   } catch {
     throw new Error("history_page_not_lossless: sanitizer cannot project the page");
   }

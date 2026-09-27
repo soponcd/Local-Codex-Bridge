@@ -8,7 +8,7 @@ import {
   HISTORY_MCP_WRAPPER_ALLOWANCE_BYTES,
   MAX_HISTORY_MCP_BYTES,
 } from "../src/history.js";
-import { RuntimeStore } from "../src/runtime.js";
+import { RuntimeStore, sanitizeForTransport } from "../src/runtime.js";
 import { ControlSurface, TOOL_DEFINITIONS } from "../src/tools.js";
 
 interface Request { method: string; params: Record<string, unknown> }
@@ -142,11 +142,16 @@ test("invalid upstream pages and upstream cursor errors never fall back to full 
   assert.deepEqual(manager.calls.map((call) => call.method), ["thread/read", "thread/items/list"]);
 });
 
+test("history permits long strings without changing global sanitizer defaults or rewriting pages", () => {
+  const response = { data: [{ aggregatedOutput: "x".repeat(16_007) }] };
+  assert.match(JSON.stringify(sanitizeForTransport(response)), /truncated/);
+  assert.strictEqual(exactHistoryResponse(response), response);
+});
+
 test("history exactness rejects sanitizer mutation, including redaction, without partial pages", async () => {
   const values = [
     { api_key: "secret" },
     { text: "Bearer abcdefghijklmnop" },
-    { text: "x".repeat(12_001) },
     { nested: { a: { b: { c: { d: { e: { f: { g: { h: "deep" } } } } } } } } },
     { many: Array.from({ length: 51 }, (_, i) => i) },
     { many: Object.fromEntries(Array.from({ length: 61 }, (_, i) => [`field${i}`, i])) },

@@ -152,6 +152,42 @@ test("MCP history pages serialize exactly and errors keep stable prefixes withou
   }
 });
 
+test("MCP history delivers a 16007-character command output exactly and rejects late secrets", async () => {
+  const fixture = fileURLToPath(new URL("./history-mcp-fixture.js", import.meta.url));
+  const client = new TestClient(process.env, fixture);
+  try {
+    await initialize(client, 1);
+    const response = await client.request(2, "tools/call", {
+      name: "codex_history",
+      arguments: { thread_id: "thread-1", kind: "items", turn_id: "turn-1", cursor: "long-command", limit: 1 },
+    });
+    const result = successfulToolPayload(response);
+    assert.deepEqual(result, {
+      source: "codex_app_server", mode: "history", coverage: "native_persisted_history",
+      history_mode: "paginated", kind: "items", page_granularity: "item", thread_id: "thread-1", turn_id: "turn-1",
+      data: [{ turnId: "turn-1", item: {
+        id: "command-1", type: "commandExecution", status: "completed",
+        command: "echo audit", cwd: "D:\\work",
+        commandActions: [{ type: "unknown", command: "echo audit" }],
+        aggregatedOutput: "x".repeat(16_007), exitCode: 0, durationMs: 123,
+      } }],
+      nextCursor: "command-next", backwardsCursor: "command-back",
+    });
+    assert.doesNotMatch(JSON.stringify(result), /truncated/i);
+    const rejected = await client.request(3, "tools/call", {
+      name: "codex_history",
+      arguments: { thread_id: "thread-1", kind: "items", turn_id: "turn-1", cursor: "late-secret", limit: 1 },
+    });
+    assert.equal((rejected.result as Record<string, unknown>).isError, true);
+    const error = toolPayload(rejected);
+    assert.deepEqual(Object.keys(error), ["error"]);
+    assert.match(error.error as string, /^history_page_not_lossless: redaction or sanitizer policy would alter the page$/);
+    assert.doesNotMatch(JSON.stringify(rejected), /fixture-only-value|command-1/);
+  } finally {
+    assert.equal(await client.close(), 0);
+  }
+});
+
 test("MCP legacy history delivers full turn data and a distinct unsupported-items error", async () => {
   const fixture = fileURLToPath(new URL("./history-mcp-fixture.js", import.meta.url));
   const client = new TestClient(process.env, fixture);

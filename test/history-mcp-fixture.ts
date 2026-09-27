@@ -36,6 +36,18 @@ const appServer = {
     if (params.cursor === "redacted") return { data: [{ id: "turn-1", api_key: "secret" }], nextCursor: null, backwardsCursor: null };
     if (params.cursor === "oversized") return { data: [{ id: "turn-1", text: "中\n\"\\".repeat(60_000) }], nextCursor: null, backwardsCursor: null };
     if (params.cursor === "near-boundary") return nearBoundaryPage();
+    if (params.cursor === "long-command" || params.cursor === "late-secret") return {
+      data: [{ turnId: params.turnId, item: {
+        id: "command-1", type: "commandExecution", status: "completed",
+        command: "echo audit", cwd: "D:\\work",
+        commandActions: [{ type: "unknown", command: "echo audit" }],
+        aggregatedOutput: params.cursor === "late-secret"
+          ? ("x".repeat(12_001) + "\nAPI_KEY=fixture-only-value\n").padEnd(16_007, "x")
+          : "x".repeat(16_007),
+        exitCode: 0, durationMs: 123,
+      } }],
+      nextCursor: "command-next", backwardsCursor: "command-back",
+    };
     if (method === "thread/turns/list") return { data: [{ id: "turn-1", status: "completed", items: [] }], nextCursor: "next-turn", backwardsCursor: "reverse-turn" };
     return { data: [{ turnId: params.turnId, startedAtMs: 123, completedAtMs: null, futureField: { preserved: true }, item: { id: "item-1", type: "agentMessage", text: "🌱 exact" } }], nextCursor: null, backwardsCursor: "reverse-item" };
   },
