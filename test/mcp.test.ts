@@ -660,6 +660,25 @@ test("MCP stdio initializes idempotently and lists exactly twelve fully annotate
     assert.ok("cursor" in modelProperties);
     assert.ok("include_hidden" in modelProperties);
     const respondTool = tools.find((tool) => tool.name === "codex_respond");
+    const respondSchema = respondTool?.inputSchema as Record<string, unknown>;
+    const respondProperties = respondSchema.properties as Record<string, Record<string, unknown>>;
+    assert.deepEqual(respondProperties.network_policy_amendment, {
+      type: "object",
+      properties: {
+        host: { type: "string", minLength: 1 },
+        action: { type: "string", enum: ["allow", "deny"] },
+      },
+      required: ["host", "action"],
+      additionalProperties: false,
+      description: "Native network policy amendment for future requests; valid only for item/commandExecution/requestApproval. Provide exactly one of decision, execpolicy_amendment, network_policy_amendment, answers, permissions, or response.",
+    });
+    assert.deepEqual(respondSchema.anyOf, [
+      "decision", "execpolicy_amendment", "network_policy_amendment", "answers", "permissions", "response",
+    ].map((key) => ({ required: [key] })));
+    assert.equal(respondSchema.additionalProperties, false);
+    assert.deepEqual(respondProperties.decision?.enum, ["accept", "acceptForSession", "decline", "cancel"]);
+    assert.equal(respondProperties.decision?.description,
+      "Command or file approval decision. decline rejects the action and continues the current turn; cancel rejects the action and immediately interrupts the current turn.");
     assert.equal(
       (respondTool?.annotations as Record<string, unknown>).idempotentHint,
       false,

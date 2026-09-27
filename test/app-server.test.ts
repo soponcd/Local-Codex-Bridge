@@ -226,6 +226,119 @@ test("failed app-server response write restores the original pending request", a
   }
 });
 
+test("codex_respond maps network allow/deny and preserves distinct stable and legacy decisions", async () => {
+  const manager = new CapturingResponseManager();
+  const control = new ControlSurface(manager, undefined, WINDOWS_PLATFORM_POLICY);
+  const command = "item/commandExecution/requestApproval";
+  const cases: Array<{ method: string; input: Record<string, unknown>; decision: unknown }> = [];
+  for (const action of ["allow", "deny"]) {
+    const amendment = { host: "api.example.com", action };
+    cases.push({ method: command, input: { network_policy_amendment: amendment },
+      decision: { applyNetworkPolicyAmendment: { network_policy_amendment: amendment } } });
+  }
+  for (const method of [command, "item/fileChange/requestApproval", "execCommandApproval", "applyPatchApproval"]) {
+    for (const decision of ["accept", "acceptForSession", "decline", "cancel"]) {
+      const legacy: Record<string, unknown> = {
+        accept: "approved", acceptForSession: "approved_for_session",
+        decline: { denied: { rejection: "declined by MCP client" } }, cancel: "abort",
+      };
+      cases.push({ method, input: { decision }, decision: method.startsWith("item/") ? decision : legacy[decision] });
+    }
+  }
+  for (const method of [command, "execCommandApproval"]) {
+    cases.push({ method, input: { execpolicy_amendment: ["npm", "test"] },
+      decision: method === command
+        ? { acceptWithExecpolicyAmendment: { execpolicy_amendment: ["npm", "test"] } }
+        : { approved_execpolicy_amendment: { proposed_execpolicy_amendment: ["npm", "test"] } } });
+  }
+  manager.runtime.markTurnAccepted("thread-network", "turn-network");
+  try {
+    for (const [id, current] of cases.entries()) {
+      manager.runtime.recordServerRequest(id, current.method, { threadId: "thread-network", turnId: "turn-network" });
+      await control.call("codex_respond", {
+        request_id: id, thread_id: "thread-network", turn_id: "turn-network", method: current.method, ...current.input,
+      });
+      assert.deepEqual(manager.responses.at(-1), { id, result: { decision: current.decision } });
+      assert.deepEqual(manager.runtime.pendingForThread("thread-network"), []);
+    }
+  } finally {
+    await manager.close();
+  }
+});
+
+test("codex_respond rejects invalid network amendments before claiming pending requests", async (t) => {
+  const command = "item/commandExecution/requestApproval";
+  const valid = { host: "api.example.com", action: "allow" };
+  const cases: Array<{ name: string; method?: string; input: Record<string, unknown>; error: RegExp }> = [];
+  for (const [name, amendment, error] of [
+    ["missing host", { action: "allow" }, /host must be a non-empty string/],
+    ["empty host", { host: "", action: "allow" }, /host must be a non-empty string/],
+    ["blank host", { host: "  ", action: "allow" }, /host must be a non-empty string/],
+    ["non-string host", { host: 7, action: "allow" }, /host must be a non-empty string/],
+    ["missing action", { host: valid.host }, /requires action/],
+    ["invalid action", { host: valid.host, action: "accept" }, /action must be one of: allow, deny/],
+    ["non-string action", { host: valid.host, action: true }, /action must be one of: allow, deny/],
+    ["extra property", { ...valid, persist: true }, /Unknown argument field: persist/],
+    ["null amendment", null, /network_policy_amendment must be an object/],
+    ["array amendment", [], /network_policy_amendment must be an object/],
+    ["string amendment", "allow", /network_policy_amendment must be an object/],
+  ] as const) {
+    cases.push({ name, input: { network_policy_amendment: amendment }, error });
+  }
+  for (const method of ["item/fileChange/requestApproval", "execCommandApproval", "applyPatchApproval",
+    "item/tool/requestUserInput", "item/permissions/requestApproval", "future/requestApproval"]) {
+    cases.push({ name: `wrong method ${method}`, method, input: { network_policy_amendment: valid },
+      error: /valid only for item\/commandExecution\/requestApproval|Unsupported app-server request method/ });
+  }
+  for (const [selector, value] of Object.entries({ decision: "accept", execpolicy_amendment: ["npm"],
+    answers: {}, permissions: {}, response: {}, scope: "session" })) {
+    cases.push({ name: `conflicting ${selector}`, input: { network_policy_amendment: valid, [selector]: value },
+      error: /Provide exactly one|permissions and scope are valid only/ });
+  }
+  for (const current of cases) {
+    await t.test(current.name, async (t) => {
+      const manager = new CapturingResponseManager();
+      const control = new ControlSurface(manager, undefined, WINDOWS_PLATFORM_POLICY);
+      const method = current.method ?? command;
+      manager.runtime.markTurnAccepted("thread-network", "turn-network");
+      manager.runtime.recordServerRequest(41, method, { threadId: "thread-network", turnId: "turn-network" });
+      const before = manager.runtime.pendingForThread("thread-network");
+      const claim = t.mock.method(manager.runtime, "claimPending");
+      try {
+        await assert.rejects(control.call("codex_respond", {
+          request_id: 41, thread_id: "thread-network", turn_id: "turn-network", method, ...current.input,
+        }), current.error);
+        assert.equal(claim.mock.callCount(), 0);
+        assert.deepEqual(manager.responses, []);
+        assert.deepEqual(manager.runtime.pendingForThread("thread-network"), before);
+      } finally {
+        await manager.close();
+      }
+    });
+  }
+});
+
+test("failed network amendment response write retains the same pending request", async () => {
+  const manager = new RejectingResponseManager();
+  const control = new ControlSurface(manager, undefined, WINDOWS_PLATFORM_POLICY);
+  const method = "item/commandExecution/requestApproval";
+  manager.runtime.markTurnAccepted("thread-network", "turn-network");
+  manager.runtime.recordServerRequest(41, method, { threadId: "thread-network", turnId: "turn-network" });
+  const before = manager.runtime.pendingForThread("thread-network");
+  try {
+    await assert.rejects(control.call("codex_respond", {
+      request_id: 41, thread_id: "thread-network", turn_id: "turn-network", method,
+      network_policy_amendment: { host: "api.example.com", action: "deny" },
+    }), /synthetic app-server response write failure/);
+    assert.equal(manager.lastResponseId, 41);
+    assert.deepEqual(manager.runtime.pendingForThread("thread-network"), before);
+    const pending = manager.runtime.claimPending(41, { threadId: "thread-network", turnId: "turn-network", method });
+    manager.runtime.releasePending(pending);
+  } finally {
+    await manager.close();
+  }
+});
+
 test("codex_respond sends exact stable permission responses including an empty grant", async () => {
   const manager = new CapturingResponseManager();
   const control = new ControlSurface(manager, undefined, WINDOWS_PLATFORM_POLICY);

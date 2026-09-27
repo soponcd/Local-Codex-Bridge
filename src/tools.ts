@@ -476,13 +476,23 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
         decision: {
           type: "string",
           enum: ["accept", "acceptForSession", "decline", "cancel"],
-          description: "Command or file approval decision.",
+          description: "Command or file approval decision. decline rejects the action and continues the current turn; cancel rejects the action and immediately interrupts the current turn.",
         },
         execpolicy_amendment: {
           type: "array",
           minItems: 1,
           items: { type: "string" },
           description: "Command approval exec-policy amendment; encoded in app-server's native decision shape.",
+        },
+        network_policy_amendment: {
+          type: "object",
+          properties: {
+            host: { type: "string", minLength: 1 },
+            action: { type: "string", enum: ["allow", "deny"] },
+          },
+          required: ["host", "action"],
+          additionalProperties: false,
+          description: "Native network policy amendment for future requests; valid only for item/commandExecution/requestApproval. Provide exactly one of decision, execpolicy_amendment, network_policy_amendment, answers, permissions, or response.",
         },
         answers: {
           type: "object",
@@ -516,6 +526,7 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
       anyOf: [
         { required: ["decision"] },
         { required: ["execpolicy_amendment"] },
+        { required: ["network_policy_amendment"] },
         { required: ["answers"] },
         { required: ["permissions"] },
         { required: ["response"] },
@@ -1470,6 +1481,7 @@ export class ControlSurface {
       "method",
       "decision",
       "execpolicy_amendment",
+      "network_policy_amendment",
       "answers",
       "permissions",
       "scope",
@@ -1493,10 +1505,14 @@ export class ControlSurface {
     }
     const decision = enumValue(args, "decision", ["accept", "acceptForSession", "decline", "cancel"] as const);
     const amendment = args.execpolicy_amendment;
+    const networkAmendment = args.network_policy_amendment;
     const answers = args.answers;
     const permissions = args.permissions;
     const scope = enumValue(args, "scope", ["turn", "session"] as const);
     const generic = args.response;
+    if (networkAmendment !== undefined && method !== "item/commandExecution/requestApproval") {
+      throw new Error("network_policy_amendment is valid only for item/commandExecution/requestApproval");
+    }
 
     let response: Record<string, unknown> | undefined;
     if (method === "item/permissions/requestApproval") {
@@ -1522,11 +1538,12 @@ export class ControlSurface {
       const supplied = [
         decision !== undefined,
         amendment !== undefined,
+        networkAmendment !== undefined,
         answers !== undefined,
         generic !== undefined,
       ].filter(Boolean).length;
       if (supplied !== 1) {
-        throw new Error("Provide exactly one of decision, execpolicy_amendment, answers, or response");
+        throw new Error("Provide exactly one of decision, execpolicy_amendment, network_policy_amendment, answers, or response");
       }
     }
 
@@ -1538,7 +1555,16 @@ export class ControlSurface {
       method === "execCommandApproval" ||
       method === "applyPatchApproval"
     ) {
-      if (amendment !== undefined) {
+      if (networkAmendment !== undefined) {
+        const value = asObject(networkAmendment, "network_policy_amendment");
+        onlyKeys(value, ["host", "action"]);
+        const host = requiredString(value, "host");
+        const action = enumValue(value, "action", ["allow", "deny"] as const);
+        if (action === undefined) {
+          throw new Error("network_policy_amendment requires action");
+        }
+        response = { decision: { applyNetworkPolicyAmendment: { network_policy_amendment: { host, action } } } };
+      } else if (amendment !== undefined) {
         if (method !== "item/commandExecution/requestApproval" && method !== "execCommandApproval") {
           throw new Error("execpolicy_amendment is valid only for command approval");
         }
@@ -1574,7 +1600,7 @@ export class ControlSurface {
           response = { decision };
         }
       } else {
-        throw new Error("Approval requests require decision or execpolicy_amendment");
+        throw new Error("Approval requests require decision, execpolicy_amendment, or network_policy_amendment");
       }
     } else if (method === "item/tool/requestUserInput") {
       response = answers !== undefined ? { answers: asObject(answers, "answers") } : asObject(generic, "response");

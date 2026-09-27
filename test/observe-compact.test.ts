@@ -644,7 +644,15 @@ test("cached projections stay bounded and replay scope elision leaves retained f
 
 test("an elapsed compact deadline never hides an outstanding approval as no_change", async (t) => {
   const runtime = started();
-  runtime.recordServerRequest(7, "item/commandExecution/requestApproval", { ...scope, command: "npm test" });
+  const params = {
+    ...scope, command: "npm test",
+    networkApprovalContext: { host: "api.example.com", protocol: "https" },
+    proposedNetworkPolicyAmendments: [
+      { host: "api.example.com", action: "allow" },
+      { host: "api.example.com", action: "deny" },
+    ],
+  };
+  runtime.recordServerRequest(7, "item/commandExecution/requestApproval", params);
   // The request event was already consumed, but the request remains pending.
   // Advance the clock during snapshot collection to exercise the deadline edge
   // without relying on host timing or an arbitrary sleep.
@@ -660,6 +668,7 @@ test("an elapsed compact deadline never hides an outstanding approval as no_chan
   assert.equal(result.no_change, undefined);
   assert.equal(result.pending_requests.length, 1);
   assert.equal(result.pending_requests[0].request_id, 7);
+  assert.deepEqual(result.pending_requests[0].params, params);
   assert.equal(result.next_cursor, 1);
 });
 
