@@ -1,4 +1,4 @@
-// Qualified against codex-cli 0.155.0-alpha.16.4 generate-ts --experimental.
+// Qualified against codex-cli 0.158.0-alpha.2.1 generate-ts --experimental.
 // Every installed notification and ThreadItem has an explicit compact policy.
 export type CompactPolicy =
   | "wake_typed"
@@ -58,6 +58,7 @@ export const NOTIFICATION_POLICIES: Readonly<Record<string, CompactPolicy>> = {
   "mcpServer/startupStatus/updated": "accumulate_typed",
   "mcpServer/event/stream/notification": diagnostic(false),
   "account/updated": "ignore_compact",
+  "account/gatewayOAuth/changed": "ignore_compact",
   "account/rateLimits/updated": "ignore_compact",
   "app/list/updated": "ignore_compact",
   "remoteControl/status/changed": "ignore_compact",

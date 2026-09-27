@@ -1027,7 +1027,10 @@ export class RuntimeStore {
       }
       await this.#waitForChange(runtime, revision, deadline, signal);
       if (signal?.aborted) return result(runtime.nextCursor - 1 > scan.nextCursor);
-      if (runtime.revision !== revision && runtime.nextCursor - 1 === snapshot.current_cursor) return result(false);
+      if (runtime.revision !== revision && runtime.nextCursor - 1 === snapshot.current_cursor) {
+        last = this.observe(threadId, scan.nextCursor, Math.min(COMPACT_DRAIN_CHUNK, COMPACT_DRAIN_CEILING - scan.scanned))!;
+        return result(false);
+      }
     }
   }
 

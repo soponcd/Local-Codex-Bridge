@@ -1,16 +1,19 @@
 import { sanitizeForTransport } from "./runtime.js";
 
-// Budget the serialized MCP result, including both layers of JSON escaping.
-// The allowance covers the request id and framing beyond the fixed wrapper.
+// Count the actual success envelope: one structured result and a tiny text marker.
+// Reserve framing/request-id headroom before the final MCP check with the real id.
 export const MAX_HISTORY_MCP_BYTES = 256 * 1024;
 export const HISTORY_MCP_WRAPPER_ALLOWANCE_BYTES = 1024;
 
+export function structuredToolResult(response: unknown): Record<string, unknown> {
+  return { content: [{ type: "text", text: "structured result" }], structuredContent: response };
+}
+
 export function historyMcpBytes(response: unknown, id: string | number): number {
-  const text = JSON.stringify(response);
   return Buffer.byteLength(JSON.stringify({
     jsonrpc: "2.0",
     id,
-    result: { content: [{ type: "text", text }] },
+    result: structuredToolResult(response),
   }) + "\n", "utf8");
 }
 
@@ -74,7 +77,7 @@ export function exactHistoryResponse(response: Record<string, unknown>): Record<
   }
 
   if (historyMcpBytes(response, "") + HISTORY_MCP_WRAPPER_ALLOWANCE_BYTES > MAX_HISTORY_MCP_BYTES) {
-    throw new Error("history_page_too_large: received page exceeds the lossless MCP byte budget; retry with the same cursor and a smaller limit if possible");
+    throw new Error("history_page_too_large: received page exceeds the lossless MCP byte budget; paginated pages may retry the same cursor with a smaller limit; a legacy turn at limit:1 cannot be made smaller");
   }
 
   // Keep the current transport sanitizer as the eligibility policy, then

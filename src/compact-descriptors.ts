@@ -2,9 +2,12 @@
 // rawResponse* are TS-only ServerNotification methods; their standalone v2 JSON schemas supply the shapes.
 // Runtime shapes follow JSON schema. TS supplies method/item coverage only; TS-only field changes require protocol review.
 import type { CompactDescriptorBundle } from "./compact-shape.js";
-export const COMPACT_SCHEMA_FINGERPRINT = "5fa1ab92b744ec664302e5f5c3ff3c02f2a57dbf70829b5ceb14258821b808d1";
+export const COMPACT_SCHEMA_FINGERPRINT = "5a7bf8de7d254b66c7ac4631ab3b36622a1308f5d64edbf8cc56f5d5245e738a";
 export const NOTIFICATION_SHAPES: CompactDescriptorBundle = {
   "methods": {
+    "account/gatewayOAuth/changed": {
+      "$ref": "#/definitions/GatewayOAuthChangedNotification"
+    },
     "account/login/completed": {
       "$ref": "#/definitions/AccountLoginCompletedNotification"
     },
@@ -2145,6 +2148,42 @@ export const NOTIFICATION_SHAPES: CompactDescriptorBundle = {
         "sessionId"
       ],
       "type": "object"
+    },
+    "GatewayOAuthChangedNotification": {
+      "properties": {
+        "authUrl": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "providerId": {
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/definitions/GatewayOAuthStatus"
+        }
+      },
+      "required": [
+        "providerId",
+        "status"
+      ],
+      "type": "object"
+    },
+    "GatewayOAuthStatus": {
+      "enum": [
+        "notReady",
+        "started",
+        "succeeded",
+        "failed"
+      ],
+      "type": "string"
     },
     "GitInfo": {
       "properties": {

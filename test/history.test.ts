@@ -15,6 +15,8 @@ interface Request { method: string; params: Record<string, unknown> }
 
 class StubAppServer extends AppServerManager {
   readonly calls: Request[] = [];
+  routeMetadata = true;
+  historyMode: unknown = "paginated";
   constructor(readonly handler: (method: string, params: Record<string, unknown>) => unknown,
               runtime = new RuntimeStore()) {
     super(runtime, { executable: "unused-test-codex" });
@@ -22,6 +24,7 @@ class StubAppServer extends AppServerManager {
   override async request(method: string, params: unknown): Promise<unknown> {
     const request = { method, params: params as Record<string, unknown> };
     this.calls.push(request);
+    if (method === "thread/read" && this.routeMetadata) return { thread: { id: request.params.threadId, historyMode: this.historyMode, turns: [] } };
     return this.handler(method, request.params);
   }
 }
@@ -29,53 +32,49 @@ class StubAppServer extends AppServerManager {
 const page = (data: unknown[] = [], nextCursor: string | null = null,
               backwardsCursor: string | null = null) => ({ data, nextCursor, backwardsCursor });
 const callHistory = (surface: ControlSurface, history: Record<string, unknown>) =>
-  surface.call("codex_threads", { thread_id: "thread-1", history });
+  surface.call("codex_history", { thread_id: "thread-1", ...history });
 
-test("history schema and pre-RPC parameter matrix match the two native page modes", async () => {
-  const schema = TOOL_DEFINITIONS.find((tool) => tool.name === "codex_threads")?.inputSchema;
-  assert.ok(schema?.oneOf);
-  const historySchema = (schema.properties as Record<string, unknown>).history as Record<string, unknown>;
-  const branches = historySchema.oneOf as Array<Record<string, unknown>>;
-  assert.equal(branches.length, 2);
-  assert.deepEqual(branches.map((branch) => branch.required), [["kind"], ["kind", "turn_id"]]);
-  assert.deepEqual(branches.map((branch) => branch.additionalProperties), [false, false]);
-
+test("history schema and static validation separate history from thread metadata/list", async () => {
+  const schema = TOOL_DEFINITIONS.find((tool) => tool.name === "codex_history")!.inputSchema;
+  assert.deepEqual(schema.required, ["thread_id", "kind"]);
+  assert.equal(schema.additionalProperties, false);
+  assert.equal((schema.oneOf as unknown[]).length, 2);
+  const properties = schema.properties as Record<string, Record<string, unknown>>;
+  assert.equal(properties.limit!.maximum, 50);
+  assert.equal(properties.cursor!.type, "string");
+  assert.equal("history" in (TOOL_DEFINITIONS.find(tool => tool.name === "codex_threads")!.inputSchema.properties as object), false);
   const manager = new StubAppServer(() => { throw new Error("native call forbidden"); });
   const surface = new ControlSurface(manager);
   const invalid = [
-    { history: { kind: "turns" } },
-    { thread_id: "thread-1", history: { kind: "turns" }, include_turns: false },
-    { thread_id: "thread-1", history: { kind: "items" }, include_turns: true },
-    { thread_id: "thread-1", include_turns: true },
-    { include_turns: false },
-    { thread_id: "thread-1", cwd: "D:\\work" },
-    { thread_id: "thread-1", history: { kind: "turns" }, cursor: "list-cursor" },
-    { thread_id: "thread-1", history: { kind: "turns" }, limit: 1 },
-    { thread_id: "thread-1", history: null },
-    { thread_id: "thread-1", history: [] },
-    { thread_id: "thread-1", history: { kind: "unknown" } },
-    { thread_id: "thread-1", history: { kind: "turns", turn_id: "turn-1" } },
-    { thread_id: "thread-1", history: { kind: "items" } },
-    { thread_id: "thread-1", history: { kind: "items", turn_id: "" } },
-    { thread_id: "thread-1", history: { kind: "items", turn_id: null } },
-    { thread_id: "thread-1", history: { kind: "turns", cursor: null } },
-    { thread_id: "thread-1", history: { kind: "turns", cursor: "" } },
-    { thread_id: "thread-1", history: { kind: "turns", sort_direction: null } },
-    { thread_id: "thread-1", history: { kind: "turns", sort_direction: "sideways" } },
-    { thread_id: "thread-1", history: { kind: "turns", limit: 0 } },
-    { thread_id: "thread-1", history: { kind: "turns", limit: 51 } },
-    { thread_id: "thread-1", history: { kind: "turns", limit: 1.5 } },
-    { thread_id: "thread-1", history: { kind: "items", turn_id: "turn-1", limit: 21 } },
-    { thread_id: "thread-1", history: { kind: "items", turn_id: "turn-1", extra: true } },
+    {}, { kind: "turns" }, { thread_id: "thread-1" },
+    ...[null, "", " ", 1, "x".repeat(201)].map(thread_id => ({ thread_id, kind: "turns" })),
+    ...[null, "", "unknown"].map(kind => ({ thread_id: "thread-1", kind })),
+    ...[null, "", " ", 3, {}, "x".repeat(10_001)].map(cursor => ({ thread_id: "thread-1", kind: "turns", cursor })),
+    ...[null, 0, 51, 1.5, "2"].map(limit => ({ thread_id: "thread-1", kind: "turns", limit })),
+    ...[null, "", "sideways"].map(sort_direction => ({ thread_id: "thread-1", kind: "turns", sort_direction })),
+    { thread_id: "thread-1", kind: "turns", turn_id: "turn-1" },
+    { thread_id: "thread-1", kind: "turns", turn_id: null },
+    { thread_id: "thread-1", kind: "items" },
+    ...[null, "", " ", 4, "x".repeat(201)].map(turn_id => ({ thread_id: "thread-1", kind: "items", turn_id })),
+    { thread_id: "thread-1", kind: "items", turn_id: "turn-1", limit: 21 },
+    ...["history", "include_turns", "cwd", "extra"].map(key => ({ thread_id: "thread-1", kind: "turns", [key]: true })),
   ];
   for (const args of invalid) {
-    await assert.rejects(surface.call("codex_threads", args), /./, JSON.stringify(args));
-    assert.equal(manager.calls.length, 0, JSON.stringify(args));
+    await assert.rejects(surface.call("codex_history", args), /./, JSON.stringify(args));
+    assert.equal(manager.calls.length, 0);
   }
-  await assert.rejects(surface.call("codex_threads", { thread_id: "thread-1", include_turns: true }),
-    /include_turns:true.*history/);
-  assert.equal(manager.calls.length, 0);
+  for (const args of [
+    { thread_id: "thread-1", include_turns: true }, { include_turns: false },
+    { thread_id: "thread-1", cwd: "D:\\work" },
+    { thread_id: "thread-1", history: { kind: "turns" } },
+    { thread_id: "thread-1", kind: "turns" },
+  ]) {
+    await assert.rejects(surface.call("codex_threads", args), /./);
+    assert.equal(manager.calls.length, 0);
+  }
+  await assert.rejects(surface.call("codex_threads", { thread_id: "thread-1", include_turns: true }), /include_turns:true.*codex_history/);
 });
+
 
 test("metadata/list remain distinct and native history pages preserve cursors, order and empty/end", async () => {
   const manager = new StubAppServer((method, params) => {
@@ -94,14 +93,14 @@ test("metadata/list remain distinct and native history pages preserve cursors, o
   });
   const surface = new ControlSurface(manager);
   assert.deepEqual(await surface.call("codex_threads", { thread_id: "thread-1", include_turns: false }),
-    { source: "codex_app_server", mode: "read", thread: { id: "thread-1", turns: [] } });
+    { source: "codex_app_server", mode: "read", thread: { id: "thread-1", historyMode: "paginated", turns: [] } });
   assert.deepEqual(manager.calls.at(-1), { method: "thread/read", params: { threadId: "thread-1", includeTurns: false } });
   assert.equal((await surface.call("codex_threads", { cwd: "D:\\work", search_term: "x", cursor: "list-cursor", limit: 2 }) as Record<string, unknown>).nextCursor, "list-next");
   assert.deepEqual(manager.calls.at(-1), { method: "thread/list", params: { limit: 2, sortKey: "updated_at", sortDirection: "desc", cwd: "D:\\work", searchTerm: "x", cursor: "list-cursor" } });
 
   const first = await callHistory(surface, { kind: "turns" }) as Record<string, unknown>;
   assert.deepEqual(manager.calls.at(-1), { method: "thread/turns/list", params: { threadId: "thread-1", limit: 20, sortDirection: "desc", itemsView: "notLoaded" } });
-  assert.deepEqual(first, { source: "codex_app_server", mode: "history", coverage: "native_persisted_history", kind: "turns", thread_id: "thread-1", data: [{ id: "turn-2", items: [] }, { id: "turn-1", items: [] }], nextCursor: "turn-next", backwardsCursor: "reverse" });
+  assert.deepEqual(first, { source: "codex_app_server", mode: "history", coverage: "native_persisted_history", history_mode: "paginated", kind: "turns", page_granularity: "turn", items_view: "notLoaded", thread_id: "thread-1", data: [{ id: "turn-2", items: [] }, { id: "turn-1", items: [] }], nextCursor: "turn-next", backwardsCursor: "reverse" });
   const empty = await callHistory(surface, { kind: "turns", cursor: "turn-next", limit: 50 });
   assert.deepEqual((empty as Record<string, unknown>).data, []);
   assert.equal((empty as Record<string, unknown>).nextCursor, "turn-next-2");
@@ -133,14 +132,14 @@ test("invalid upstream pages and upstream cursor errors never fall back to full 
   for (const value of malformed) {
     const manager = new StubAppServer(() => value);
     await assert.rejects(callHistory(new ControlSurface(manager), { kind: "turns", limit: 1 }), /^Error: history_upstream_invalid:/);
-    assert.deepEqual(manager.calls.map((call) => call.method), ["thread/turns/list"]);
+    assert.deepEqual(manager.calls.map((call) => call.method), ["thread/read", "thread/turns/list"]);
   }
   const invalidItem = new StubAppServer(() => page([{ turnId: "turn-1" }]));
   await assert.rejects(callHistory(new ControlSurface(invalidItem), { kind: "items", turn_id: "turn-1" }), /^Error: history_upstream_invalid:/);
-  assert.deepEqual(invalidItem.calls.map((call) => call.method), ["thread/items/list"]);
+  assert.deepEqual(invalidItem.calls.map((call) => call.method), ["thread/read", "thread/items/list"]);
   const manager = new StubAppServer(() => { throw new Error("native invalid cursor"); });
   await assert.rejects(callHistory(new ControlSurface(manager), { kind: "items", turn_id: "turn-1", cursor: "stale" }), /native invalid cursor/);
-  assert.deepEqual(manager.calls.map((call) => call.method), ["thread/items/list"]);
+  assert.deepEqual(manager.calls.map((call) => call.method), ["thread/read", "thread/items/list"]);
 });
 
 test("history exactness rejects sanitizer mutation, including redaction, without partial pages", async () => {
@@ -156,7 +155,7 @@ test("history exactness rejects sanitizer mutation, including redaction, without
   for (const item of values) {
     const manager = new StubAppServer(() => page([{ turnId: "turn-1", item }]));
     await assert.rejects(callHistory(new ControlSurface(manager), { kind: "items", turn_id: "turn-1" }), /^Error: history_page_not_lossless:/);
-    assert.deepEqual(manager.calls.map((call) => call.method), ["thread/items/list"]);
+    assert.deepEqual(manager.calls.map((call) => call.method), ["thread/read", "thread/items/list"]);
   }
   assert.equal(HISTORY_MCP_WRAPPER_ALLOWANCE_BYTES, 1024);
   assert.equal(MAX_HISTORY_MCP_BYTES, 256 * 1024);
@@ -166,8 +165,8 @@ test("history exactness rejects sanitizer mutation, including redaction, without
   assert.throws(() => exactHistoryResponse({ data: [long] }), /^Error: history_page_too_large:/);
 });
 
-test("MCP UTF-8 and JSON escaping byte boundary is measured after both serialization layers", () => {
-  for (const character of ["\n", "中"]) {
+test("MCP UTF-8 and JSON escaping byte boundary is measured from the actual structuredContent frame", () => {
+  for (const character of ["\u0001", "\u0000"]) {
     const candidate = (count: number) => ({ data: Array.from({ length: 10 }, () => ({ text: character.repeat(count) })) });
     let low = 0;
     let high = 12_000;
@@ -191,8 +190,8 @@ test("received oversized pages can retry the same cursor with a smaller limit", 
   await assert.rejects(callHistory(surface, { kind: "turns", cursor: "same-cursor", limit: 2 }), /^Error: history_page_too_large:/);
   const retry = await callHistory(surface, { kind: "turns", cursor: "same-cursor", limit: 1 }) as Record<string, unknown>;
   assert.equal(retry.nextCursor, "same-next");
-  assert.deepEqual(manager.calls.map((call) => call.params.cursor), ["same-cursor", "same-cursor"]);
-  assert.deepEqual(manager.calls.map((call) => call.method), ["thread/turns/list", "thread/turns/list"]);
+  assert.deepEqual(manager.calls.filter(call => call.method !== "thread/read").map((call) => call.params.cursor), ["same-cursor", "same-cursor"]);
+  assert.deepEqual(manager.calls.map((call) => call.method), ["thread/read", "thread/turns/list", "thread/read", "thread/turns/list"]);
 });
 
 test("runtime-missing observe returns metadata placeholders in compact/raw/wait and never builds runtime", async () => {
@@ -201,6 +200,7 @@ test("runtime-missing observe returns metadata placeholders in compact/raw/wait 
     assert.equal(params.includeTurns, false);
     return { thread: { id: "thread-1", historyMode: "paginated", turns: [{ id: "should-not-leak", items: [{ text: "secret-final" }] }] } };
   });
+  manager.routeMetadata = false;
   const surface = new ControlSurface(manager);
   for (const args of [{}, { view: "raw" }, { wait_ms: 10 }, { view: "raw", wait_ms: 10 }]) {
     const observed = await surface.call("codex_observe", { thread_id: "thread-1", ...args }) as Record<string, unknown>;
@@ -209,7 +209,7 @@ test("runtime-missing observe returns metadata placeholders in compact/raw/wait 
     assert.equal(observed.active_turn_id, null);
     assert.deepEqual((observed.stored_thread as Record<string, unknown>).turns, []);
     assert.equal(observed.source, "codex_app_server_thread_read_metadata");
-    assert.match(observed.note as string, /unknown.*codex_threads\.history/);
+    assert.match(observed.note as string, /unknown.*codex_history/);
     assert.equal("history_cursor" in observed, false);
     assert.equal(manager.runtime.hasThread("thread-1"), false);
   }
@@ -226,6 +226,7 @@ test("runtime-missing observe returns metadata placeholders in compact/raw/wait 
 test("cancelled runtime-missing observe does not publish a fabricated fallback", async () => {
   let release: ((value: unknown) => void) | undefined;
   const manager = new StubAppServer(() => new Promise<unknown>((resolve) => { release = resolve; }));
+  manager.routeMetadata = false;
   const controller = new AbortController();
   const waiting = new ControlSurface(manager).call("codex_observe", {
     thread_id: "thread-1", wait_ms: 10,
@@ -239,4 +240,80 @@ test("cancelled runtime-missing observe does not publish a fabricated fallback",
   await assert.rejects(waiting, /MCP request cancelled/);
   assert.deepEqual(manager.calls.map((call) => call.method), ["thread/read"]);
   assert.equal(manager.runtime.hasThread("thread-1"), false);
+});
+
+test("legacy full-turn pages preserve native forward/reverse cursors and explicit granularity", async () => {
+  const item = { id: "item-1", type: "agentMessage", text: "legacy 🌱", future: { preserved: true } };
+  const manager = new StubAppServer((method, params) => {
+    assert.equal(method, "thread/turns/list");
+    if (params.itemsView === "notLoaded") return page([{ id: "latest", items: [] }]);
+    assert.equal(params.limit, 1);
+    assert.equal(params.itemsView, "full");
+    if (params.cursor === "native-next") return page([{ id: "older", itemsView: "full", items: [item] }], null, "native-back");
+    return page([{ id: "latest", itemsView: "full", items: [item] }], "native-next", "native-back");
+  });
+  manager.historyMode = "legacy";
+  const surface = new ControlSurface(manager);
+  const first = await callHistory(surface, { kind: "turns" }) as Record<string, unknown>;
+  assert.deepEqual(first, {
+    source: "codex_app_server", mode: "history", coverage: "native_persisted_history",
+    history_mode: "legacy", kind: "turns", page_granularity: "turn", items_view: "full", thread_id: "thread-1",
+    data: [{ id: "latest", itemsView: "full", items: [item] }], nextCursor: "native-next", backwardsCursor: "native-back",
+  });
+  const second = await callHistory(surface, { kind: "turns", cursor: first.nextCursor, limit: 1 }) as Record<string, unknown>;
+  assert.equal(second.nextCursor, null);
+  assert.deepEqual(second.data, [{ id: "older", itemsView: "full", items: [item] }]);
+  await callHistory(surface, { kind: "turns", cursor: second.backwardsCursor, sort_direction: "asc" });
+  assert.deepEqual(manager.calls.at(-1)?.params, { threadId: "thread-1", cursor: "native-back", limit: 1, sortDirection: "asc", itemsView: "full" });
+  for (const call of manager.calls.filter(call => call.method === "thread/read")) assert.equal(call.params.includeTurns, false);
+  assert.equal(manager.runtime.hasThread("thread-1"), false);
+
+  // Mode is freshly read on every request, never inferred from a saved cursor.
+  manager.historyMode = "paginated";
+  const before = manager.calls.length;
+  const refreshed = await callHistory(surface, { kind: "turns" }) as Record<string, unknown>;
+  assert.equal(refreshed.history_mode, "paginated");
+  assert.equal(refreshed.items_view, "notLoaded");
+  assert.equal(manager.calls.length, before + 2);
+  assert.equal(manager.calls.at(-1)?.params.itemsView, "notLoaded");
+  assert.equal(manager.calls.at(-1)?.params.limit, 20);
+});
+
+test("mode-specific failures stop after metadata and unknown modes never guess or hydrate", async () => {
+  const manager = new StubAppServer(() => { throw new Error("history RPC forbidden"); });
+  manager.historyMode = "legacy";
+  const surface = new ControlSurface(manager);
+  await assert.rejects(callHistory(surface, { kind: "items", turn_id: "turn-1" }), /^Error: history_legacy_item_paging_unsupported:.*kind:'turns'/);
+  await assert.rejects(callHistory(surface, { kind: "turns", limit: 2 }), /legacy.*limit:1/);
+  assert.deepEqual(manager.calls.map(call => call.method), ["thread/read", "thread/read"]);
+  for (const mode of [undefined, null, "unknown", {}, 1]) {
+    manager.historyMode = mode;
+    await assert.rejects(callHistory(surface, { kind: "turns" }), /^Error: history_upstream_invalid:/);
+  }
+  assert.ok(manager.calls.every(call => call.method === "thread/read" && call.params.includeTurns === false));
+  assert.equal(manager.runtime.hasThread("thread-1"), false);
+  manager.routeMetadata = false;
+  await assert.rejects(callHistory(surface, { kind: "turns" }), /history RPC forbidden/);
+  assert.equal(manager.calls.at(-1)?.method, "thread/read");
+});
+
+test("legacy oversize/redaction failures never split a full turn or retry full history", async () => {
+  for (const item of [{ text: "中".repeat(100_000) }, { api_key: "fixture-secret" }]) {
+    const manager = new StubAppServer(() => page([{ id: "legacy-turn", itemsView: "full", items: [item] }]));
+    manager.historyMode = "legacy";
+    await assert.rejects(callHistory(new ControlSurface(manager), { kind: "turns" }),
+      "api_key" in item ? /^Error: history_page_not_lossless:/ : /^Error: history_page_too_large:.*legacy turn at limit:1/);
+    assert.deepEqual(manager.calls.map(call => call.method), ["thread/read", "thread/turns/list"]);
+    assert.equal(manager.runtime.hasThread("thread-1"), false);
+  }
+});
+
+test("metadata errors and malformed metadata stop without a history RPC", async () => {
+  for (const metadata of [null, {}, { thread: null }, { thread: { id: "other", historyMode: "paginated" } }]) {
+    const manager = new StubAppServer(() => metadata);
+    manager.routeMetadata = false;
+    await assert.rejects(callHistory(new ControlSurface(manager), { kind: "turns" }), /./);
+    assert.deepEqual(manager.calls.map(call => call.method), ["thread/read"]);
+    assert.equal(manager.runtime.hasThread("thread-1"), false);
+  }
 });

@@ -28,18 +28,17 @@ Bridge 本身保持薄层：
 
 **原生 Codex thread/session 始终是执行事实源。**
 
-## 当前测试候选版本
+## 当前代码范围
 
-**V2.1.3** · [CHANGELOG](CHANGELOG.md)
+[版本历史](CHANGELOG.md)
 
-V2.1.3 继续收紧 Bridge 作为 supervisory adapter 的边界，并补充：
+当前代码提供 12 个工具，包含独立 History、Native Goal、Queue 与 Search，并保留薄 supervisory adapter 的边界：
 
-- 原生 `model/list` 的按需发现；
-- `codex_turn` 的可选 model / reasoning-effort override；
-- stable permission approval response；
-- mutating acknowledgement timeout 的 UNKNOWN 语义；
-- 公开工具描述与运行时约束的一致性；
-- 统一版本锚点与升级假设检查。
+- 原生持久历史按需分页，成功页无损交付；
+- Goal set 显式选择预算意图，Queue 交由 native 在 active turn 后执行；
+- 原生 capability / lineage 与搜索 locator 只按需读取；
+- compact observation 使用一次固定截止、最多 120 秒的事件驱动等待；
+- 所有成功工具调用使用 `structuredContent`，旧客户端需按下文迁移。
 
 Windows 与 macOS 共用同一核心 Bridge，实现差异只保留在平台原生路径、launcher、checkpoint 默认目录、进程启动与终止等系统边界。
 
@@ -81,12 +80,16 @@ Windows 与 macOS 共用同一核心 Bridge，实现差异只保留在平台原�
 
 ------
 
-## 8 个 MCP 工具
+## 12 个 MCP 工具
 
 | Tool               | 用途                                                         | 边界                                                         |
 | ------------------ | ------------------------------------------------------------ | ------------------------------------------------------------ |
-| `codex_threads`    | 列出、搜索、读取原生 Codex 持久线程元数据及按需分页历史      | `cwd` / search 只是筛选条件，不是 ACL                        |
+| `codex_threads`    | 列出、搜索、读取原生 Codex 持久线程元数据      | `cwd` / search 只是筛选条件，不是 ACL                        |
+| `codex_history` | 按需读取原生持久历史页 | paginated 按 turn / item 分页；legacy 每页一个完整 turn，无 Bridge 历史库 |
+| `codex_search` | 原生跨线程搜索与线程内 occurrence 定位 | 返回 locator；不建索引，不隐式限制 workspace，不完整读取历史 |
 | `codex_models`     | 按需读取一页原生 `model/list`                                | 不缓存模型目录，不维护 current-model registry                |
+| `codex_goal` | 读取、设置或清除原生 thread goal | 不隐式 resume / turn-start，不自建 goal，不合并 checkpoint；clear 不等于 interrupt |
+| `codex_queue` | 管理原生待执行 follow-up 文本 | 原生负责队列和执行；不隐式 resume / start，不建 Bridge scheduler |
 | `codex_turn`       | 创建或恢复原生 thread，并启动一个 turn                       | 返回 accepted 不等于任务完成；model / effort 都是可选 override |
 | `codex_observe`    | 有界读取实时事件、pending requests、terminal state 与 live cursor | runtime 缺失时只读持久元数据；支持一次 bounded wait          |
 | `codex_steer`      | 对同一个 active turn 追加语义纠正或新意图                    | 不是 timer、polling 或 retry 机制                            |
@@ -96,9 +99,77 @@ Windows 与 macOS 共用同一核心 Bridge，实现差异只保留在平台原�
 
 完整 schema 与运行时限制以 [`src/tools.ts`](src/tools.ts) 为准。
 
-`codex_threads(thread_id)` 和 `include_turns:false` 只读 `thread/read(includeTurns:false)` 元数据。旧参数 `include_turns:true` 现在返回 migration error；持久历史请用 `history:{kind:"turns", cursor?, limit?, sort_direction?}` 获取 turn 页，再用 `history:{kind:"items", turn_id, cursor?, limit?, sort_direction?}` 获取指定 turn 的 item 页。turn 页固定 `itemsView:"notLoaded"`；默认 limit 分别为 20 / 10，上限分别为 50 / 20。原生 `nextCursor:null` 才表示当前方向结束；反向 `backwardsCursor` 要配合相反的 `sort_direction`。turn 反向页可能再次包含 anchor turn；Bridge 不去重。历史 cursor、顶层 thread/list cursor、`codex_observe` live 数字 cursor 互不通用。
+**响应格式：** 所有成功 `tools/call` 的完整结果都位于 `result.structuredContent`；`result.content` 只保留 tiny text 标记，不再包含可解析的结果 JSON。旧客户端须改为读取 `structuredContent`。错误仍走显式 `isError` / text error 路径，不附带成功结果。
 
-历史页必须能按当前 sanitizer 原样交付，且完整 MCP JSON 结果须在 256 KiB 预算内（其中 1 KiB 留给 framing/request id）。已完整接收的超预算页返回 `history_page_too_large:`；会被脱敏或裁剪的页返回 `history_page_not_lossless:`；原生页结构不完整返回 `history_upstream_invalid:`。错误不会附带部分 data/cursor。App Server 单行入站超过 10 MiB 仍是连接级 fatal protocol failure，无法保证转成普通分页错误。cursor 有效期与分页期间的快照一致性由 upstream 决定。
+`codex_threads(thread_id)` 只读元数据。旧参数 `include_turns:false` 保持该行为；`include_turns:true` 明确返回指向独立 `codex_history` 的迁移错误。旧 caller 需要迁移。
+
+`codex_history` 每次先读取原生 historyMode：paginated 线程用 `kind:"turns"` 取不含 items 的 turn 索引（默认 20、最多 50），再用 `kind:"items", turn_id` 读取指定 turn 的 items（默认 10、最多 20）；legacy 线程仅支持 `kind:"turns"`，每页一个包含完整 items 的原生 turn，默认且最大 limit 为 1。legacy item 请求返回 `history_legacy_item_paging_unsupported:`。成功页明确标识 history mode、分页粒度与 turn items view；Bridge 不造 item/chunk cursor。
+
+只有原生 `nextCursor:null` 表示当前方向结束；空页本身不表示结束。反向 `backwardsCursor` 配合相反的 `sort_direction`，turn anchor 会再次包含，Bridge 不去重。续页保持同一 thread、history mode、kind、turn scope 与排序方向；history cursor、thread/list cursor、live observe 数字 cursor 互不通用。
+
+历史页以原样 `structuredContent` 加 tiny text 返回，实际 MCP JSON 帧受 256 KiB 预算约束（预检另留 1 KiB framing / request-id 余量）。已接收的超预算页返回 `history_page_too_large:`；脱敏或 sanitizer 裁剪会改变内容时返回 `history_page_not_lossless:`；原生页结构错误返回 `history_upstream_invalid:`。错误没有部分 data/cursor。即使 limit=1，一个 legacy turn 或 paginated item 仍可能无法无损交付；不自动 full-history read 或分块。超过 10 MiB 的 App Server 单行入站仍是连接级 fatal protocol failure，不能保证转成普通分页错误；下游裁剪、cursor 有效期与快照一致性不由 Bridge 保证。
+
+------
+
+## Native Search
+
+`codex_search` 返回原生搜索 locator。`kind:"threads"` 映射 `thread/search`，区别于 `codex_threads` 的标题筛选；它没有 cwd / parent / ancestor 筛选，只接受原生 source / archived 范围，不能当作 workspace 或 ACL 隔离。`kind:"occurrences"` 映射 `thread/searchOccurrences`，要求指定一个 paginated thread；原生按时间顺序查找可见 user 与 final assistant 消息中的不区分大小写字面子串，不覆盖每个 tool / reasoning item。
+
+每次只取一页，续页保持 query 与筛选条件，只有 `nextCursor:null` 表示结束。Occurrence 的 `turnCursor` 是同一 thread 的 `codex_history(kind:"turns")` 原生 inclusive anchor，不是搜索续页 cursor；`snippetMatchRange` 使用 UTF-16 code units，end 不包含在范围内。
+
+可交付的页面保持原样；脱敏、裁剪、非法字段或 256 KiB 返回体上限会导致 `search_result_not_deliverable:`，不返回部分 data/cursor。Bridge 不建索引、不做 relevance 判断、不隐式 resume，也不以完整历史读取兜底。Legacy 支持与其他 native 错误由原生决定；搜索结果不保证完整审计或快照一致性。
+
+------
+
+## Native capability 与 lineage
+
+`codex_threads` 的 list / read 结果沿既有有界脱敏路径保留原生线程事实；runtime 缺失时，`codex_observe.stored_thread` 也来自只读 metadata。原生 `canAcceptDirectInput` 表示 App Server 当时是否接受该 loaded thread 的直接 turn 输入：`null` 表示能力未知或不可用，不能当成 false；旧响应缺字段时仍保持缺失。它不证明跨客户端 writer ownership，也不作为 Bridge 的写权限判定或自动 resume 条件。
+
+Lineage 直接读取原生 `sessionId`、`forkedFromId`、`parentThreadId` 与 source 信息。Session tree、fork 来源和 spawned parent 各有含义，Bridge 不互相推导，也不递归读取或保存关系图。Metadata 仍受既有 transport 脱敏与截断限制，不具有 History 的整页无损交付保证。
+
+列举子线程时可用 `parent_thread_id` 查直接 spawned children，或用 `ancestor_thread_id` 查任意深度的 spawned descendants（不包含祖先本身）；二者不能同时给非 null 值。这两个筛选不用于枚举 forks。来源由 `source_kinds` 明确选择，例如：
+
+```json
+{"parent_thread_id":"<native-thread-id>","source_kinds":["subAgentThreadSpawn"],"limit":20}
+```
+
+省略 `source_kinds`、传 null 或空数组都保持 native 的 interactive-source 默认值，不隐式扩大到 subagents。筛选字段仅用于 list，不能与 `thread_id` 混用；null、省略、数组顺序及重复值原样转发。每次只读取一个有界 native page，续页沿用相同筛选与 native cursor；不做 Bridge tree walk、补查或全量扫描。这些筛选不增加独立工具。
+
+------
+
+## Native Goal
+
+`codex_goal` 用 `action:"get" / "set" / "clear"` 管理指定 `thread_id` 的原生持久目标，每次只映射一个原生方法。Goal 服务 executor 的持续目标，`codex_checkpoint` 仍只保护 supervisor cognition；Bridge 不保存或重建 goal，也不隐式 resume、启动 turn 或恢复被清除的目标。
+
+set 必须显式携带 `budget_mode`，没有默认 mode 或默认额度：
+
+| budget_mode | Native tokenBudget | 公共参数要求 |
+| --- | --- | --- |
+| `preserve` | 省略，保留既有预算 | 不得携带 `token_budget` |
+| `unlimited` | `null`，移除预算上限 | 不得携带 `token_budget` |
+| `fixed` | 指定额度 | 必填正的 JavaScript safe integer `token_budget` |
+
+旧式 set 缺少 mode、或直接传 `token_budget:null` 会在 native mutation 前拒绝。预算是可选资源上限；需要硬上限时选择 fixed，修改已有目标且不改预算时选择 preserve。此 gate 不影响普通 Turn、Queue 或 Steer。
+
+set 还可携带 `objective`、`status`；其省略与 null 原样交给 native，不补默认值。目标的非空、4,000 字符限制及状态转换由 native 判定，Bridge 不截断或改写目标。safe-integer 上限仅保护预算的无损传输。
+
+成功返回原生 goal / null 或 cleared 布尔值，保留原生字段。返回体经过既有脱敏与有界无损检查，最大 256 KiB；无法原样交付时返回 `goal_result_not_deliverable:`。对 set / clear，这表示 **native 已返回成功、mutation 已获确认，但响应无法交付**；不等同于确认超时的 UNKNOWN，也不应直接重试。没有自动补偿或第二套 goal 状态。
+
+Goal updated / cleared 通知沿现有 compact/raw 通道可见。Active goal 的续跑由 native 决定；clear 不能作为中断正在执行的 turn 的替代品，需要中断时使用精确的 `codex_interrupt`。
+
+------
+
+## Native Queue
+
+`codex_queue` 管理原生待执行 follow-up，提供 list / add / update / delete / reorder 五个操作。适用流程是 A 正在执行时排入 B、C，A 结束后由原生 Codex 自动依次执行。入队成功不代表执行完成；继续用 `codex_observe` 监督各轮，用 `codex_history` 恢复持久结果。`codex_steer` 仍用于纠正当前 active turn。
+
+每次调用只映射一个 native queue 方法，不隐式 resume、启动 turn 或 queue，不创建 Bridge 队列、调度器或重试循环。add 必须携带调用方提供的 `client_user_message_id`；修改、删除和重排使用原生 `queuedSubmission.id`。该 client ID 没有经过本项目验证的幂等保证，不能作为自动重试依据。队列项可能在读取或修改期间被原生消费，成员关系、重排有效性及冲突由 native 判定。
+
+add / update 仅接受文本；update 会把该条目的**整个 input 数组替换成一个 text item**，不会合并其他输入。list 原样保留可交付的 native input 类型，每次默认请求 20 条、最多 100 条，只返回一个 native page；只有 `nextCursor:null` 表示结束。重排最多传 100 个原生 ID，这是传输边界，不代表原生队列容量；Bridge 不补查、拼接或去重。
+
+成功结果保留原生字段，并接受既有脱敏与有界无损检查，返回体上限 256 KiB。需要脱敏、裁剪或结构不合法时返回 `queue_result_not_deliverable:`；对变更操作，这明确表示 **native 已返回成功、mutation 已获确认，但结果无法交付**。已经发送但确认超时则是 UNKNOWN / possibly accepted。两种情况都不自动重试或补偿，应先读取 queue 与执行状态。
+
+Queue changed 通知沿现有 compact/raw 通道可见。delete 删除待执行项，不中断已经开始的 turn。当前资格验证覆盖 active A→B→C；空闲／冷线程的启动、跨进程保留和多客户端并发写入不在本轮验证范围。此接口依赖当前原生 experimental queue API，升级时需重新核验。
 
 ------
 
@@ -189,10 +260,12 @@ terminal state / acceptance
 以下原生请求如果已经成功写入 app-server，但等待 acknowledgement 超时：
 
 - `thread/start`
-- `thread/resume`
+- `thread/resume`（`excludeTurns:true`，恢复执行不灌入持久 turns）
 - `turn/start`
 - `turn/steer`
 - `turn/interrupt`
+- `thread/goal/set` / `thread/goal/clear`
+- `thread/queue/add` / `update` / `delete` / `reorder`
 
 Bridge 会把结果视为：
 
@@ -410,7 +483,8 @@ Local Codex Bridge **不会创建新的操作系统 sandbox**。
 - threads；
 - turns；
 - conversation history；
-- native execution results。
+- native execution results；
+- thread goals 与 queued follow-ups。
 
 Bridge 的：
 
@@ -420,7 +494,7 @@ Bridge 的：
 
 主要存在于内存中。
 
-Bridge 重启且缺失 live runtime 时，`codex_observe` 只读 `thread/read(includeTurns:false)` 元数据；`terminal:null` 和 `active_turn_id:null` 表示未知。返回的零值 live cursor、空 events / pending requests 只是 unavailable placeholders，不能重建 live state。需要持久历史时按需调用 `codex_threads.history`。runtime 仍存在但 ring 已淘汰事件时，`cursor_lost` / `cursor_floor` 继续表示真实的 live 缺口。
+Bridge 重启且缺失 live runtime 时，`codex_observe` 只读 `thread/read(includeTurns:false)` 元数据；`terminal:null` 和 `active_turn_id:null` 表示未知。返回的零值 live cursor、空 events / pending requests 只是 unavailable placeholders，不能重建 live state。需要持久历史时按需调用 `codex_history`。runtime 仍存在但 ring 已淘汰事件时，`cursor_lost` / `cursor_floor` 继续表示真实的 live 缺口。
 
 ### Checkpoint
 
@@ -522,7 +596,7 @@ npm run smoke:live
 
 - `src/mcp.ts` — MCP stdio / JSON-RPC boundary
 - `src/app-server.ts` — native Codex app-server process / protocol adapter
-- `src/tools.ts` — 8 tools、schema 与 supervisory semantics
+- `src/tools.ts` — 12 tools、schema 与 supervisory semantics
 - `src/runtime.ts` — bounded live runtime state / events / pending requests
 - `src/checkpoint.ts` — optional supervisory checkpoint
 - `src/platform.ts` — Windows / macOS platform boundary

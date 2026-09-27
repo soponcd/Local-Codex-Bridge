@@ -18,12 +18,16 @@ MCP client -> Local Codex Bridge (JSON-RPC stdio)
 
 `src/mcp.ts` owns the MCP boundary, `src/app-server.ts` owns the official child-process protocol, `src/tools.ts` owns the public tool contract, and `src/runtime.ts` owns ephemeral live state. `src/checkpoint.ts` provides the separate optional local checkpoint store. The Windows Tray and Secure MCP Tunnel integration are optional layers; the Tunnel itself is external to this repository.
 
-The eight public tools have distinct semantics:
+The twelve public tools have distinct semantics:
 
-- `codex_threads`: list/search/read persistent native threads; filters are not access control.
+- `codex_threads`: list/search/read native thread metadata and capability/lineage facts, with native source/parent/ancestor filters; filters are not access control and capability facts are not a Bridge write-permission model.
+- `codex_history`: page native persisted history without Bridge history state; paginated threads expose a turn index or scoped items, legacy threads expose one full turn per page.
+- `codex_search`: read native thread search or within-thread occurrences as locators; no Bridge index, relevance scoring, full-history fallback, or implied workspace filter.
 - `codex_models`: read one bounded current `model/list` page on demand; it creates no catalog cache or current-model registry.
+- `codex_goal`: map native thread goal get/set/clear without implicit resume, turn-start, retries, or Bridge goal state; native active goals may execute. Set requires explicit `budget_mode`: preserve, unlimited, or fixed. Keep goals separate from supervisor checkpoints.
+- `codex_queue`: map native queued follow-up list/add/update/delete/reorder without implicit execution, retries, scheduling, or Bridge queue state; native executes queued work after the active turn.
 - `codex_turn`: create or resume a native thread and start a turn; acceptance is not completion.
-- `codex_observe`: read bounded live state or explicitly degraded persisted history after Bridge state loss.
+- `codex_observe`: read bounded live state or explicitly unavailable live-state placeholders with native metadata after Bridge state loss; persistent content recovery belongs to `codex_history`.
 - `codex_steer`: append a semantic correction to the exact active turn; do not use it as a timer or retry.
 - `codex_respond`: answer one real pending app-server request using its raw ID and exact scope.
 - `codex_interrupt`: interrupt one exact native turn; it is not process control.
@@ -56,7 +60,7 @@ Prefer evidence from the current source, tests, package metadata, and actual mac
 A rebuild or install should demonstrate, as applicable:
 
 - dependency installation, type checking, build, and the regular automated test suite succeed;
-- the MCP server keeps stdout clean, initializes correctly, and exposes exactly the eight intended tools;
+- the MCP server keeps stdout clean, initializes correctly, and exposes exactly the twelve intended tools;
 - the official app-server executable is resolved and launched with the expected stdio arguments;
 - persistent native history and ephemeral Bridge state remain clearly separated;
 - no author-specific path, credential, Tunnel profile, port, or secret has entered the repository or generic setup;

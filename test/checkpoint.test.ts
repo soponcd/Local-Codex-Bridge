@@ -30,7 +30,11 @@ const unavailableAppServer = {} as unknown as AppServerManager;
 test("checkpoint remains the final tool in the current tool catalog", () => {
   assert.deepEqual(TOOL_DEFINITIONS.map((tool) => tool.name), [
     "codex_threads",
+    "codex_history",
+    "codex_search",
     "codex_models",
+    "codex_goal",
+    "codex_queue",
     "codex_turn",
     "codex_observe",
     "codex_steer",

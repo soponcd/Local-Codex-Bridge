@@ -1,4 +1,4 @@
-// Generated from installed codex-cli 0.155.0-alpha.16.4 generate-ts --experimental.
+// Generated from installed codex-cli 0.158.0-alpha.2.1 generate-ts --experimental.
 // Regenerate and review this fixture when the installed Codex protocol changes.
 export const INSTALLED_NOTIFICATION_METHODS = [
   "error",
@@ -49,6 +49,7 @@ export const INSTALLED_NOTIFICATION_METHODS = [
   "mcpServer/startupStatus/updated",
   "mcpServer/event/stream/notification",
   "account/updated",
+  "account/gatewayOAuth/changed",
   "account/rateLimits/updated",
   "app/list/updated",
   "remoteControl/status/changed",

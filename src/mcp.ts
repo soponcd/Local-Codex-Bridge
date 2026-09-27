@@ -1,6 +1,6 @@
 import { sanitizeForTransport, type RpcId } from "./runtime.js";
 import { ControlSurface, TOOL_DEFINITIONS, TOOL_NAMES } from "./tools.js";
-import { historyMcpBytes, MAX_HISTORY_MCP_BYTES } from "./history.js";
+import { historyMcpBytes, MAX_HISTORY_MCP_BYTES, structuredToolResult } from "./history.js";
 import { VERSION } from "./version.js";
 
 const JSONRPC_VERSION = "2.0";
@@ -334,14 +334,11 @@ export class McpStdioServer {
         toolArguments,
         name === "codex_observe" ? signal : undefined,
       );
-      if (name === "codex_threads" && asRecord(result)?.mode === "history" &&
+      if (name === "codex_history" &&
           historyMcpBytes(result, id) > MAX_HISTORY_MCP_BYTES) {
         throw new Error("history_page_too_large: final MCP frame exceeds the lossless byte budget");
       }
-      await this.#sendResult(id, {
-        content: [{ type: "text", text: "structured result" }],
-        structuredContent: result,
-      });
+      await this.#sendResult(id, structuredToolResult(result));
     } catch (error) {
       await this.#sendResult(id, {
         content: [

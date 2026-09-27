@@ -144,7 +144,7 @@ lines.on("line", (line) => {
       id: message.id,
       result: {
         thread: {
-          id: message.params.threadId,
+          id: message.params.threadId, historyMode: "paginated",
           status: { type: "notLoaded" },
           turns: message.params.includeTurns
             ? [{ id: "stored-turn", status: "completed", items: [{ type: "agentMessage", text: "STORED_OK" }] }]

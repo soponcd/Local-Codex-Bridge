@@ -8,11 +8,12 @@ import { PassThrough } from "node:stream";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
-import type { AppServerManager } from "../src/app-server.js";
+import { AppServerManager } from "../src/app-server.js";
 import { CHECKPOINT_DIRECTORY_ENV, CheckpointStore } from "../src/checkpoint.js";
 import { McpStdioServer } from "../src/mcp.js";
 import { RuntimeStore } from "../src/runtime.js";
 import { ControlSurface, TOOL_NAMES } from "../src/tools.js";
+import { VERSION } from "../src/version.js";
 
 type RpcId = string | number;
 
@@ -108,24 +109,24 @@ test("MCP history pages serialize exactly and errors keep stable prefixes withou
   try {
     await initialize(client, 1);
     const turns = successfulToolPayload(await client.request(2, "tools/call", {
-      name: "codex_threads", arguments: { thread_id: "thread-1", history: { kind: "turns" } },
+      name: "codex_history", arguments: { thread_id: "thread-1", kind: "turns" },
     }));
     assert.deepEqual(turns, {
       source: "codex_app_server", mode: "history", coverage: "native_persisted_history",
-      kind: "turns", thread_id: "thread-1", data: [{ id: "turn-1", status: "completed", items: [] }],
+      history_mode: "paginated", kind: "turns", page_granularity: "turn", items_view: "notLoaded", thread_id: "thread-1", data: [{ id: "turn-1", status: "completed", items: [] }],
       nextCursor: "next-turn", backwardsCursor: "reverse-turn",
     });
     const items = successfulToolPayload(await client.request(3, "tools/call", {
-      name: "codex_threads", arguments: { thread_id: "thread-1", history: { kind: "items", turn_id: "turn-1" } },
+      name: "codex_history", arguments: { thread_id: "thread-1", kind: "items", turn_id: "turn-1" },
     }));
-    assert.deepEqual(items.data, [{ turnId: "turn-1", item: { id: "item-1", type: "agentMessage", text: "🌱 exact" } }]);
+    assert.deepEqual(items.data, [{ turnId: "turn-1", startedAtMs: 123, completedAtMs: null, futureField: { preserved: true }, item: { id: "item-1", type: "agentMessage", text: "🌱 exact" } }]);
     const boundary = successfulToolPayload(await client.request(5, "tools/call", {
-      name: "codex_threads", arguments: { thread_id: "thread-1", history: { kind: "turns", cursor: "near-boundary" } },
+      name: "codex_history", arguments: { thread_id: "thread-1", kind: "turns", cursor: "near-boundary" },
     }));
     assert.equal((boundary.data as unknown[]).length, 10);
     const oversizedId = "request-" + "x".repeat(2_000);
     const tooLargeFrame = await client.request(oversizedId, "tools/call", {
-      name: "codex_threads", arguments: { thread_id: "thread-1", history: { kind: "turns", cursor: "near-boundary" } },
+      name: "codex_history", arguments: { thread_id: "thread-1", kind: "turns", cursor: "near-boundary" },
     });
     assert.equal((tooLargeFrame.result as Record<string, unknown>).isError, true);
     assert.match(toolPayload(tooLargeFrame).error as string, /^history_page_too_large:/);
@@ -135,7 +136,7 @@ test("MCP history pages serialize exactly and errors keep stable prefixes withou
       ["oversized", "history_page_too_large:"],
     ] as const) {
       const response = await client.request(cursor, "tools/call", {
-        name: "codex_threads", arguments: { thread_id: "thread-1", history: { kind: "turns", cursor } },
+        name: "codex_history", arguments: { thread_id: "thread-1", kind: "turns", cursor },
       });
       assert.equal((response.result as Record<string, unknown>).isError, true);
       const error = toolPayload(response);
@@ -143,9 +144,37 @@ test("MCP history pages serialize exactly and errors keep stable prefixes withou
       assert.deepEqual(Object.keys(error), ["error"]);
     }
     const stale = await client.request(4, "tools/call", {
-      name: "codex_threads", arguments: { thread_id: "thread-1", history: { kind: "turns", cursor: "stale" } },
+      name: "codex_history", arguments: { thread_id: "thread-1", kind: "turns", cursor: "stale" },
     });
     assert.match(toolPayload(stale).error as string, /native invalid cursor/);
+  } finally {
+    assert.equal(await client.close(), 0);
+  }
+});
+
+test("MCP legacy history delivers full turn data and a distinct unsupported-items error", async () => {
+  const fixture = fileURLToPath(new URL("./history-mcp-fixture.js", import.meta.url));
+  const client = new TestClient(process.env, fixture);
+  try {
+    await initialize(client, 1);
+    const response = await client.request(2, "tools/call", {
+      name: "codex_history", arguments: { thread_id: "legacy-thread", kind: "turns" },
+    });
+    const result = successfulToolPayload(response);
+    assert.deepEqual(result, {
+      source: "codex_app_server", mode: "history", coverage: "native_persisted_history",
+      history_mode: "legacy", kind: "turns", page_granularity: "turn", items_view: "full", thread_id: "legacy-thread",
+      data: [{ id: "legacy-turn", itemsView: "full", items: [{ id: "legacy-item", type: "agentMessage", text: "legacy full" }] }],
+      nextCursor: null, backwardsCursor: "legacy-reverse",
+    });
+    assert.deepEqual((response.result as Record<string, unknown>).content, [{ type: "text", text: "structured result" }]);
+    const unsupported = await client.request(3, "tools/call", {
+      name: "codex_history", arguments: { thread_id: "legacy-thread", kind: "items", turn_id: "legacy-turn" },
+    });
+    assert.equal((unsupported.result as Record<string, unknown>).isError, true);
+    assert.deepEqual(Object.keys(toolPayload(unsupported)), ["error"]);
+    assert.match(toolPayload(unsupported).error as string, /^history_legacy_item_paging_unsupported:/);
+    assert.equal("structuredContent" in (unsupported.result as object), false);
   } finally {
     assert.equal(await client.close(), 0);
   }
@@ -371,7 +400,165 @@ test("MCP models, turn ack, and checkpoint preserve original handler results", {
   }
 });
 
-test("MCP stdio initializes idempotently and lists exactly eight fully annotated tools", async () => {
+test("MCP goals traverse native JSONL with exact nulls, responses, notifications and acknowledged delivery errors", async () => {
+  const manager = new AppServerManager(undefined, {
+    executable: process.execPath,
+    prefixArgs: [fileURLToPath(new URL("../../test/goal-codex.mjs", import.meta.url))],
+  });
+  const control = new ControlSurface(manager);
+  try {
+    await withInMemoryMcp(control, async request => {
+      let id = 1;
+      const invoke = (action: string, fields = {}) => request(id++, "tools/call", {
+        name: "codex_goal", arguments: { action, thread_id: "goal-thread", ...fields },
+      });
+      assert.deepEqual(structuredToolPayload(await invoke("get")), { goal: null });
+      const missingIntent = await invoke("set", { objective: "Must not reach native", token_budget: 999 });
+      assert.equal((missingIntent.result as Record<string, unknown>).isError, true);
+      assert.deepEqual(await manager.request("test/requests", {}), [{ method: "thread/goal/get", params: { threadId: "goal-thread" } }]);
+      const set = structuredToolPayload(await invoke("set", { objective: "  Exact fixture 🌱  ", status: "paused", budget_mode: "fixed", token_budget: 999 }));
+      assert.deepEqual(set, { goal: {
+        threadId: "goal-thread", objective: "  Exact fixture 🌱  ", status: "paused", tokenBudget: 999,
+        tokensUsed: 23, timeUsedSeconds: 4, createdAt: 100, updatedAt: 105, futureField: "preserved",
+      } });
+      assert.deepEqual(structuredToolPayload(await invoke("get")), set);
+      assert.deepEqual(structuredToolPayload(await invoke("set", { budget_mode: "preserve" })), set);
+      const clearedBudget = structuredToolPayload(await invoke("set", { objective: null, status: null, budget_mode: "unlimited" }));
+      assert.equal((clearedBudget.goal as Record<string, unknown>).tokenBudget, null);
+      assert.deepEqual(structuredToolPayload(await invoke("clear")), { cleared: true });
+      assert.deepEqual(structuredToolPayload(await invoke("clear")), { cleared: false });
+      assert.deepEqual(structuredToolPayload(await invoke("get")), { goal: null });
+      const requests = await manager.request("test/requests", {}) as Array<{ method: string; params: unknown }>;
+      assert.deepEqual(requests.map(entry => entry.method), [
+        "thread/goal/get", "thread/goal/set", "thread/goal/get", "thread/goal/set", "thread/goal/set", "thread/goal/clear", "thread/goal/clear", "thread/goal/get",
+      ]);
+      assert.deepEqual(requests[3]!.params, { threadId: "goal-thread" });
+      assert.deepEqual(requests[4]!.params, { threadId: "goal-thread", objective: null, status: null, tokenBudget: null });
+      for (const view of ["compact", "raw"]) {
+        const events: Array<Record<string, unknown>> = [];
+        let cursor = 0;
+        // Compact returns at each wake; follow its cursor to recover every fact.
+        for (let page = 0; page < 4; page++) {
+          const observed = structuredToolPayload(await request(id++, "tools/call", {
+            name: "codex_observe", arguments: { thread_id: "goal-thread", cursor, view },
+          }));
+          events.push(...observed.events as Array<Record<string, unknown>>);
+          if (!observed.has_more) break;
+          assert.ok((observed.next_cursor as number) > cursor);
+          cursor = observed.next_cursor as number;
+        }
+        assert.deepEqual(events.map(event => event.method), ["thread/goal/updated", "thread/goal/updated", "thread/goal/updated", "thread/goal/cleared"]);
+        if (view === "compact") assert.ok(events.every(event => event.type === "diagnostic_passthrough"));
+      }
+      const rejected = await invoke("set", { objective: "password=synthetic-test-only", budget_mode: "unlimited" });
+      assert.equal((rejected.result as Record<string, unknown>).isError, true);
+      assert.equal((rejected.result as Record<string, unknown>).structuredContent, undefined);
+      const error = toolPayload(rejected).error as string;
+      assert.match(error, /mutation was acknowledged/);
+      assert.doesNotMatch(error, /UNKNOWN|synthetic-test-only/);
+      const after = await manager.request("test/requests", {}) as unknown[];
+      assert.equal(after.length, requests.length + 1, "delivery error must not retry/compensate");
+    });
+  } finally {
+    await manager.close();
+  }
+});
+
+test("MCP queue actions traverse native JSONL and retain exact pages, queue-change wakes and acknowledged failures", async () => {
+  const manager = new AppServerManager(undefined, {
+    executable: process.execPath,
+    prefixArgs: [fileURLToPath(new URL("../../test/queue-codex.mjs", import.meta.url))],
+  });
+  try {
+    await withInMemoryMcp(new ControlSurface(manager), async request => {
+      let id = 1;
+      const invoke = (action: string, fields = {}) => request(id++, "tools/call", {
+        name: "codex_queue", arguments: { action, thread_id: "queue-thread", ...fields },
+      });
+      assert.deepEqual(structuredToolPayload(await invoke("list")), { data: [], nextCursor: null });
+      const added = structuredToolPayload(await invoke("add", { text: "  B 🌱  ", client_user_message_id: "caller-b" }));
+      assert.deepEqual(added, { queuedSubmission: { id: "queue-1", input: [{ type: "text", text: "  B 🌱  ", text_elements: [] }], clientUserMessageId: "caller-b", futureField: { native: true } } });
+      structuredToolPayload(await invoke("add", { text: "C", client_user_message_id: "caller-c" }));
+      const updated = structuredToolPayload(await invoke("update", { text: "B updated", queued_submission_id: "queue-1" }));
+      assert.equal((updated.queuedSubmission as Record<string, unknown>).clientUserMessageId, "caller-b");
+      assert.deepEqual(structuredToolPayload(await invoke("reorder", { queued_submission_ids: ["queue-2", "queue-1"] })), {});
+      const first = structuredToolPayload(await invoke("list", { limit: 1 }));
+      assert.equal((first.data as Array<{ id: string }>)[0]!.id, "queue-2");
+      assert.equal(first.nextCursor, "native:1");
+      const second = structuredToolPayload(await invoke("list", { limit: 1, cursor: first.nextCursor }));
+      assert.deepEqual(second.data, [updated.queuedSubmission]);
+      assert.equal(second.nextCursor, null);
+      assert.deepEqual(structuredToolPayload(await invoke("delete", { queued_submission_id: "queue-2" })), { deleted: true });
+      const nativeRejected = await invoke("reorder", { queued_submission_ids: ["queue-1", "queue-1"] });
+      assert.equal((nativeRejected.result as Record<string, unknown>).isError, true);
+      const captured = await manager.request("test/requests", {}) as Array<{ method: string; params: unknown }>;
+      assert.deepEqual(captured.map(entry => entry.method), ["thread/queue/list", "thread/queue/add", "thread/queue/add", "thread/queue/update", "thread/queue/reorder", "thread/queue/list", "thread/queue/list", "thread/queue/delete", "thread/queue/reorder"]);
+      assert.deepEqual(captured[3]!.params, { threadId: "queue-thread", input: [{ type: "text", text: "B updated", text_elements: [] }], queuedSubmissionId: "queue-1" });
+      for (const view of ["compact", "raw"]) {
+        const events: Array<Record<string, unknown>> = [];
+        let cursor = 0;
+        for (let page = 0; page < 5; page++) {
+          const observed = structuredToolPayload(await request(id++, "tools/call", { name: "codex_observe", arguments: { thread_id: "queue-thread", view, cursor } }));
+          events.push(...observed.events as Array<Record<string, unknown>>);
+          if (!observed.has_more) break;
+          assert.ok((observed.next_cursor as number) > cursor);
+          cursor = observed.next_cursor as number;
+        }
+        assert.equal(events.length, 5);
+        assert.ok(events.every(event => event.method === "thread/queue/changed"));
+        if (view === "compact") assert.ok(events.every(event => event.type === "diagnostic_passthrough"));
+      }
+      const failedDelivery = await invoke("add", { text: "password=synthetic-only", client_user_message_id: "caller-sensitive" });
+      const error = toolPayload(failedDelivery).error as string;
+      assert.match(error, /queue_result_not_deliverable:.*mutation was acknowledged/);
+      assert.doesNotMatch(error, /UNKNOWN|synthetic-only/);
+      assert.equal((failedDelivery.result as Record<string, unknown>).structuredContent, undefined);
+      const after = await manager.request("test/requests", {}) as unknown[];
+      assert.equal(after.length, captured.length + 1);
+    });
+  } finally { await manager.close(); }
+});
+
+test("MCP search traverses native JSONL with exact pagination, UTF-16 locators and no fallback reads", async () => {
+  const manager = new AppServerManager(undefined, {
+    executable: process.execPath,
+    prefixArgs: [fileURLToPath(new URL("../../test/search-codex.mjs", import.meta.url))],
+  });
+  try {
+    await withInMemoryMcp(new ControlSurface(manager), async request => {
+      let id = 1;
+      const invoke = (kind: string, fields = {}) => request(id++, "tools/call", {
+        name: "codex_search", arguments: { kind, search_term: "Hit", limit: 1, ...fields },
+      });
+      const threads = structuredToolPayload(await invoke("threads", { source_kinds: [], archived: null }));
+      assert.equal(threads.nextCursor, "native-threads-next");
+      assert.equal(threads.backwardsCursor, "native-threads-back");
+      assert.equal((threads.data as Array<any>)[0].thread.canAcceptDirectInput, null);
+      const empty = structuredToolPayload(await invoke("threads", { cursor: threads.nextCursor, source_kinds: [], archived: null }));
+      assert.deepEqual(empty, { data: [], nextCursor: null, backwardsCursor: null, future: true });
+      const first = structuredToolPayload(await invoke("occurrences", { thread_id: "search-thread" }));
+      const second = structuredToolPayload(await invoke("occurrences", { thread_id: "search-thread", cursor: first.nextCursor }));
+      assert.equal(second.nextCursor, null);
+      assert.deepEqual((first.data as Array<any>)[0], { turnId: "turn-a", itemId: "user-a", snippet: "🌱 Hit", snippetMatchRange: { start: 3, end: 6 }, turnCursor: "native-inclusive-turn-a" });
+      assert.equal((second.data as Array<any>)[0].itemId, "final-a");
+      const invalid = await invoke("occurrences", { thread_id: "search-thread", sort_direction: null });
+      assert.equal((invalid.result as Record<string, unknown>).isError, true);
+      const nativeError = await invoke("occurrences", { thread_id: "search-thread", search_term: "legacy" });
+      assert.match(toolPayload(nativeError).error as string, /requires paginated history/);
+      const redacted = await invoke("threads", { search_term: "sensitive" });
+      assert.equal((redacted.result as Record<string, unknown>).structuredContent, undefined);
+      assert.match(toolPayload(redacted).error as string, /search_result_not_deliverable/);
+      assert.doesNotMatch(toolPayload(redacted).error as string, /synthetic-search-only/);
+      const captured = await manager.request("test/requests", {}) as Array<{ method: string; params: unknown }>;
+      assert.deepEqual(captured.map(entry => entry.method), ["thread/search", "thread/search", "thread/searchOccurrences", "thread/searchOccurrences", "thread/searchOccurrences", "thread/search"]);
+      assert.deepEqual(captured[0]!.params, { searchTerm: "Hit", limit: 1, sourceKinds: [], archived: null });
+      assert.deepEqual(captured[3]!.params, { threadId: "search-thread", searchTerm: "Hit", limit: 1, cursor: "native-occurrences-next" });
+      assert.equal(manager.runtime.observe("search-thread", 0, 20), null);
+    });
+  } finally { await manager.close(); }
+});
+
+test("MCP stdio initializes idempotently and lists exactly twelve fully annotated tools", async () => {
   const client = new TestClient();
   try {
     const initializeLine = JSON.stringify({
@@ -400,7 +587,7 @@ test("MCP stdio initializes idempotently and lists exactly eight fully annotated
       {
         name: "local-codex-bridge",
         title: "Local Codex Bridge",
-        version: "2.1.3",
+        version: VERSION,
       },
     );
 
@@ -443,7 +630,11 @@ test("MCP stdio initializes idempotently and lists exactly eight fully annotated
     const tools = (listed.result as Record<string, unknown>).tools as Array<Record<string, unknown>>;
     assert.deepEqual(tools.map((tool) => tool.name), [
       "codex_threads",
+      "codex_history",
+      "codex_search",
       "codex_models",
+      "codex_goal",
+      "codex_queue",
       "codex_turn",
       "codex_observe",
       "codex_steer",

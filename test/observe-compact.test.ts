@@ -46,7 +46,7 @@ async function observe(runtime: RuntimeStore, cursor = 0, limit = 50, waitMs = 0
 }
 
 test("installed experimental schema is exhaustively classified by explicit manifest", () => {
-  assert.equal(INSTALLED_NOTIFICATION_METHODS.length, 84);
+  assert.equal(INSTALLED_NOTIFICATION_METHODS.length, 85);
   assert.equal(INSTALLED_THREAD_ITEM_TYPES.length, 19);
   assert.deepEqual(Object.keys(NOTIFICATION_POLICIES).sort(), [...INSTALLED_NOTIFICATION_METHODS].sort());
   assert.deepEqual(Object.keys(NOTIFICATION_SHAPES.methods).sort(), [...INSTALLED_NOTIFICATION_METHODS].sort());
@@ -57,6 +57,47 @@ test("installed experimental schema is exhaustively classified by explicit manif
       assert.equal(typeof policy.wake, "boolean");
     }
   }
+});
+
+test("gateway OAuth known shapes stay silent while malformed shapes fail open", async () => {
+  const method = "account/gatewayOAuth/changed";
+  for (const status of ["notReady", "started", "succeeded", "failed"]) {
+    for (const optional of [{}, { authUrl: null, error: null }, { authUrl: "https://example.invalid/login", error: "native detail" }]) {
+      const data = { providerId: "fixture-provider", status, ...optional };
+      const routed = routeCompactEvent(event(method, data));
+      assert.equal(routed.wake, false);
+      assert.equal(routed.fact, null);
+      assert.equal(routed.activity, undefined);
+    }
+  }
+  for (const data of [{ status: "started" }, { providerId: 42, status: "started" },
+    { providerId: "fixture-provider", status: "future-status" },
+    { providerId: "fixture-provider", status: "started", authUrl: 42 }]) {
+    const routed = routeCompactEvent(event(method, data));
+    assert.equal(routed.wake, true);
+    assert.equal(routed.fact?.type, "unknown");
+  }
+
+  const runtime = started();
+  const pending = observe(runtime, 0, 50, 1_000);
+  let settled = false;
+  void pending.then(() => { settled = true; });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  runtime.recordNotification(method, { providerId: "fixture-provider", status: "started" });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(settled, false);
+  const compact = await observe(runtime);
+  assert.equal(compact.next_cursor, 1);
+  assert.equal(compact.events, undefined);
+  assert.equal(compact.activity, undefined);
+  const raw = await observe(runtime, 0, 50, 0, "raw");
+  assert.equal(raw.next_cursor, 1);
+  assert.equal(raw.events[0].method, method);
+  assert.equal(raw.events[0].data.status, "started");
+  message(runtime, "after-oauth", "next supervision wake");
+  const woken = await pending;
+  assert.equal(woken.next_cursor, 2);
+  assert.deepEqual(woken.events.map((fact: Result) => fact.type), ["message"]);
 });
 
 test("installed-known diagnostic with a missing required schema field fails open as unknown", () => {
@@ -299,6 +340,23 @@ test("silent-only deadline advances cursor and keeps activity; pure quiet return
   assert.equal(active.no_change, undefined);
   const quiet = await observe(runtime, 1, 50, 15);
   assert.deepEqual(quiet, { runtime_available: true, runtime_status: "inProgress", active_turn_id: "u", next_cursor: 1, no_change: true });
+});
+
+test("revision-only wake returns the current active turn in the same compact envelope", async () => {
+  const runtime = started();
+  const pending = observe(runtime, 0, 50, 1_000);
+  await Promise.resolve();
+  runtime.markTurnAccepted("t", "v");
+  const compact = await pending;
+  assert.equal(compact.runtime_status, "inProgress");
+  assert.equal(compact.active_turn_id, "v");
+  assert.equal(compact.next_cursor, 0);
+  assert.equal(compact.no_change, undefined);
+  assert.equal(compact.events, undefined);
+  const raw = await observe(runtime, 0, 50, 0, "raw");
+  assert.equal(raw.active_turn_id, "v");
+  assert.equal(raw.next_cursor, 0);
+  assert.deepEqual(raw.events, []);
 });
 
 test("multi-chunk compact deadline stays fixed despite continuing silent events", async () => {

@@ -27,8 +27,8 @@ test("history response above 10 MiB remains a fatal app-server inbound limitatio
   });
   try {
     await assert.rejects(
-      new ControlSurface(manager).call("codex_threads", {
-        thread_id: "thread-big", history: { kind: "turns", cursor: "oversized-inbound", limit: 1 },
+      new ControlSurface(manager).call("codex_history", {
+        thread_id: "thread-big", kind: "turns", cursor: "oversized-inbound", limit: 1,
       }),
       /app-server JSONL line exceeded 10 MiB/,
     );
@@ -381,7 +381,7 @@ test("mutating app-server acknowledgement timeouts report unknown outcome withou
     requestTimeoutMs: 20,
   });
   try {
-    for (const method of ["thread/start", "thread/resume", "turn/start", "turn/steer", "turn/interrupt"]) {
+    for (const method of ["thread/start", "thread/resume", "turn/start", "turn/steer", "turn/interrupt", "thread/goal/set", "thread/goal/clear", "thread/queue/add", "thread/queue/update", "thread/queue/delete", "thread/queue/reorder"]) {
       await assert.rejects(
         manager.request(method, {}),
         (error: unknown) => {
@@ -396,9 +396,17 @@ test("mutating app-server acknowledgement timeouts report unknown outcome withou
       manager.request("thread/list", {}),
       /Codex app-server request timed out: thread\/list/,
     );
+    await assert.rejects(manager.request("thread/goal/get", {}), /Codex app-server request timed out: thread\/goal\/get/);
+    await assert.rejects(manager.request("thread/queue/list", {}), /Codex app-server request timed out: thread\/queue\/list/);
+    for (const method of ["thread/search", "thread/searchOccurrences"]) {
+      await assert.rejects(manager.request(method, {}), error => {
+        assert.match(String(error), /Codex app-server request timed out:/);
+        assert.doesNotMatch(String(error), /UNKNOWN|possibly accepted/); return true;
+      });
+    }
     const count = await manager.request("test/count", {}) as Record<string, unknown>;
     // App-server startup sends initialize plus the initialized notification.
-    assert.equal(count.requestCount, 9);
+    assert.equal(count.requestCount, 19);
   } finally {
     await manager.close();
   }

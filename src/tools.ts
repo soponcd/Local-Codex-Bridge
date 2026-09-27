@@ -11,6 +11,9 @@ import {
 } from "./runtime.js";
 import { platformPolicyFor, type PlatformPolicy } from "./platform.js";
 import { exactHistoryResponse, validateHistoryPage } from "./history.js";
+import { exactGoalResponse, GOAL_STATUSES } from "./goal.js";
+import { exactQueueResponse, QUEUE_ACTIONS, QUEUE_PAGE_LIMIT } from "./queue.js";
+import { exactSearchResponse, SEARCH_PAGE_LIMIT } from "./search.js";
 
 export interface ToolDefinition {
   name: string;
@@ -68,6 +71,13 @@ const MAX_MODEL_CATALOG_PAGES = 100;
 const MAX_MODEL_CATALOG_ENTRIES = 10_000;
 const HISTORY_TURN_LIMIT = 50;
 const HISTORY_ITEM_LIMIT = 20;
+const THREAD_SOURCE_KINDS = [
+  "cli", "vscode", "exec", "appServer", "subAgent", "subAgentReview",
+  "subAgentCompact", "subAgentThreadSpawn", "subAgentOther", "unknown",
+] as const;
+const THREAD_LIST_FIELDS = [
+  "cwd", "search_term", "cursor", "limit", "parent_thread_id", "ancestor_thread_id", "source_kinds",
+] as const;
 
 interface ModelListPage {
   data: Record<string, unknown>[];
@@ -79,7 +89,7 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
     name: "codex_threads",
     title: "Codex Threads",
     description:
-      "List or search persistent threads; read one thread's metadata; or page native persisted turns/items through history. History cursors are opaque and separate from thread/list and live observe cursors. include_turns:true now returns a migration error; use history instead. No history read reconstructs live Bridge events.",
+      "List or search persistent native threads, or read one thread's metadata without loading turns. include_turns:true returns a migration error; use codex_history for persistent history. Native canAcceptDirectInput (boolean or null) and lineage fields remain native facts, not Bridge write authorization; an absent field stays absent. List filters can select direct children or spawned descendants; source_kinds must explicitly include subagents when needed because native defaults to interactive sources. No metadata read reconstructs live Bridge events.",
     inputSchema: {
       type: "object",
       properties: {
@@ -91,40 +101,32 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
         },
         include_turns: {
           type: "boolean",
-          description: "Legacy parameter: false reads metadata; true returns a migration error directing callers to history.",
-        },
-        history: {
-          oneOf: [
-            {
-              type: "object",
-              properties: {
-                kind: { const: "turns" },
-                cursor: { type: "string", minLength: 1, maxLength: 10_000 },
-                limit: { type: "integer", minimum: 1, maximum: HISTORY_TURN_LIMIT, default: 20 },
-                sort_direction: { type: "string", enum: ["asc", "desc"], default: "desc" },
-              },
-              required: ["kind"],
-              additionalProperties: false,
-            },
-            {
-              type: "object",
-              properties: {
-                kind: { const: "items" },
-                turn_id: { type: "string", minLength: 1, maxLength: 200 },
-                cursor: { type: "string", minLength: 1, maxLength: 10_000 },
-                limit: { type: "integer", minimum: 1, maximum: HISTORY_ITEM_LIMIT, default: 10 },
-                sort_direction: { type: "string", enum: ["asc", "desc"], default: "asc" },
-              },
-              required: ["kind", "turn_id"],
-              additionalProperties: false,
-            },
-          ],
-          description: "One native persisted history page. Keep cursor, scope, and sort direction together for continuation; reverse cursors use the opposite sort direction.",
+          description: "Legacy parameter: false reads metadata; true returns a migration error directing callers to codex_history.",
         },
         cwd: {
           type: "string",
           maxLength: 1000,
           description: "Optional exact absolute native cwd filter for thread/list.",
+        },
+        parent_thread_id: {
+          type: ["string", "null"],
+          minLength: 1,
+          maxLength: 200,
+          pattern: "\\S",
+          description: "List direct spawned children of this native parent. Mutually exclusive with a non-null ancestor_thread_id. Does not select forks or implicitly include subagent sources.",
+        },
+        ancestor_thread_id: {
+          type: ["string", "null"],
+          minLength: 1,
+          maxLength: 200,
+          pattern: "\\S",
+          description: "List spawned descendants at any depth, excluding the ancestor itself. Mutually exclusive with a non-null parent_thread_id. Native filtering only; no Bridge tree walk.",
+        },
+        source_kinds: {
+          type: ["array", "null"],
+          items: { type: "string", enum: THREAD_SOURCE_KINDS },
+          maxItems: 100,
+          description: "Native source filter. Omitted, null, or [] retains native interactive-source defaults; use subAgentThreadSpawn explicitly for spawned threads. Order and duplicates are forwarded. At most 100 entries is a transport bound.",
         },
         search_term: {
           type: "string",
@@ -147,10 +149,13 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
         },
       },
       oneOf: [
-        { not: { anyOf: [{ required: ["thread_id"] }, { required: ["history"] }, { required: ["include_turns"] }] } },
-        { required: ["thread_id"], not: { anyOf: [{ required: ["history"] }, { required: ["cwd"] }, { required: ["search_term"] }, { required: ["cursor"] }, { required: ["limit"] }] } },
-        { required: ["thread_id", "history"], not: { anyOf: [{ required: ["include_turns"] }, { required: ["cwd"] }, { required: ["search_term"] }, { required: ["cursor"] }, { required: ["limit"] }] } },
+        { not: { anyOf: [{ required: ["thread_id"] }, { required: ["include_turns"] }] } },
+        { required: ["thread_id"], not: { anyOf: THREAD_LIST_FIELDS.map((key) => ({ required: [key] })) } },
       ],
+      not: {
+        required: ["parent_thread_id", "ancestor_thread_id"],
+        properties: { parent_thread_id: { type: "string" }, ancestor_thread_id: { type: "string" } },
+      },
       additionalProperties: false,
     },
     annotations: {
@@ -160,6 +165,63 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
       idempotentHint: true,
       openWorldHint: false,
     },
+  },
+  {
+    name: "codex_history",
+    title: "Codex History",
+    description:
+      "Read one lossless native persisted history page, without attaching a writer or rebuilding Bridge live state. Paginated threads provide a turn index (turns) or items within a required turn_id (items). Legacy threads provide one full turn per page (turns, limit 1); item paging is unsupported. Keep opaque string cursors with the same thread, history mode, kind, turn scope, and sort direction; reverse cursors use the opposite direction. Only nextCursor:null means end. Oversized or sanitizer-altered pages fail without partial data; a single legacy turn may be undeliverable. No cache, full-thread fallback, or chunk cursor.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        thread_id: { type: "string", minLength: 1, maxLength: 200, pattern: "\\S" },
+        kind: { type: "string", enum: ["turns", "items"] },
+        turn_id: { type: "string", minLength: 1, maxLength: 200, pattern: "\\S" },
+        cursor: { type: "string", minLength: 1, maxLength: 10_000, pattern: "\\S", description: "Native history cursor; separate from thread/list and numeric live observe cursors." },
+        limit: { type: "integer", minimum: 1, maximum: HISTORY_TURN_LIMIT, description: "Paginated turns: default 20, max 50. Paginated items: default 10, max 20. Legacy turns: default and max 1, checked after metadata read." },
+        sort_direction: { type: "string", enum: ["asc", "desc"], description: "Defaults to desc for turns and asc for items." },
+      },
+      required: ["thread_id", "kind"],
+      oneOf: [
+        { properties: { kind: { const: "turns" } }, not: { required: ["turn_id"] } },
+        { properties: { kind: { const: "items" }, limit: { maximum: HISTORY_ITEM_LIMIT } }, required: ["turn_id"] },
+      ],
+      additionalProperties: false,
+    },
+    annotations: {
+      title: "Codex History",
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+  },
+  {
+    name: "codex_search",
+    title: "Search Native Codex History",
+    description:
+      "Read one native search page without resuming threads, loading full histories or rebuilding Bridge live state. kind=threads maps thread/search for native substring/full-text thread discovery with snippets, distinct from the codex_threads title filter. Native search has no cwd/parent/ancestor filter: it searches native-visible threads selected only by source_kinds and archived, never an implied workspace or ACL. kind=occurrences maps thread/searchOccurrences within one required paginated thread: case-insensitive literal substring matches in visible user and final assistant messages, in chronological message order, not every tool/reasoning item. Native owns indexing, matching and ordering; Bridge has no index, relevance scoring, traversal or fallback. Preserve the exact query and filters on continuation; only nextCursor:null means end, not an empty page. Thread-search backwardsCursor is used with the opposite sort_direction; occurrence turnCursor is an inclusive native history anchor for codex_history(kind=turns, same thread), not a search continuation. snippetMatchRange uses UTF-16 code units, end exclusive. Eligible pages and future fields are unchanged; redaction, truncation, invalid fields or the 256 KiB result-body bound produce search_result_not_deliverable with no partial data/cursor. Native errors, including unsupported history modes, propagate without retry. Search results are locators, not a complete history audit or a snapshot guarantee.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        kind: { type: "string", enum: ["threads", "occurrences"] },
+        search_term: { type: "string", minLength: 1, maxLength: 500, pattern: "\\S", description: "Native query, forwarded unchanged. Length bound is for transport; Bridge does not tokenize, trim or interpret it." },
+        thread_id: { type: "string", minLength: 1, maxLength: 200, pattern: "\\S", description: "Required only for occurrences. Exact native paginated thread." },
+        cursor: { type: "string", minLength: 1, maxLength: 10_000, pattern: "\\S", description: "Opaque search continuation for the same kind, query, scope and filters. Never substitute an occurrence's turnCursor here." },
+        limit: { type: "integer", minimum: 1, maximum: SEARCH_PAGE_LIMIT, default: 20 },
+        sort_key: { type: ["string", "null"], enum: ["created_at", "updated_at", "recency_at", null], description: "Threads only. Omission/null retains native created_at default." },
+        sort_direction: { type: ["string", "null"], enum: ["asc", "desc", null], description: "Threads only. Omission/null retains native descending default. Occurrences have native chronological order." },
+        source_kinds: { type: ["array", "null"], items: { type: "string", enum: THREAD_SOURCE_KINDS }, maxItems: 100, description: "Threads only. Omitted/null/[] keeps native interactive-source defaults; select subagents explicitly. No deduplication or expansion." },
+        archived: { type: ["boolean", "null"], description: "Threads only. true searches archived threads; false/null/omission searches non-archived threads." },
+      },
+      required: ["kind", "search_term"],
+      oneOf: [
+        { properties: { kind: { const: "threads" } }, not: { required: ["thread_id"] } },
+        { properties: { kind: { const: "occurrences" } }, required: ["thread_id"], not: { anyOf: ["sort_key", "sort_direction", "source_kinds", "archived"].map(key => ({ required: [key] })) } },
+      ],
+      additionalProperties: false,
+    },
+    annotations: { title: "Search Native Codex History", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   },
   {
     name: "codex_models",
@@ -196,6 +258,77 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
       destructiveHint: false,
       idempotentHint: true,
       openWorldHint: false,
+    },
+  },
+  {
+    name: "codex_goal",
+    title: "Manage Native Codex Goal",
+    description:
+      "Get, set, or clear the native persisted goal of an exact thread. Each call maps one thread/goal method without implicit resume, turn/start, retries, a goal cache, or checkpoint writes. Active goals may cause native execution; clear is not turn interrupt. Set requires explicit budget_mode with no default: preserve omits native tokenBudget, unlimited sends null, fixed sends the required positive safe-integer token_budget. A budget is an optional native Goal resource ceiling: ordinarily choose unlimited for a long-running goal, fixed only when a hard cap is intended, and preserve when editing an existing goal without changing its budget. The budget gate does not apply to ordinary turns, Queue or Steer. Native Codex validates objectives and owns status transitions and usage accounting. Success returns the unchanged native response; goal_result_not_deliverable means native returned success but its result could not be delivered losslessly, including an acknowledged mutation for set/clear. An already-sent mutating acknowledgement timeout instead means UNKNOWN / possibly accepted. Read native goal state before deciding on another mutation; do not directly retry.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        action: { type: "string", enum: ["get", "set", "clear"] },
+        thread_id: { type: "string", minLength: 1, maxLength: 200, pattern: "\\S" },
+        objective: {
+          type: ["string", "null"],
+          description: "Set only. Native Codex enforces its non-empty, 4,000-character objective contract; Bridge forwards the string unchanged and does not count or truncate it. Omission/null preserves the existing objective.",
+        },
+        status: { type: ["string", "null"], enum: [...GOAL_STATUSES, null], description: "Set only. Native status; omission/null preserves the existing status." },
+        budget_mode: { type: "string", enum: ["preserve", "unlimited", "fixed"], description: "Required for set, with no default. preserve omits native tokenBudget; unlimited sends null; fixed requires token_budget. Only fixed accepts an amount." },
+        token_budget: {
+          type: "integer", minimum: 1, maximum: Number.MAX_SAFE_INTEGER,
+          description: "Required only for budget_mode=fixed. A positive native Goal resource ceiling. The maximum is a JavaScript lossless transport bound, not a goal business rule. No default budget; do not send this field for preserve/unlimited.",
+        },
+      },
+      required: ["action", "thread_id"],
+      oneOf: [
+        { properties: { action: { const: "set" } }, required: ["budget_mode"], oneOf: [
+          { properties: { budget_mode: { const: "fixed" } }, required: ["token_budget"] },
+          { properties: { budget_mode: { enum: ["preserve", "unlimited"] } }, not: { required: ["token_budget"] } },
+        ] },
+        { properties: { action: { enum: ["get", "clear"] } }, not: { anyOf: ["objective", "status", "budget_mode", "token_budget"].map(key => ({ required: [key] })) } },
+      ],
+      additionalProperties: false,
+    },
+    annotations: {
+      title: "Manage Native Codex Goal",
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+      openWorldHint: true,
+    },
+  },
+  {
+    name: "codex_queue",
+    title: "Codex Native Queue",
+    description:
+      "List, add, update, delete or reorder native queued follow-up text for an existing active workflow. Native Codex owns ordering and automatic execution after the current turn; an enqueue acknowledgement is not execution or completion. This differs from codex_steer, which redirects the current turn. Each call forwards one native queue operation, with no implicit resume, turn-start, queue-start, traversal, retry, scheduler or Bridge queue store. Use caller-supplied client_user_message_id for add and native queuedSubmission.id for update/delete/reorder; do not assume an idempotency guarantee. An already-sent mutation timeout is UNKNOWN; read queue and execution state before deciding on another write. queue_result_not_deliverable means native returned success but its result could not be delivered losslessly; for mutations the acknowledgement is retained. No retry or compensation is performed. Queue entries may be consumed while inspecting or editing them. This surface supports text only; update replaces the entire native input array with one text item.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        action: { type: "string", enum: QUEUE_ACTIONS },
+        thread_id: { type: "string", minLength: 1, maxLength: 200, pattern: "\\S" },
+        text: { type: "string", minLength: 1, maxLength: 200_000, pattern: "\\S", description: "Follow-up text for add or full input replacement for update. Input transport bound; long or redaction-sensitive native results may be undeliverable even after the mutation succeeds." },
+        client_user_message_id: { type: "string", minLength: 1, maxLength: 200, pattern: "\\S", description: "Required caller-provided native clientUserMessageId for add; Bridge never generates or retries it." },
+        queued_submission_id: { type: "string", minLength: 1, maxLength: 200, pattern: "\\S", description: "Exact native queuedSubmission.id for update/delete; not a turn id or client message id." },
+        queued_submission_ids: { type: "array", maxItems: QUEUE_PAGE_LIMIT, items: { type: "string", minLength: 1, maxLength: 200, pattern: "\\S" }, description: "Native pending submission IDs in the requested order. Pass the full intended ordering; native validates membership/permutation. No read/merge/deduplication or retry. The array bound is not native queue capacity." },
+        cursor: { type: "string", minLength: 1, maxLength: 10_000, pattern: "\\S", description: "Opaque native queue-list cursor; not a history or observe cursor." },
+        limit: { type: "integer", minimum: 1, maximum: QUEUE_PAGE_LIMIT, default: 20, description: "Maximum entries requested in this single native queue page." },
+      },
+      required: ["action", "thread_id"],
+      oneOf: [
+        { properties: { action: { const: "list" } }, not: { anyOf: ["text", "client_user_message_id", "queued_submission_id", "queued_submission_ids"].map(key => ({ required: [key] })) } },
+        { properties: { action: { const: "add" } }, required: ["text", "client_user_message_id"], not: { anyOf: ["queued_submission_id", "queued_submission_ids", "cursor", "limit"].map(key => ({ required: [key] })) } },
+        { properties: { action: { const: "update" } }, required: ["text", "queued_submission_id"], not: { anyOf: ["client_user_message_id", "queued_submission_ids", "cursor", "limit"].map(key => ({ required: [key] })) } },
+        { properties: { action: { const: "delete" } }, required: ["queued_submission_id"], not: { anyOf: ["text", "client_user_message_id", "queued_submission_ids", "cursor", "limit"].map(key => ({ required: [key] })) } },
+        { properties: { action: { const: "reorder" } }, required: ["queued_submission_ids"], not: { anyOf: ["text", "client_user_message_id", "queued_submission_id", "cursor", "limit"].map(key => ({ required: [key] })) } },
+      ],
+      additionalProperties: false,
+    },
+    annotations: {
+      title: "Codex Native Queue", readOnlyHint: false, destructiveHint: true,
+      idempotentHint: false, openWorldHint: true,
     },
   },
   {
@@ -254,7 +387,7 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
     name: "codex_observe",
     title: "Observe Codex Turn",
     description:
-      "Read bounded incremental sanitized Bridge runtime events, pending requests, and terminal output for a thread. Default compact view projects native facts; raw returns the existing sanitized event envelope. Compact drains silent native events across chunks and wakes on completed supervision facts; raw retains its existing native page and wait behavior. Optional wait_ms performs one bounded event-driven wait with a fixed per-call deadline (maximum 120 seconds); 0 returns immediately. A true-silence deadline returns only runtime_available, runtime_status, active_turn_id, next_cursor, and no_change: true. Reuse next_cursor to continue observing. Use view=raw with a chosen native cursor and wait_ms=0 for replay while the ring retains those events. After Bridge process loss, metadata-only thread/read cannot reconstruct live events, pending requests, cursor, active turn, or terminal; page persistent history through codex_threads.history if needed. A long interval with no new command or output can still mean Codex is actively reasoning; absence of new command activity alone is not evidence of a stall. When actively supervising an in-progress turn, use repeated bounded-wait observe calls until terminal unless the user explicitly pauses or stops; do not end supervision merely because one snapshot is inProgress. After every wake or deadline return, inspect the newly available events/state and decide whether steer, respond, or interruption is needed before starting the next bounded wait.",
+      "Read bounded incremental sanitized Bridge runtime events, pending requests, and terminal output for a thread. Default compact view projects native facts; raw returns the existing sanitized event envelope. Compact drains silent native events across chunks and wakes on completed supervision facts; raw retains its existing native page and wait behavior. Optional wait_ms performs one bounded event-driven wait with a fixed per-call deadline (maximum 120 seconds); 0 returns immediately. A true-silence deadline returns only runtime_available, runtime_status, active_turn_id, next_cursor, and no_change: true. Reuse next_cursor to continue observing. Use view=raw with a chosen native cursor and wait_ms=0 for replay while the ring retains those events. After Bridge process loss, metadata-only thread/read cannot reconstruct live events, pending requests, cursor, active turn, or terminal; page persistent history through codex_history if needed. A long interval with no new command or output can still mean Codex is actively reasoning; absence of new command activity alone is not evidence of a stall. When actively supervising an in-progress turn, use repeated bounded-wait observe calls until terminal unless the user explicitly pauses or stops; do not end supervision merely because one snapshot is inProgress. After every wake or deadline return, inspect the newly available events/state and decide whether steer, respond, or interruption is needed before starting the next bounded wait.",
     inputSchema: {
       type: "object",
       properties: {
@@ -754,10 +887,18 @@ export class ControlSurface {
   async call(name: string, rawArguments: unknown, signal?: AbortSignal): Promise<unknown> {
     const args = asObject(rawArguments ?? {});
     switch (name) {
+      case "codex_history":
+        return this.#history(args);
       case "codex_threads":
         return await this.#threads(args);
       case "codex_models":
         return await this.#models(args);
+      case "codex_goal":
+        return await this.#goal(args);
+      case "codex_queue":
+        return this.#queue(args);
+      case "codex_search":
+        return this.#search(args);
       case "codex_turn":
         return await this.#turn(args);
       case "codex_observe":
@@ -863,68 +1004,109 @@ export class ControlSurface {
     return this.checkpoints;
   }
 
+  async #history(args: Record<string, unknown>): Promise<unknown> {
+    onlyKeys(args, ["thread_id", "kind", "turn_id", "cursor", "limit", "sort_direction"]);
+    const threadId = requiredString(args, "thread_id", 200);
+    const kind = enumValue(args, "kind", ["turns", "items"]);
+    if (kind === undefined) throw new Error("kind is required");
+    if (kind === "turns" && Object.hasOwn(args, "turn_id")) {
+      throw new Error("turn_id is valid only for items");
+    }
+    const turnId = kind === "items" ? requiredString(args, "turn_id", 200) : undefined;
+    const cursor = optionalString(args, "cursor", 10_000);
+    const requestedLimit = optionalInteger(args, "limit", 1, kind === "turns" ? HISTORY_TURN_LIMIT : HISTORY_ITEM_LIMIT);
+    const sortDirection = enumValue(args, "sort_direction", ["asc", "desc"])
+      ?? (kind === "turns" ? "desc" : "asc");
+
+    // Native mode is read on demand, never cached in Bridge live state.
+    const metadata = await this.appServer.request("thread/read", { threadId, includeTurns: false });
+    const thread = asObject(responseRecord(metadata, "thread/read").thread, "thread/read result.thread");
+    const historyMode = thread.historyMode;
+    if (thread.id !== threadId || (historyMode !== "paginated" && historyMode !== "legacy")) {
+      throw new Error("history_upstream_invalid: metadata must identify the requested thread and a supported historyMode");
+    }
+    if (historyMode === "legacy") {
+      if (kind === "items") {
+        throw new Error("history_legacy_item_paging_unsupported: use codex_history with kind:'turns' for native one-full-turn pages; legacy has no item cursor");
+      }
+      if (requestedLimit !== undefined && requestedLimit !== 1) {
+        throw new Error("legacy history turn pages require limit:1");
+      }
+    }
+    const limit = requestedLimit ?? (historyMode === "legacy" ? 1 : kind === "turns" ? 20 : 10);
+    const itemsView = historyMode === "legacy" ? "full" : "notLoaded";
+    const page = validateHistoryPage(await this.appServer.request(
+      kind === "turns" ? "thread/turns/list" : "thread/items/list",
+      {
+        threadId,
+        ...(turnId ? { turnId } : {}),
+        ...(cursor ? { cursor } : {}),
+        limit,
+        sortDirection,
+        ...(kind === "turns" ? { itemsView } : {}),
+      },
+    ), limit, kind);
+    return exactHistoryResponse({
+      source: "codex_app_server",
+      mode: "history",
+      coverage: "native_persisted_history",
+      history_mode: historyMode,
+      kind,
+      page_granularity: kind === "turns" ? "turn" : "item",
+      ...(kind === "turns" ? { items_view: itemsView } : {}),
+      thread_id: threadId,
+      ...(turnId ? { turn_id: turnId } : {}),
+      data: page.data,
+      nextCursor: page.nextCursor,
+      backwardsCursor: page.backwardsCursor,
+    });
+  }
+
+  async #search(args: Record<string, unknown>): Promise<unknown> {
+    const kind = enumValue(args, "kind", ["threads", "occurrences"] as const);
+    if (!kind) throw new Error("kind is required");
+    onlyKeys(args, ["kind", "search_term", "cursor", "limit", ...(kind === "threads"
+      ? ["sort_key", "sort_direction", "source_kinds", "archived"] : ["thread_id"])]);
+    const limit = optionalInteger(args, "limit", 1, SEARCH_PAGE_LIMIT) ?? 20;
+    const params: Record<string, unknown> = { searchTerm: requiredString(args, "search_term", 500), limit };
+    const cursor = optionalString(args, "cursor", 10_000);
+    if (cursor !== undefined) params.cursor = cursor;
+    if (kind === "occurrences") {
+      params.threadId = requiredString(args, "thread_id", 200);
+    } else {
+      const sortKey = args.sort_key === null ? null : enumValue(args, "sort_key", ["created_at", "updated_at", "recency_at"] as const);
+      const sortDirection = args.sort_direction === null ? null : enumValue(args, "sort_direction", ["asc", "desc"] as const);
+      const archived = args.archived === null ? null : optionalBoolean(args, "archived");
+      const sourceKinds = args.source_kinds;
+      if (sourceKinds !== undefined && sourceKinds !== null && (
+        !Array.isArray(sourceKinds) || sourceKinds.length > 100 ||
+        sourceKinds.some(value => typeof value !== "string" || !(THREAD_SOURCE_KINDS as readonly string[]).includes(value))
+      )) throw new Error("source_kinds must be null or an array of at most 100 native source kinds");
+      if (sortKey !== undefined) params.sortKey = sortKey;
+      if (sortDirection !== undefined) params.sortDirection = sortDirection;
+      if (archived !== undefined) params.archived = archived;
+      if (sourceKinds !== undefined) params.sourceKinds = sourceKinds;
+    }
+    const method = kind === "threads" ? "thread/search" : "thread/searchOccurrences";
+    return exactSearchResponse(await this.appServer.request(method, params), kind, limit);
+  }
+
   async #threads(args: Record<string, unknown>): Promise<unknown> {
-    onlyKeys(args, ["thread_id", "include_turns", "history", "cwd", "search_term", "cursor", "limit"]);
+    onlyKeys(args, ["thread_id", "include_turns", ...THREAD_LIST_FIELDS]);
     const threadId = optionalString(args, "thread_id", 200);
     if (threadId) {
-      if (["cwd", "search_term", "cursor", "limit"].some((key) => Object.hasOwn(args, key))) {
+      if (THREAD_LIST_FIELDS.some((key) => Object.hasOwn(args, key))) {
         throw new Error("thread_id cannot be combined with list/search fields");
-      }
-      if (Object.hasOwn(args, "history")) {
-        if (Object.hasOwn(args, "include_turns")) {
-          throw new Error("history cannot be combined with include_turns");
-        }
-        const history = asObject(args.history, "history");
-        onlyKeys(history, ["kind", "turn_id", "cursor", "limit", "sort_direction"]);
-        const kind = enumValue(history, "kind", ["turns", "items"]);
-        if (kind === undefined) throw new Error("history.kind is required");
-        if (kind === "turns" && Object.hasOwn(history, "turn_id")) {
-          throw new Error("history.turn_id is valid only for items");
-        }
-        if (kind === "items" && !Object.hasOwn(history, "turn_id")) {
-          throw new Error("history.turn_id is required for items");
-        }
-        const turnId = kind === "items" ? requiredString(history, "turn_id", 200) : undefined;
-        const cursor = optionalString(history, "cursor", 10_000);
-        const limit = optionalInteger(history, "limit", 1, kind === "turns" ? HISTORY_TURN_LIMIT : HISTORY_ITEM_LIMIT)
-          ?? (kind === "turns" ? 20 : 10);
-        const sortDirection = enumValue(history, "sort_direction", ["asc", "desc"])
-          ?? (kind === "turns" ? "desc" : "asc");
-        const page = validateHistoryPage(await this.appServer.request(
-          kind === "turns" ? "thread/turns/list" : "thread/items/list",
-          {
-            threadId,
-            ...(turnId ? { turnId } : {}),
-            ...(cursor ? { cursor } : {}),
-            limit,
-            sortDirection,
-            ...(kind === "turns" ? { itemsView: "notLoaded" } : {}),
-          },
-        ), limit, kind);
-        return exactHistoryResponse({
-          source: "codex_app_server",
-          mode: "history",
-          coverage: "native_persisted_history",
-          kind,
-          thread_id: threadId,
-          ...(turnId ? { turn_id: turnId } : {}),
-          data: page.data,
-          nextCursor: page.nextCursor,
-          backwardsCursor: page.backwardsCursor,
-        });
       }
       const includeTurns = optionalBoolean(args, "include_turns") ?? false;
       if (includeTurns) {
-        throw new Error("include_turns:true is no longer supported; use codex_threads(thread_id, history:{kind:'turns'}) and page items by turn_id");
+        throw new Error("include_turns:true is no longer supported; use codex_history(thread_id, kind:'turns') and native history mode guidance");
       }
       const result = await this.appServer.request("thread/read", {
         threadId,
         includeTurns: false,
       });
       return sanitizeForTransport({ source: "codex_app_server", mode: "read", ...responseRecord(result, "thread/read") });
-    }
-    if (Object.hasOwn(args, "history")) {
-      throw new Error("history is valid only with thread_id");
     }
     if (Object.hasOwn(args, "include_turns")) {
       throw new Error("include_turns is valid only with thread_id");
@@ -933,6 +1115,18 @@ export class ControlSurface {
     const searchTerm = optionalString(args, "search_term", 500);
     const cursor = optionalString(args, "cursor", 10_000);
     const limit = optionalInteger(args, "limit", 1, 100) ?? 20;
+    const parentThreadId = args.parent_thread_id === null ? null : optionalString(args, "parent_thread_id", 200);
+    const ancestorThreadId = args.ancestor_thread_id === null ? null : optionalString(args, "ancestor_thread_id", 200);
+    if (parentThreadId != null && ancestorThreadId != null) {
+      throw new Error("parent_thread_id and ancestor_thread_id are mutually exclusive");
+    }
+    const sourceKinds = args.source_kinds;
+    if (sourceKinds !== undefined && sourceKinds !== null && (
+      !Array.isArray(sourceKinds) || sourceKinds.length > 100 ||
+      sourceKinds.some((kind) => typeof kind !== "string" || !(THREAD_SOURCE_KINDS as readonly string[]).includes(kind))
+    )) {
+      throw new Error("source_kinds must be null or an array of at most 100 native source kinds");
+    }
     const result = await this.appServer.request("thread/list", {
       limit,
       sortKey: "updated_at",
@@ -940,6 +1134,9 @@ export class ControlSurface {
       ...(cwd ? { cwd } : {}),
       ...(searchTerm ? { searchTerm } : {}),
       ...(cursor ? { cursor } : {}),
+      ...(parentThreadId !== undefined ? { parentThreadId } : {}),
+      ...(ancestorThreadId !== undefined ? { ancestorThreadId } : {}),
+      ...(sourceKinds !== undefined ? { sourceKinds } : {}),
     });
     const page = responseRecord(result, "thread/list");
     if (!Array.isArray(page.data)) {
@@ -1056,6 +1253,81 @@ export class ControlSurface {
     }
   }
 
+  async #goal(args: Record<string, unknown>): Promise<unknown> {
+    const action = enumValue(args, "action", ["get", "set", "clear"] as const);
+    if (!action) throw new Error("action is required");
+    onlyKeys(args, action === "set"
+      ? ["action", "thread_id", "objective", "status", "budget_mode", "token_budget"]
+      : ["action", "thread_id"]);
+    const threadId = requiredString(args, "thread_id", 200);
+    const params: Record<string, unknown> = { threadId };
+    if (action === "set") {
+      const mode = enumValue(args, "budget_mode", ["preserve", "unlimited", "fixed"] as const);
+      if (!mode) throw new Error("budget_mode is required for set: choose preserve, unlimited, or fixed explicitly");
+      if (mode === "fixed") {
+        if (!Number.isSafeInteger(args.token_budget) || (args.token_budget as number) < 1) {
+          throw new Error("fixed budget_mode requires a positive safe-integer token_budget; the maximum is a lossless transport bound");
+        }
+        params.tokenBudget = args.token_budget;
+      } else {
+        if (Object.hasOwn(args, "token_budget")) throw new Error("token_budget is accepted only with budget_mode=fixed");
+        if (mode === "unlimited") params.tokenBudget = null;
+      }
+      if (args.objective !== undefined) {
+        if (args.objective !== null && typeof args.objective !== "string") {
+          throw new Error("objective must be a string or null");
+        }
+        // Native validates objective length/emptiness; do not introduce a
+        // competing JavaScript character count, trim, or truncation rule.
+        params.objective = args.objective;
+      }
+      if (args.status !== undefined) {
+        params.status = args.status === null ? null : enumValue(args, "status", GOAL_STATUSES);
+      }
+    }
+    const response = await this.appServer.request(`thread/goal/${action}`, params);
+    return exactGoalResponse(response, action, threadId);
+  }
+
+  async #queue(args: Record<string, unknown>): Promise<unknown> {
+    const action = enumValue(args, "action", QUEUE_ACTIONS);
+    if (!action) throw new Error("action is required");
+    const fields = {
+      list: ["cursor", "limit"], add: ["text", "client_user_message_id"],
+      update: ["text", "queued_submission_id"], delete: ["queued_submission_id"],
+      reorder: ["queued_submission_ids"],
+    };
+    onlyKeys(args, ["action", "thread_id", ...fields[action]]);
+    const params: Record<string, unknown> = { threadId: requiredString(args, "thread_id", 200) };
+    const expected: { submissionId?: string; clientUserMessageId?: string } = {};
+    if (action === "list") {
+      params.limit = optionalInteger(args, "limit", 1, QUEUE_PAGE_LIMIT) ?? 20;
+      const cursor = optionalString(args, "cursor", 10_000);
+      if (cursor !== undefined) params.cursor = cursor;
+    }
+    if (action === "add" || action === "update") {
+      params.input = [{ type: "text", text: requiredString(args, "text"), text_elements: [] }];
+    }
+    if (action === "add") {
+      expected.clientUserMessageId = requiredString(args, "client_user_message_id", 200);
+      params.clientUserMessageId = expected.clientUserMessageId;
+    }
+    if (action === "update" || action === "delete") {
+      expected.submissionId = requiredString(args, "queued_submission_id", 200);
+      params.queuedSubmissionId = expected.submissionId;
+    }
+    if (action === "reorder") {
+      const ids = args.queued_submission_ids;
+      if (!Array.isArray(ids) || ids.length > QUEUE_PAGE_LIMIT || ids.some(id =>
+        typeof id !== "string" || id.trim().length === 0 || id.length > 200)) {
+        throw new Error("queued_submission_ids must be an array of at most 100 non-empty native IDs, each at most 200 characters");
+      }
+      params.queuedSubmissionIds = ids;
+    }
+    const response = await this.appServer.request("thread/queue/" + action, params);
+    return exactQueueResponse(response, action, expected);
+  }
+
   async #turn(args: Record<string, unknown>): Promise<unknown> {
     onlyKeys(args, ["text", "thread_id", "cwd", "model", "effort", "sandbox", "approval_policy"]);
     const text = requiredString(args, "text");
@@ -1081,6 +1353,7 @@ export class ControlSurface {
     const threadResult = requestedThreadId
       ? await this.appServer.request("thread/resume", {
           threadId: requestedThreadId,
+          excludeTurns: true,
           ...overrides,
         })
       : await this.appServer.request("thread/start", {
@@ -1148,7 +1421,7 @@ export class ControlSurface {
     return sanitizeForTransport({
       runtime_available: false,
       live_state_reconstructable: false,
-      note: "This Bridge process has no live runtime for the thread. Live events, pending requests, live cursor, active turn, and terminal are unknown. Page persisted history with codex_threads.history.",
+      note: "This Bridge process has no live runtime for the thread. Live events, pending requests, live cursor, active turn, and terminal are unknown. Page persisted history with codex_history.",
       runtime_status: "not_reconstructable",
       active_turn_id: null,
       events: [],
