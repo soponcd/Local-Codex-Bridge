@@ -662,3 +662,154 @@ test("an elapsed compact deadline never hides an outstanding approval as no_chan
   assert.equal(result.pending_requests[0].request_id, 7);
   assert.equal(result.next_cursor, 1);
 });
+
+test("stream loss preserves commentary and sparse compact pages never skip retained facts", async () => {
+  const runtime = started(4);
+  message(runtime, "first", "first commentary"); // 1
+  runtime.recordNotification("item/commandExecution/outputDelta", { ...scope, delta: "a" }); // 2
+  message(runtime, "second", "second commentary"); // 3
+  for (let i = 0; i < 100; i++) runtime.recordNotification("item/commandExecution/outputDelta", { ...scope, itemId: `i-${i % 3}`, delta: "output" });
+  message(runtime, "third", "third commentary"); // 104
+  for (let i = 0; i < 100; i++) runtime.recordNotification("item/reasoning/textDelta", { ...scope, delta: "thinking", contentIndex: i % 2 });
+  const retained = runtime.observe("t", 0, 100)!;
+  assert.deepEqual(retained.events.map((entry) => entry.cursor), [1, 3, 104, 204]);
+  assert.equal(retained.cursor_floor, 0);
+  assert.equal(retained.stream_lost, true);
+  assert.equal(retained.facts_lost, false);
+  for (const limit of [1, 2, 10]) {
+    let cursor = 0;
+    const seen: string[] = [];
+    for (let page = 0; cursor < 204 && page < 5; page++) {
+      const result = await observe(runtime, cursor, limit);
+      assert.ok(result.next_cursor > cursor);
+      assert.equal(result.facts_lost, undefined);
+      assert.equal(result.no_change, undefined);
+      seen.push(...(result.events ?? []).map((fact: Result) => fact.item_id));
+      cursor = result.next_cursor;
+    }
+    assert.equal(cursor, 204);
+    assert.deepEqual(seen, ["first", "second", "third"]);
+  }
+  assert.deepEqual(runtime.observe("t", 0, 100), retained);
+});
+
+test("stream-only loss stays diagnostic across repeated bounded waits and new activity", async () => {
+  const runtime = started(3);
+  let cursor = 0;
+  for (let round = 0; round < 2; round++) {
+    const cancellation = new AbortController();
+    let settled = false;
+    const pending = runtime.observeCompactWithWait("t", cursor, 50, 10_000, cancellation.signal)
+      .then((result) => { settled = true; return result as Result; });
+    try {
+      // Synchronous bursts overflow storage before the waiter can scan them.
+      for (let i = 0; i < 100; i++) runtime.recordNotification("item/commandExecution/outputDelta", { ...scope, itemId: `stream-${i % 4}`, delta: "output" });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(settled, false, "stream loss must not terminate the compact wait");
+      for (let i = 0; i < 100; i++) runtime.recordNotification("item/agentMessage/delta", { ...scope, delta: "partial" });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(settled, false, "subsequent stream loss must not create a wake loop");
+      message(runtime, `wake-${round}`, "supervision wake");
+      const result = await pending;
+      assert.equal(result.stream_lost, true);
+      assert.equal(result.cursor_lost, true);
+      assert.equal(result.facts_lost, undefined);
+      assert.equal(result.no_change, undefined);
+      assert.equal(result.events.at(-1).item_id, `wake-${round}`);
+      assert.ok(result.next_cursor > cursor);
+      cursor = result.next_cursor;
+    } finally { cancellation.abort(); await pending; }
+  }
+});
+
+test("a stream-loss deadline returns progress once and the next quiet deadline is no_change", async (t) => {
+  const runtime = started(3);
+  for (let i = 0; i < 20; i++) runtime.recordNotification("item/commandExecution/outputDelta", { ...scope, delta: "x" });
+  let expired = false;
+  const read = runtime.observe.bind(runtime);
+  t.mock.method(performance, "now", () => expired ? 2 : 0);
+  t.mock.method(runtime, "observe", (...args: Parameters<RuntimeStore["observe"]>) => {
+    const result = read(...args);
+    expired = true;
+    return result;
+  });
+  const result = await observe(runtime, 0, 50, 1);
+  assert.equal(result.next_cursor, 20);
+  assert.equal(result.stream_lost, true);
+  assert.equal(result.facts_lost, undefined);
+  assert.equal(result.no_change, undefined);
+  assert.equal(result.activity["item/commandExecution/outputDelta"], 3);
+  expired = false;
+  const quiet = await observe(runtime, result.next_cursor, 50, 1);
+  assert.equal(quiet.no_change, true);
+  assert.equal(quiet.stream_lost, undefined);
+  assert.equal(quiet.next_cursor, 20);
+});
+
+test("facts loss wakes compact even when every retained event is normally silent", async () => {
+  for (const buffered of [true, false]) {
+    const runtime = started(3);
+    const overflowFacts = () => {
+      for (let i = 0; i < 4; i++) runtime.recordNotification("account/updated", { authMode: null, planType: null });
+    };
+    if (buffered) overflowFacts();
+    const cancellation = new AbortController();
+    const pending = runtime.observeCompactWithWait("t", 0, 50, 10_000, cancellation.signal);
+    try {
+      if (!buffered) overflowFacts();
+      const result = await Promise.race([pending, new Promise<null>((resolve) => setImmediate(() => resolve(null)))]) as Result | null;
+      assert.notEqual(result, null, "facts loss must return before waiting for another event");
+      assert.equal(result!.facts_lost, true);
+      assert.equal(result!.stream_lost, undefined);
+      assert.equal(result!.cursor_lost, true);
+      assert.equal(result!.events, undefined);
+      assert.equal(result!.next_cursor, 4);
+      assert.equal(result!.no_change, undefined);
+    } finally { cancellation.abort(); await pending; }
+  }
+});
+
+test("evicted approval events still wake compact and expose the actionable pending request", async () => {
+  const runtime = started(3);
+  runtime.recordServerRequest("approval", "item/commandExecution/requestApproval", { ...scope, command: "npm test" });
+  for (let i = 0; i < 4; i++) runtime.recordNotification("account/updated", { authMode: null, planType: null });
+  assert.equal(runtime.observe("t", 0, 100)!.events.some((entry) => entry.method.endsWith("requestApproval")), false);
+  const result = await observe(runtime, runtime.currentCursor("t"), 50, 10_000);
+  assert.equal(result.pending_requests[0].request_id, "approval");
+  assert.equal(result.no_change, undefined);
+  const claimed = runtime.claimPending("approval", { threadId: "t", turnId: "u", method: "item/commandExecution/requestApproval" });
+  runtime.completePending(claimed);
+  assert.deepEqual(runtime.pendingForThread("t"), []);
+});
+
+test("an evicted final behind a retained older delta respects scan and replay boundaries", async () => {
+  const runtime = started(3);
+  runtime.recordNotification("item/commandExecution/outputDelta", { ...scope, delta: "older output" }); // 1 stays retained
+  message(runtime, "final", "FINAL", "final_answer"); // 2
+  turnCompleted(runtime, "final", "FINAL"); // 3
+  runtime.recordNotification("future/after-terminal", { threadId: "t" }); // 4 evicts final
+  runtime.recordNotification("future/after-terminal", { threadId: "t" }); // 5 evicts terminal
+  const raw = runtime.observe("t", 0, 100)!;
+  assert.equal(raw.cursor_floor, 0);
+  assert.deepEqual(raw.events.map((entry) => entry.cursor), [1, 4, 5]);
+  assert.equal(raw.terminal?.final_result, "FINAL");
+  assert.equal(raw.facts_lost, true);
+  // Force an ordinary scan ceiling before the missing final's position.
+  const { projectCompact } = await import("../src/observe-compact.js");
+  const identity = { itemCursor: 2, terminalCursor: 3, turnId: "u", itemEvicted: true };
+  const beforeAnchor = projectCompact(runtime.observe("t", 0, 1)!, 0, {}, identity) as Result;
+  assert.equal(beforeAnchor.next_cursor, 1);
+  assert.equal(beforeAnchor.terminal.final_result, undefined);
+  const first = await observe(runtime, beforeAnchor.next_cursor, 1);
+  assert.equal(first.next_cursor, 4);
+  assert.equal(first.terminal.final_result, "FINAL");
+  const next = await observe(runtime, first.next_cursor, 1);
+  assert.equal(next.next_cursor, 5);
+  assert.equal(next.terminal.final_result, undefined);
+  assert.equal((await observe(runtime, 0, 1)).terminal.final_result, "FINAL");
+  // A caught-up observer sees the terminal immediately without replaying final text.
+  const caughtUp = await observe(runtime, 5, 50, 10_000);
+  assert.equal(caughtUp.terminal.status, "completed");
+  assert.equal(caughtUp.terminal.final_result, undefined);
+  assert.equal(caughtUp.no_change, undefined);
+});

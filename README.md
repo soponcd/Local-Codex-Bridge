@@ -225,9 +225,11 @@ Bridge 不尝试推断当前 thread 正在使用哪个模型。
 
 长任务通常应继续通过 `codex_observe` 监督，而不是把“请求已接受”误认为“任务已经完成”。
 
-可选的 `wait_ms` 上限为 `120000` 毫秒（120 秒），截止时间从本次调用开始固定；省略或设为 `0` 时立即读取。completed agent message、待处理请求、明确失败／警告、终态和无法识别的 native 事件会提前唤醒；已识别的 delta、成功命令等活动累计到下次唤醒或本次截止时间。Bridge 不进行 polling 或 stall detection。
+可选的 `wait_ms` 上限为 `120000` 毫秒（120 秒），截止时间从本次调用开始固定；省略或设为 `0` 时立即读取。completed agent message、待处理请求、明确失败／警告、终态、无法识别的 native 事件，以及 `facts_lost` 表示的监督事实完整性风险会提前唤醒 compact；已识别的 delta、成功命令等活动累计到下次唤醒或本次截止时间。仅有 `stream_lost` 时附轻量诊断字段，不提前唤醒 compact，也不要求 supervisor 下钻 raw。Bridge 不进行 polling 或 stall detection。
 
-默认 `view: "compact"` 跨 native chunks 排掉 silent events，仅交付有界的 typed supervision facts 与活动计数；`limit` 约束投影后的 facts。正常结果用 `next_cursor` 续读，只有 ring 缺口才附 `cursor_lost` / `cursor_floor`；命中内部排水上限会明确返回 `continuation: "drainage_yield"`。`view: "raw"` 保留原有 native 事件分页和等待行为，可用指定 native cursor 与 `wait_ms: 0` 下钻。真的没有 native 变化、待处理请求或终态时，截止返回仅含 `runtime_available`、`runtime_status`、`active_turn_id`、`next_cursor`、`no_change: true` 五字段。发生过活动不会标成 `no_change`；它也不表示 stalled。
+默认 `view: "compact"` 跨保留事件 chunks 排掉 silent events，仅交付有界的 typed supervision facts 与实际扫描到的保留活动计数；`limit` 约束投影后的 facts。命中内部排水上限会明确返回 `continuation: "drainage_yield"`。`view: "raw"` 返回真实的 sanitized 单条保留事件，沿用进入 thread runtime 时的递增 cursor，不合并、不重新编号；内部 cursor 可以有缺口，因此不是完整 native stream。可用指定 runtime cursor 与 `wait_ms: 0` 重放仍在 ring 中的事件。
+
+`stream_lost` 表示合法 allowlist 流式 delta 已被淘汰，`facts_lost` 表示其余事件已被淘汰；`cursor_lost` 总括两类缺失。loss 覆盖本次读取检查的未扫描 cursor 到当前 head 的范围，不限于本页返回记录之间。`cursor_floor` 仅表示最早保留记录之前的位置，不保证之后连续完整。两种 view 都必须用 `next_cursor` 续读；不能因 loss 跳到 floor，从而漏过仍保留的事件。真的没有新活动或 loss、待处理请求或终态时，截止返回仅含 `runtime_available`、`runtime_status`、`active_turn_id`、`next_cursor`、`no_change: true` 五字段；它不表示 stalled。
 
 一个典型流程是：
 
@@ -494,7 +496,11 @@ Bridge 的：
 
 主要存在于内存中。
 
-Bridge 重启且缺失 live runtime 时，`codex_observe` 只读 `thread/read(includeTurns:false)` 元数据；`terminal:null` 和 `active_turn_id:null` 表示未知。返回的零值 live cursor、空 events / pending requests 只是 unavailable placeholders，不能重建 live state。需要持久历史时按需调用 `codex_history`。runtime 仍存在但 ring 已淘汰事件时，`cursor_lost` / `cursor_floor` 继续表示真实的 live 缺口。
+每个 thread 只有一个按 cursor 排序的有界 ring，默认容量 R=256。D 仅包括显式 allowlist 中、原始 shape 合法的纯流式 delta；其余事件保守归 F，包括 unknown、非法 shape、warning 和普通状态。分类不读取正文语义，也不以 `wake:false` 或名称包含 delta 为依据。F 最多保留最近 R−1 条；D 借用其他空位，出现过 D 后始终保留最近一条 D（R≥2）。两类各自按 FIFO 淘汰，D 不能为自己淘汰 F。读取不改变保留结果，不建立第二个 buffer、item 生命周期或消费确认状态。
+
+两个常数大小的 loss watermark 分别记录最近淘汰的 D 和 F cursor；不保存缺口区间。delta 洪流不会改变最近 R−1 条 F 的保留集合，但 F 自身超过容量仍会造成 `facts_lost`。pending requests 和 latest terminal/final snapshot 保持独立可用，不依赖原事件仍在 ring 中；ring 本身不替代持久 history。
+
+Bridge 重启且缺失 live runtime 时，`codex_observe` 只读 `thread/read(includeTurns:false)` 元数据；`terminal:null` 和 `active_turn_id:null` 表示未知。返回的零值 live cursor、false loss 字段、空 events / pending requests 都只是 `unavailable_live_fields` 标明的 unavailable placeholders，不能证明没有丢失或重建 live state。需要持久历史时按需调用 `codex_history`。runtime 仍存在时，`stream_lost` / `facts_lost` 区分实际保留缺失，`cursor_lost` 总括两类；`cursor_floor` 不再代表连续后缀。
 
 ### Checkpoint
 

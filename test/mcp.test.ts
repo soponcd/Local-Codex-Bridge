@@ -275,12 +275,14 @@ for (const view of ["compact", "raw"] as const) {
       assert.equal(pending[0]!.request_id, 7);
       assert.deepEqual(pending[0]!.params, pendingParams);
       if (view === "raw") {
-        for (const key of ["runtime_available", "runtime_status", "active_turn_id", "events", "next_cursor", "current_cursor", "cursor_floor", "cursor_lost", "has_more", "pending_requests", "terminal"]) {
+        for (const key of ["runtime_available", "runtime_status", "active_turn_id", "events", "next_cursor", "current_cursor", "cursor_floor", "cursor_lost", "stream_lost", "facts_lost", "has_more", "pending_requests", "terminal"]) {
           assert.equal(Object.hasOwn(first, key), true, `raw envelope must retain ${key}`);
         }
         assert.deepEqual(first.events, runtime.observe(threadId, 0, 1)!.events);
         assert.equal(first.cursor_floor, 0);
         assert.equal(first.cursor_lost, false);
+        assert.equal(first.stream_lost, false);
+        assert.equal(first.facts_lost, false);
       }
       const continued = await observe(first.next_cursor as number);
       assert.ok((continued.next_cursor as number) > (first.next_cursor as number));

@@ -387,7 +387,7 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
     name: "codex_observe",
     title: "Observe Codex Turn",
     description:
-      "Read bounded incremental sanitized Bridge runtime events, pending requests, and terminal output for a thread. Default compact view projects native facts; raw returns the existing sanitized event envelope. Compact drains silent native events across chunks and wakes on completed supervision facts; raw retains its existing native page and wait behavior. Optional wait_ms performs one bounded event-driven wait with a fixed per-call deadline (maximum 120 seconds); 0 returns immediately. A true-silence deadline returns only runtime_available, runtime_status, active_turn_id, next_cursor, and no_change: true. Reuse next_cursor to continue observing. Use view=raw with a chosen native cursor and wait_ms=0 for replay while the ring retains those events. After Bridge process loss, metadata-only thread/read cannot reconstruct live events, pending requests, cursor, active turn, or terminal; page persistent history through codex_history if needed. A long interval with no new command or output can still mean Codex is actively reasoning; absence of new command activity alone is not evidence of a stall. When actively supervising an in-progress turn, use repeated bounded-wait observe calls until terminal unless the user explicitly pauses or stops; do not end supervision merely because one snapshot is inProgress. After every wake or deadline return, inspect the newly available events/state and decide whether steer, respond, or interruption is needed before starting the next bounded wait.",
+      "Read bounded incremental sanitized Bridge runtime events, pending requests, and terminal output for a thread. Default compact view projects supervision facts and counts only scanned retained activity. Raw returns individual retained sanitized events with original runtime cursors, without aggregation; internal cursor gaps are possible, so it is not a complete native stream. stream_lost reports evicted allowlisted, valid streaming deltas; facts_lost reports eviction of other events; cursor_lost summarizes either. Loss covers the unscanned cursor-to-head range checked during the read, not only the returned page. cursor_floor locates the oldest retained event boundary, not a continuous suffix or an instruction to skip records. Always reuse next_cursor to consume remaining retained events. Compact drains silent retained events across chunks and wakes on supervision facts or facts_lost; stream_lost alone is diagnostic metadata, does not wake compact early, and does not require raw replay. Optional wait_ms performs one bounded event-driven wait with a fixed per-call deadline (maximum 120 seconds); 0 returns immediately. A true-silence deadline returns only runtime_available, runtime_status, active_turn_id, next_cursor, and no_change: true; activity or loss is not silence. Use view=raw with a chosen runtime cursor and wait_ms=0 for retained-event replay. Pending requests and latest terminal output remain separately available even after their ring events are evicted. After Bridge process loss, metadata-only thread/read cannot reconstruct live events, pending requests, cursor, active turn, or terminal; page persistent history through codex_history if needed. A long interval with no new command or output can still mean Codex is actively reasoning; absence of new command activity alone is not evidence of a stall. When actively supervising an in-progress turn, use repeated bounded-wait observe calls until terminal unless the user explicitly pauses or stops; do not end supervision merely because one snapshot is inProgress. After every wake or deadline return, inspect the newly available events/state and decide whether steer, respond, or interruption is needed before starting the next bounded wait.",
     inputSchema: {
       type: "object",
       properties: {
@@ -395,14 +395,14 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
         cursor: {
           type: "integer",
           minimum: 0,
-          description: "Continue from this native runtime cursor; deliberate older values replay retained events.",
+          description: "Continue from next_cursor; deliberate older values replay retained events. Original per-event runtime cursors may have internal gaps. Never replace next_cursor with cursor_floor after loss.",
         },
         limit: {
           type: "integer",
           minimum: 1,
           maximum: 100,
           default: 50,
-          description: "Maximum compact facts or raw native events to return; compact may scan more silent native events internally.",
+          description: "Maximum compact facts or retained raw events to return; compact may scan more silent retained events internally. Loss metadata can cover events beyond this page.",
         },
         wait_ms: {
           type: "integer",
@@ -410,13 +410,13 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
           maximum: MAX_OBSERVE_WAIT_MS,
           default: 0,
           description:
-            "Optional fixed per-call wait for a supervision wake or deadline in compact view; raw retains its existing event wait. 0 drains currently available events immediately. This is not stall detection.",
+            "Optional fixed per-call wait for a supervision wake, facts loss, or deadline in compact view; stream loss alone does not wake compact early. Raw waits for retained events/state. 0 reads currently available events immediately. This is not stall detection.",
         },
         view: {
           type: "string",
           enum: ["compact", "raw"],
           default: "compact",
-          description: "Compact facts by default; raw returns the existing sanitized native event envelope. Raw retains native pagination and its existing wait behavior.",
+          description: "Compact facts by default; raw returns retained individual sanitized event envelopes with original runtime cursors and possible internal gaps. Neither view restores evicted events; use next_cursor for pagination.",
         },
       },
       required: ["thread_id"],
@@ -1429,10 +1429,12 @@ export class ControlSurface {
       current_cursor: 0,
       cursor_floor: 0,
       cursor_lost: false,
+      stream_lost: false,
+      facts_lost: false,
       has_more: false,
       pending_requests: [],
       terminal: null,
-      unavailable_live_fields: ["events", "next_cursor", "current_cursor", "cursor_floor", "cursor_lost", "has_more", "pending_requests"],
+      unavailable_live_fields: ["events", "next_cursor", "current_cursor", "cursor_floor", "cursor_lost", "stream_lost", "facts_lost", "has_more", "pending_requests"],
       stored_thread: { ...storedThread, turns: [] },
       source: "codex_app_server_thread_read_metadata",
     });

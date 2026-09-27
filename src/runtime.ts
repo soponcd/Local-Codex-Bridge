@@ -39,6 +39,7 @@ export interface RuntimeEvent {
   compactSettingsChanged?: boolean;
   compactBoundaryChanged?: boolean;
   compactRoute?: Route;
+  streamDelta?: boolean;
 }
 
 export interface PendingServerRequest {
@@ -99,6 +100,8 @@ interface ThreadRuntime {
   revision: number;
   nextCursor: number;
   events: RuntimeEvent[];
+  lastDroppedStream: number;
+  lastDroppedFact: number;
   terminal: TerminalSnapshot | null;
   agentText: string;
   compactPlanSignature: string | null;
@@ -119,6 +122,8 @@ export interface RuntimeObservation {
   current_cursor: number;
   cursor_floor: number;
   cursor_lost: boolean;
+  stream_lost: boolean;
+  facts_lost: boolean;
   has_more: boolean;
   pending_requests: unknown[];
   terminal: TerminalSnapshot | null;
@@ -155,6 +160,16 @@ const EVENT_SANITIZE: SanitizeOptions = {
   maxObjectKeys: 50,
   totalCharBudget: 64_000,
 };
+
+// Retention eligibility is independent of compact wake/activity policy. Only
+// these pure streaming methods with a valid ORIGINAL native shape may borrow
+// fact capacity. New methods and all other notifications conservatively use F.
+const STREAM_DELTA_METHODS = new Set([
+  "item/agentMessage/delta", "item/plan/delta",
+  "item/commandExecution/outputDelta", "item/fileChange/outputDelta",
+  "item/reasoning/summaryTextDelta", "item/reasoning/textDelta",
+  "command/exec/outputDelta", "process/outputDelta",
+]);
 
 const TEXT_SECRET_PATTERNS: ReadonlyArray<[RegExp, string]> = [
   [/\bBearer\s+[A-Za-z0-9._~+\/-]{8,}={0,2}/gi, "Bearer [REDACTED]"],
@@ -453,8 +468,8 @@ export class RuntimeStore {
     private readonly ringLimit = 256,
     private readonly uxProjection?: UxProjectionSink,
   ) {
-    if (!Number.isInteger(ringLimit) || ringLimit < 1) {
-      throw new Error("ringLimit must be a positive integer");
+    if (!Number.isInteger(ringLimit) || ringLimit < 2) {
+      throw new Error("ringLimit must be an integer of at least 2");
     }
     this.#publishUx();
   }
@@ -476,6 +491,8 @@ export class RuntimeStore {
         revision: 0,
         nextCursor: 1,
         events: [],
+        lastDroppedStream: 0,
+        lastDroppedFact: 0,
         terminal: null,
         agentText: "",
         compactPlanSignature: null,
@@ -892,11 +909,14 @@ export class RuntimeStore {
     const current = runtime.nextCursor - 1;
     const firstAvailable = runtime.events[0]?.cursor ?? runtime.nextCursor;
     const requested = cursor ?? firstAvailable - 1;
-    const cursorLost = requested < firstAvailable - 1;
-    const effective = cursorLost ? firstAvailable - 1 : requested;
-    const available = runtime.events.filter((event) => event.cursor > effective);
+    const streamLost = runtime.lastDroppedStream > requested;
+    const factsLost = runtime.lastDroppedFact > requested;
+    // Loss describes the entire unread (requested, current] interval, including
+    // gaps after this page. Never skip retained records by replacing the cursor
+    // with a loss watermark or the (potentially sparse) ring's floor.
+    const available = runtime.events.filter((event) => event.cursor > requested);
     const events = available.slice(0, limit);
-    const nextCursor = events.at(-1)?.cursor ?? Math.min(Math.max(effective, 0), current);
+    const nextCursor = events.at(-1)?.cursor ?? Math.min(Math.max(requested, 0), current);
     return {
       runtime_available: true,
       runtime_status: runtime.status,
@@ -905,7 +925,9 @@ export class RuntimeStore {
       next_cursor: nextCursor,
       current_cursor: current,
       cursor_floor: Math.max(0, firstAvailable - 1),
-      cursor_lost: cursorLost,
+      cursor_lost: streamLost || factsLost,
+      stream_lost: streamLost,
+      facts_lost: factsLost,
       has_more: available.length > events.length,
       pending_requests: this.pendingForThread(threadId),
       terminal: runtime.terminal,
@@ -973,29 +995,31 @@ export class RuntimeStore {
     const startedRevision = runtime.revision;
     const deadline = performance.now() + waitMs;
     const initial = this.observe(threadId, cursor, COMPACT_DRAIN_CHUNK)!;
-    let cursorLost = initial.cursor_lost;
+    let streamLost = initial.stream_lost;
+    let factsLost = initial.facts_lost;
     let cursorFloor = initial.cursor_floor;
     const requested = cursor ?? initial.cursor_floor;
     const scan = new CompactAccumulator(requested, factLimit, {
       threadId, ...(runtime.activeTurnId ? { activeTurnId: runtime.activeTurnId } : {}),
-    }, cursorLost ? cursorFloor : Math.min(requested, initial.current_cursor));
+    }, Math.min(requested, initial.current_cursor));
     const finalIdentity = () => ({
       itemCursor: runtime.finalMessageCursor,
       terminalCursor: runtime.terminalCursor,
       turnId: runtime.terminal?.turn_id ?? null,
+      itemEvicted: runtime.finalMessageCursor !== null && runtime.finalMessageCursor <= runtime.lastDroppedFact,
     });
     let last = initial;
     const result = (more = false): Record<string, unknown> =>
-      scan.result(last, finalIdentity(), more, cursorLost, cursorFloor);
+      scan.result(last, finalIdentity(), more, streamLost, factsLost, cursorFloor);
 
     while (true) {
       const revision = runtime.revision;
       const snapshot = this.observe(threadId, scan.nextCursor, Math.min(COMPACT_DRAIN_CHUNK, COMPACT_DRAIN_CEILING - scan.scanned))!;
       last = snapshot;
       if (snapshot.cursor_lost) {
-        cursorLost = true;
+        streamLost ||= snapshot.stream_lost;
+        factsLost ||= snapshot.facts_lost;
         cursorFloor = Math.max(cursorFloor, snapshot.cursor_floor);
-        scan.nextCursor = snapshot.cursor_floor;
       }
       for (let index = 0; index < snapshot.events.length; index += 1) {
         if (!scan.consume(snapshot.events[index]!)) return result(true);
@@ -1012,9 +1036,9 @@ export class RuntimeStore {
         if (waitMs > 0 && performance.now() >= deadline) return result(true);
         continue;
       }
-      if (snapshot.pending_requests.length > 0 || snapshot.terminal !== null || snapshot.active_turn_id === null || cursorLost || waitMs === 0 || performance.now() >= deadline) {
+      if (snapshot.pending_requests.length > 0 || snapshot.terminal !== null || snapshot.active_turn_id === null || factsLost || waitMs === 0 || performance.now() >= deadline) {
         if (scan.scanned === 0 && runtime.revision === startedRevision && snapshot.pending_requests.length === 0 && snapshot.terminal === null &&
-            snapshot.active_turn_id !== null && !cursorLost && waitMs > 0 && performance.now() >= deadline) {
+            snapshot.active_turn_id !== null && !streamLost && !factsLost && waitMs > 0 && performance.now() >= deadline) {
           return {
             runtime_available: true,
             runtime_status: snapshot.runtime_status,
@@ -1102,7 +1126,11 @@ export class RuntimeStore {
       data,
       ...(turnId ? { turn_id: turnId } : {}),
     };
+    let streamDelta = false;
     const compactRoute = prepareCompactRoute(event, () => {
+    // Reuse the compact membrane's original-shape validation, before transport
+    // sanitization. A cap signal carries a fact despite sharing a delta method.
+    streamDelta = STREAM_DELTA_METHODS.has(method) && asRecord(data)?.capReached !== true;
     if (method === "turn/plan/updated") {
       const plan = asRecord(data)?.plan;
       if (Array.isArray(plan) && plan.every((step) => typeof asRecord(step)?.step === "string" && typeof asRecord(step)?.status === "string")) {
@@ -1127,12 +1155,20 @@ export class RuntimeStore {
     }
     });
     Object.defineProperty(event, "compactRoute", { value: compactRoute });
+    Object.defineProperty(event, "streamDelta", { value: streamDelta });
     event.data = sanitizeForTransport(data, EVENT_SANITIZE);
     runtime.nextCursor += 1;
-    runtime.events.push(event);
-    if (runtime.events.length > this.ringLimit) {
-      runtime.events.splice(0, runtime.events.length - this.ringLimit);
+    const factCount = runtime.events.reduce((count, retained) => count + (retained.streamDelta ? 0 : 1), 0);
+    const evictFact = !streamDelta && factCount >= this.ringLimit - 1;
+    if (evictFact || runtime.events.length === this.ringLimit) {
+      // Both classes are FIFO. F reserves R-1 records; the remaining position
+      // keeps the latest D, while D borrows any otherwise unused positions.
+      const index = runtime.events.findIndex((retained) => evictFact ? !retained.streamDelta : retained.streamDelta);
+      const [dropped] = runtime.events.splice(index, 1);
+      if (dropped!.streamDelta) runtime.lastDroppedStream = dropped!.cursor;
+      else runtime.lastDroppedFact = dropped!.cursor;
     }
+    runtime.events.push(event);
     this.#signalChange(runtime);
     return event.cursor;
   }

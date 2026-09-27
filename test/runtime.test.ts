@@ -45,6 +45,244 @@ function controlFor(runtime: RuntimeStore): ControlSurface {
   return new ControlSurface(appServer);
 }
 
+const RING_THREAD = "thread-retention";
+const RING_TURN = "turn-retention";
+const OUTPUT_DELTA = "item/commandExecution/outputDelta";
+
+function appendRingDelta(runtime: RuntimeStore, index: number): void {
+  runtime.recordNotification(OUTPUT_DELTA, {
+    threadId: RING_THREAD,
+    turnId: RING_TURN,
+    itemId: `command-${index % 5}`,
+    delta: `output-${index}`,
+  });
+}
+
+function appendRingFact(runtime: RuntimeStore, index: number): void {
+  runtime.recordNotification("warning", {
+    threadId: RING_THREAD,
+    turnId: RING_TURN,
+    message: `fact-${index}`,
+  });
+}
+
+function retainedCursors(runtime: RuntimeStore): number[] {
+  return runtime.observe(RING_THREAD, 0, 100)!.events.map((event) => event.cursor);
+}
+
+test("class-aware ring keeps recent facts through large interleaved delta bursts", () => {
+  const runtime = new RuntimeStore(4);
+  const facts: number[] = [];
+  for (let fact = 0; fact < 8; fact += 1) {
+    appendRingFact(runtime, fact);
+    facts.push(runtime.currentCursor(RING_THREAD));
+    for (let delta = 0; delta < 300; delta += 1) {
+      appendRingDelta(runtime, fact * 300 + delta);
+      const observed = runtime.observe(RING_THREAD, 0, 100)!;
+      assert.ok(observed.events.length <= 4);
+      assert.deepEqual(
+        observed.events.filter((event) => event.method !== OUTPUT_DELTA).map((event) => event.cursor),
+        facts.slice(-3),
+      );
+      assert.equal(observed.events.at(-1)?.cursor, runtime.currentCursor(RING_THREAD));
+    }
+  }
+  const observed = runtime.observe(RING_THREAD, 0, 100)!;
+  assert.equal(observed.stream_lost, true);
+  assert.equal(observed.facts_lost, true);
+  assert.equal(observed.events.at(-1)?.method, OUTPUT_DELTA);
+  assert.deepEqual(observed.events.at(-1)?.data, {
+    threadId: RING_THREAD, turnId: RING_TURN, itemId: "command-4", delta: "output-2399",
+  });
+});
+
+test("class-aware ring uses FIFO within each class and keeps the last delta through fact pressure", () => {
+  const runtime = new RuntimeStore(4);
+  appendRingDelta(runtime, 1);
+  appendRingDelta(runtime, 2);
+  appendRingDelta(runtime, 3);
+  appendRingDelta(runtime, 4);
+  assert.deepEqual(retainedCursors(runtime), [1, 2, 3, 4]);
+  appendRingFact(runtime, 5);
+  assert.deepEqual(retainedCursors(runtime), [2, 3, 4, 5]);
+  appendRingFact(runtime, 6);
+  assert.deepEqual(retainedCursors(runtime), [3, 4, 5, 6]);
+  appendRingFact(runtime, 7);
+  assert.deepEqual(retainedCursors(runtime), [4, 5, 6, 7]);
+  appendRingFact(runtime, 8);
+  assert.deepEqual(retainedCursors(runtime), [4, 6, 7, 8]);
+  appendRingDelta(runtime, 9);
+  assert.deepEqual(retainedCursors(runtime), [6, 7, 8, 9]);
+});
+
+test("unknown, malformed delta, warning, and ordinary status remain facts", () => {
+  const cases: Array<[string, Record<string, unknown>]> = [
+    ["future/outputDelta", { itemId: "unknown", delta: "ordinary output" }],
+    [OUTPUT_DELTA, { itemId: "malformed", delta: 17 }],
+    [OUTPUT_DELTA, { delta: "missing item identity" }],
+    ["warning", { message: "ordinary output" }],
+    ["thread/status/changed", { status: { type: "active", activeFlags: [] } }],
+    ["item/reasoning/summaryPartAdded", { itemId: "reasoning", summaryIndex: 0 }],
+    ["item/mcpToolCall/progress", { itemId: "tool", message: "ordinary output" }],
+  ];
+  for (const [method, params] of cases) {
+    const runtime = new RuntimeStore(2);
+    runtime.recordNotification(method, { threadId: RING_THREAD, turnId: RING_TURN, ...params });
+    for (let index = 0; index < 20; index += 1) appendRingDelta(runtime, index);
+    const observed = runtime.observe(RING_THREAD, 0, 100)!;
+    assert.deepEqual(observed.events.map((event) => event.cursor), [1, 21], method);
+    assert.equal(observed.events[0]?.method, method);
+    assert.equal(observed.facts_lost, false, method);
+    assert.equal(observed.stream_lost, true, method);
+  }
+});
+
+test("only valid allowlisted pure delta shapes share stream capacity", () => {
+  const itemScope = { threadId: RING_THREAD, turnId: RING_TURN, itemId: "stream" };
+  const cases: Array<[string, Record<string, unknown>]> = [
+    ["item/agentMessage/delta", { ...itemScope, delta: "warning approval ERROR" }],
+    ["item/plan/delta", { ...itemScope, delta: "plan" }],
+    [OUTPUT_DELTA, { ...itemScope, delta: "output" }],
+    ["item/fileChange/outputDelta", { ...itemScope, delta: "patch" }],
+    ["item/reasoning/summaryTextDelta", { ...itemScope, delta: "summary", summaryIndex: 0 }],
+    ["item/reasoning/textDelta", { ...itemScope, delta: "thinking", contentIndex: 0 }],
+    ["command/exec/outputDelta", { processId: "process", stream: "stdout", deltaBase64: "eA==", capReached: false }],
+    ["process/outputDelta", { processHandle: "process", stream: "stderr", deltaBase64: "eA==", capReached: false }],
+  ];
+  for (const [method, params] of cases) {
+    const runtime = new RuntimeStore(2);
+    runtime.markTurnAccepted(RING_THREAD, RING_TURN);
+    appendRingFact(runtime, 0);
+    for (let index = 0; index < 12; index++) runtime.recordNotification(method, params);
+    const observed = runtime.observe(RING_THREAD, 0, 100)!;
+    assert.deepEqual(observed.events.map((entry) => entry.cursor), [1, 13], method);
+    assert.equal(observed.stream_lost, true, method);
+    assert.equal(observed.facts_lost, false, method);
+    assert.equal(observed.events[1]?.method, method);
+    assert.deepEqual(observed.events[1]?.data, params);
+    assert.equal(JSON.stringify(observed.events).includes('"streamDelta"'), false);
+  }
+  for (const [method, params] of cases.slice(-2)) {
+    const runtime = new RuntimeStore(2);
+    runtime.markTurnAccepted(RING_THREAD, RING_TURN);
+    runtime.recordNotification(method, { ...params, capReached: true });
+    for (let index = 0; index < 12; index++) runtime.recordNotification(method, params);
+    const observed = runtime.observe(RING_THREAD, 0, 100)!;
+    assert.deepEqual(observed.events.map((entry) => entry.cursor), [1, 13], `${method} cap flag is a fact`);
+    assert.equal(observed.facts_lost, false);
+    assert.equal((observed.events[0]?.data as Record<string, unknown>).capReached, true);
+  }
+  for (const capacity of [0, 1, 1.5]) assert.throws(() => new RuntimeStore(capacity), /at least 2/);
+});
+
+test("sparse raw pagination preserves internal records and reports loss over the unread suffix", () => {
+  const runtime = new RuntimeStore(4);
+  for (const [index, kind] of [..."FDFDDFDD"].entries()) {
+    if (kind === "F") appendRingFact(runtime, index);
+    else appendRingDelta(runtime, index);
+  }
+  assert.deepEqual(retainedCursors(runtime), [1, 3, 6, 8]);
+  for (let start = 0; start <= 8; start += 1) {
+    for (const limit of [1, 2, 3, 4]) {
+      let cursor = start;
+      const seen: number[] = [];
+      for (let page = 0; page < 5; page += 1) {
+        const observed = runtime.observe(RING_THREAD, cursor, limit)!;
+        assert.equal(observed.cursor_floor, 0);
+        assert.equal(observed.stream_lost, cursor < 7);
+        assert.equal(observed.facts_lost, false);
+        assert.equal(observed.cursor_lost, observed.stream_lost);
+        assert.deepEqual(observed.events.map((event) => event.cursor), [1, 3, 6, 8].filter((value) => value > cursor).slice(0, limit));
+        seen.push(...observed.events.map((event) => event.cursor));
+        if (observed.events.length > 0) assert.equal(observed.next_cursor, observed.events.at(-1)?.cursor);
+        if (!observed.has_more) break;
+        assert.ok(observed.next_cursor > cursor, "a sparse page must make progress");
+        cursor = observed.next_cursor;
+        assert.ok(page < 4, "sparse pagination must terminate");
+      }
+      assert.deepEqual(seen, [1, 3, 6, 8].filter((value) => value > start));
+    }
+  }
+  appendRingFact(runtime, 9);
+  assert.deepEqual(retainedCursors(runtime), [3, 6, 8, 9]);
+  assert.equal(runtime.observe(RING_THREAD, 0, 1)?.facts_lost, true);
+  assert.equal(runtime.observe(RING_THREAD, 1, 1)?.facts_lost, false);
+  assert.equal(runtime.observe(RING_THREAD, 1, 1)?.stream_lost, true);
+  assert.equal(runtime.observe(RING_THREAD, 7, 1)?.cursor_lost, false);
+});
+
+test("small actual runtime rings satisfy retention and cursor properties for every short D/F sequence", () => {
+  const length = 7;
+  for (let capacity = 2; capacity <= 5; capacity += 1) {
+    for (let bits = 0; bits < 2 ** length; bits += 1) {
+      const runtime = new RuntimeStore(capacity);
+      const facts: number[] = [];
+      const deltas: number[] = [];
+      for (let index = 0; index < length; index += 1) {
+        if ((bits & (1 << index)) === 0) {
+          appendRingFact(runtime, index);
+          facts.push(index + 1);
+        } else {
+          appendRingDelta(runtime, index);
+          deltas.push(index + 1);
+        }
+        assert.equal(runtime.currentCursor(RING_THREAD), index + 1);
+        const retainedFacts = facts.slice(-(capacity - 1));
+        const retainedDeltas = deltas.slice(-(capacity - retainedFacts.length));
+        const expected = [...retainedFacts, ...retainedDeltas].sort((a, b) => a - b);
+        assert.deepEqual(retainedCursors(runtime), expected, `R=${capacity}, bits=${bits}, prefix=${index + 1}`);
+        assert.ok(expected.length <= capacity);
+      }
+      const retained = retainedCursors(runtime);
+      const lastDroppedD = deltas.filter((cursor) => !retained.includes(cursor)).at(-1) ?? 0;
+      const lastDroppedF = facts.filter((cursor) => !retained.includes(cursor)).at(-1) ?? 0;
+      for (let start = 0; start <= length; start += 1) {
+        for (let limit = 1; limit <= capacity; limit += 1) {
+          let cursor = start;
+          const seen: number[] = [];
+          for (let page = 0; page <= capacity; page += 1) {
+            const observed = runtime.observe(RING_THREAD, cursor, limit)!;
+            assert.equal(observed.stream_lost, lastDroppedD > cursor);
+            assert.equal(observed.facts_lost, lastDroppedF > cursor);
+            assert.equal(observed.cursor_lost, lastDroppedD > cursor || lastDroppedF > cursor);
+            seen.push(...observed.events.map((event) => event.cursor));
+            if (!observed.has_more) break;
+            assert.ok(observed.next_cursor > cursor);
+            cursor = observed.next_cursor;
+            assert.ok(page < capacity, "actual runtime pagination must terminate");
+          }
+          assert.deepEqual(seen, retained.filter((value) => value > start));
+        }
+      }
+      assert.deepEqual(retainedCursors(runtime), retained, "observers must not mutate retention");
+    }
+  }
+});
+
+test("pending request remains actionable after its original fact is evicted", () => {
+  const runtime = new RuntimeStore(3);
+  runtime.markTurnAccepted(RING_THREAD, RING_TURN);
+  runtime.recordServerRequest("approval-retained-state", "item/fileChange/requestApproval", {
+    threadId: RING_THREAD, turnId: RING_TURN, itemId: "file-change",
+  });
+  appendRingDelta(runtime, 2);
+  appendRingFact(runtime, 3);
+  appendRingFact(runtime, 4);
+  const observed = runtime.observe(RING_THREAD, 0, 10)!;
+  assert.equal(observed.facts_lost, true);
+  assert.equal(observed.events.some((event) => event.method === "item/fileChange/requestApproval"), false);
+  assert.equal(observed.pending_requests.length, 1);
+  const pending = runtime.claimPending("approval-retained-state", {
+    threadId: RING_THREAD, turnId: RING_TURN, method: "item/fileChange/requestApproval",
+  });
+  assert.equal(pending.rawId, "approval-retained-state");
+  runtime.completePending(pending);
+  assert.deepEqual(runtime.pendingForThread(RING_THREAD), []);
+  assert.throws(() => runtime.claimPending("approval-retained-state", {
+    threadId: RING_THREAD, turnId: RING_TURN, method: "item/fileChange/requestApproval",
+  }), /No pending/);
+});
+
 test("sanitizer redacts obvious secrets and bounds strings", () => {
   const result = sanitizeForTransport(
     {
@@ -107,7 +345,10 @@ test("runtime ring uses monotonic cursors, scopes pending raw ids, and captures 
   });
   const observed = runtime.observe("thread-1", 0, 10)!;
   assert.equal(observed.cursor_lost, true);
-  assert.equal(observed.events.length, 2);
+  assert.equal(observed.facts_lost, true);
+  assert.equal(observed.stream_lost, false);
+  assert.equal(observed.events.length, 1);
+  assert.equal(observed.events[0]?.method, "turn/completed");
   assert.equal(observed.terminal?.final_result, "DONE");
   assert.equal(observed.runtime_status, "completed");
 });
@@ -524,7 +765,7 @@ test("observe waits preserve full snapshots on native and revision-only changes"
 });
 
 test("observe cursor recovery and buffered pagination retain full snapshots", async () => {
-  const runtime = new RuntimeStore(2);
+  const runtime = new RuntimeStore(3);
   runtime.markTurnAccepted("thread-cursors", "turn-cursors");
   for (let index = 0; index < 3; index += 1) {
     runtime.recordNotification("item/started", {
@@ -680,25 +921,30 @@ test("completed, pending, inactive, and unavailable observe states do not wait",
 test("observe wait schema and validation preserve bounded optional semantics", async () => {
   const observeTool = TOOL_DEFINITIONS.find((tool) => tool.name === "codex_observe");
   const properties = (observeTool?.inputSchema.properties ?? {}) as Record<string, unknown>;
-  assert.deepEqual(properties.wait_ms, {
+  const { description: waitDescription, ...waitSchema } = properties.wait_ms as Record<string, unknown>;
+  assert.deepEqual(waitSchema, {
     type: "integer",
     minimum: 0,
     maximum: 120_000,
     default: 0,
-    description:
-      "Optional fixed per-call wait for a supervision wake or deadline in compact view; raw retains its existing event wait. 0 drains currently available events immediately. This is not stall detection.",
   });
+  assert.match(String(waitDescription), /facts loss/);
+  assert.match(String(waitDescription), /stream loss alone does not wake compact early/);
+  assert.match(String(waitDescription), /not stall detection/);
   assert.match(observeTool?.description ?? "", /Optional wait_ms performs one bounded event-driven wait/);
   assert.match(observeTool?.description ?? "", /fixed per-call deadline/);
   assert.match(observeTool?.description ?? "", /absence of new command activity alone is not evidence of a stall/);
   assert.match(observeTool?.description ?? "", /repeated bounded-wait observe calls until terminal.*one snapshot is inProgress/);
   assert.match(observeTool?.description ?? "", /After every wake or deadline return, inspect the newly available events\/state.*before starting the next bounded wait/);
-  assert.deepEqual(properties.view, {
+  const { description: viewDescription, ...viewSchema } = properties.view as Record<string, unknown>;
+  assert.deepEqual(viewSchema, {
     type: "string",
     enum: ["compact", "raw"],
     default: "compact",
-    description: "Compact facts by default; raw returns the existing sanitized native event envelope. Raw retains native pagination and its existing wait behavior.",
   });
+  assert.match(String(viewDescription), /retained individual sanitized event/);
+  assert.match(String(viewDescription), /original runtime cursors.*internal gaps/);
+  assert.match(String(viewDescription), /next_cursor/);
 
   const runtime = new RuntimeStore();
   runtime.ensureThread("thread-validation");

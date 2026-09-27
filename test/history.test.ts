@@ -207,6 +207,10 @@ test("runtime-missing observe returns metadata placeholders in compact/raw/wait 
     assert.equal(observed.runtime_available, false);
     assert.equal(observed.terminal, null);
     assert.equal(observed.active_turn_id, null);
+    for (const field of ["stream_lost", "facts_lost"]) {
+      assert.equal(observed[field], false);
+      assert.ok((observed.unavailable_live_fields as string[]).includes(field));
+    }
     assert.deepEqual((observed.stored_thread as Record<string, unknown>).turns, []);
     assert.equal(observed.source, "codex_app_server_thread_read_metadata");
     assert.match(observed.note as string, /unknown.*codex_history/);

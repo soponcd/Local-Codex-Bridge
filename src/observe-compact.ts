@@ -17,6 +17,7 @@ export interface CompactFinalIdentity {
   itemCursor: number | null;
   terminalCursor: number | null;
   turnId: string | null;
+  itemEvicted?: boolean;
 }
 
 function record(value: unknown): Record<string, unknown> | null {
@@ -379,7 +380,7 @@ export function routeCompactEvent(event: RuntimeEvent, scope: CompactScope = {})
 }
 
 export function hasCompactWake(observation: RuntimeObservation): boolean {
-  return observation.events.some((event) => routeCompactEvent(event).wake);
+  return observation.facts_lost || observation.events.some((event) => routeCompactEvent(event).wake);
 }
 
 export class CompactAccumulator {
@@ -425,16 +426,17 @@ export class CompactAccumulator {
     return true;
   }
 
-  result(snapshot: RuntimeObservation, final: CompactFinalIdentity | null, hasMore: boolean, cursorLost: boolean, cursorFloor: number): Record<string, unknown> {
+  result(snapshot: RuntimeObservation, final: CompactFinalIdentity | null, hasMore: boolean, streamLost: boolean, factsLost: boolean, cursorFloor: number): Record<string, unknown> {
     const terminal = snapshot.terminal;
     const terminalFact: Record<string, unknown> | null = terminal ? { turn_id: terminal.turn_id, status: terminal.status } : null;
     if (terminal && terminalFact && terminal.error != null) assignClipped(terminalFact, "error", JSON.stringify(terminal.error), 2_000);
-    // A retained final item is delivered by its event cursor. If it has left the
-    // ring, the terminal completion cursor anchors one bounded fallback delivery.
+    // Retained finals are delivered at their own cursor. An evicted final uses
+    // that same cursor as its fallback boundary; a final without an item cursor
+    // uses terminal completion. Neither loss nor floor may jump that boundary.
     if (terminal && terminalFact && terminal.final_result != null && final?.terminalCursor != null &&
         (final.itemCursor == null
           ? this.requestedCursor < final.terminalCursor && this.nextCursor >= final.terminalCursor
-          : final.itemCursor <= cursorFloor && this.requestedCursor < final.itemCursor)) {
+          : final.itemEvicted === true && this.requestedCursor < final.itemCursor && this.nextCursor >= final.itemCursor)) {
       assignClipped(terminalFact, "final_result", terminal.final_result);
     }
     return {
@@ -444,7 +446,9 @@ export class CompactAccumulator {
       next_cursor: this.nextCursor,
       ...(this.facts.length ? { events: this.facts } : {}),
       ...(Object.keys(this.activity).length ? { activity: this.activity } : {}),
-      ...(cursorLost ? { cursor_lost: true, cursor_floor: cursorFloor } : {}),
+      ...(streamLost || factsLost ? { cursor_lost: true, cursor_floor: cursorFloor } : {}),
+      ...(streamLost ? { stream_lost: true } : {}),
+      ...(factsLost ? { facts_lost: true } : {}),
       ...(hasMore || this.continuation ? { has_more: true } : {}),
       ...(this.continuation ? { continuation: this.continuation } : {}),
       ...(snapshot.pending_requests.length ? { pending_requests: snapshot.pending_requests } : {}),
@@ -456,8 +460,8 @@ export class CompactAccumulator {
 // One-page projection remains useful for deterministic fixtures. Public compact
 // observe uses RuntimeStore's multi-chunk drain loop below this boundary.
 export function projectCompact(observation: RuntimeObservation, requestedCursor: number | undefined, scope: CompactScope = {}, final: CompactFinalIdentity | null = null): Record<string, unknown> {
-  const start = observation.cursor_lost ? observation.cursor_floor : requestedCursor ?? observation.cursor_floor;
+  const start = Math.min(requestedCursor ?? observation.cursor_floor, observation.current_cursor);
   const accumulator = new CompactAccumulator(requestedCursor ?? observation.cursor_floor, 100, scope, start);
   for (const event of observation.events) if (!accumulator.consume(event)) break;
-  return accumulator.result(observation, final, observation.has_more || accumulator.scanned < observation.events.length, observation.cursor_lost, observation.cursor_floor);
+  return accumulator.result(observation, final, observation.has_more || accumulator.scanned < observation.events.length, observation.stream_lost, observation.facts_lost, observation.cursor_floor);
 }
