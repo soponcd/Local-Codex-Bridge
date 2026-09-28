@@ -2,6 +2,7 @@ import { readFileSync, writeFileSync, mkdirSync, mkdtempSync, cpSync, existsSync
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { checkHashes, hashFile, nativeSwap, targetedRestart, validateChanged, externalTrustPath } from './deploy-fix.mjs';
 import { safePackagePath } from './verify-package.mjs';
 import { verifyLive } from './verify-fix-live.mjs';
@@ -9,8 +10,9 @@ import { remoteModels } from './remote-model-probe.mjs';
 export async function rollback(config, ops) {
   const source = join(config.backup, 'files');
   const baselineFile = join(config.backup, 'baseline.json');
-  if (!/^[a-f0-9]{64}$/.test(config.backup_baseline_sha256 ?? '') || hashFile(baselineFile) !== config.backup_baseline_sha256) throw new Error('Frozen backup baseline digest mismatch');
-  const old = JSON.parse(readFileSync(baselineFile));
+  const baselineBytes = readFileSync(baselineFile);
+  if (!/^[a-f0-9]{64}$/.test(config.backup_baseline_sha256 ?? '') || createHash('sha256').update(baselineBytes).digest('hex') !== config.backup_baseline_sha256) throw new Error('Frozen backup baseline digest mismatch');
+  const old = JSON.parse(baselineBytes);
   const payload = Object.fromEntries(config.changed.map(name => [name, old[name] ?? '0'.repeat(64)]));
   validateChanged({ production: config.production, candidate: source, baseline: config.expected_current, payload, changed: config.changed });
   checkHashes(config.production, config.expected_current, 'current rollback baseline');
@@ -45,8 +47,10 @@ async function main() {
   const { verifyAnchoredPackage } = await import(pathToFileURL(externalTrustPath(packageRoot, process.env.LCB_TRUST_VERIFIER)).href);
   verifyAnchoredPackage(packageRoot);
   const contract = process.argv[2], anchor = process.env.LCB_ROLLBACK_CONTRACT_SHA256;
-  if (!contract || !/^[a-f0-9]{64}$/.test(anchor ?? '') || hashFile(contract) !== anchor) throw new Error('Frozen external rollback contract required');
-  const config = JSON.parse(readFileSync(contract));
+  if (!contract || !/^[a-f0-9]{64}$/.test(anchor ?? '')) throw new Error('Frozen external rollback contract required');
+  const contractBytes = readFileSync(contract);
+  if (createHash('sha256').update(contractBytes).digest('hex') !== anchor) throw new Error('Frozen external rollback contract required');
+  const config = JSON.parse(contractBytes);
   const run = (cmd, args) => { const r = spawnSync(cmd, args, { encoding: 'utf8', timeout: 10000 }); if (r.status !== 0) throw new Error('Target command failed'); return r; };
   const instance = () => { const r = run('/bin/launchctl', ['print', config.agent]); const pid = Number(r.stdout.match(/^\s*pid = (\d+)$/m)?.[1]); if (!pid) throw new Error('LaunchAgent running identity missing'); return pid; };
   let previous;
