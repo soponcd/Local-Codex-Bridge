@@ -16,3 +16,4 @@ releases/**/*.tar.gz
 releases/trust/
 .compat-verification/
 .validation/
+deployment-backups/
