@@ -1,4 +1,4 @@
-import { AppServerManager } from "./app-server.js";
+import { AppServerManager, diagnoseCodexVersion } from "./app-server.js";
 import {
   CHECKPOINT_TEXT_LIMIT,
   CHECKPOINT_THREAD_ID_LIMIT,
@@ -89,7 +89,13 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
         include_turns: {
           type: "boolean",
           default: false,
-          description: "Include persisted turns when reading one thread.",
+          description: "Full turns are unbounded and disabled. When true, latest_messages (1..100) is required and history is explicitly degraded to metadata plus recent paginated messages.",
+        },
+        latest_messages: {
+          type: "integer",
+          minimum: 1,
+          maximum: 100,
+          description: "With thread_id, read up to this many newest user/agent messages through native items pagination (at most 20 pages of 100 items). Returned newest first; content is transport bounded.",
         },
         cwd: {
           type: "string",
@@ -742,6 +748,25 @@ export class ControlSurface {
     this.checkpoints = checkpoints;
   }
 
+  async #readHistory(threadId: string, includeTurns: boolean): Promise<{ result: unknown; degradation?: Record<string, unknown> }> {
+    // thread/read has no limit or cursor. Read metadata only; bounded messages use items/list.
+    const result = await this.appServer.request("thread/read", { threadId, includeTurns: false });
+    const thread = asObject(responseRecord(result, "thread/read").thread, "thread/read thread");
+    if (thread.id !== threadId) throw new Error("thread/read returned mismatched thread identity");
+    if (!includeTurns) return { result };
+    const binary = this.appServer.binaryDiagnostics;
+    return { result, degradation: {
+      history_available: false,
+      compatibility: {
+        classification: "unbounded_history_disabled",
+        ...binary,
+        thread_cli_version: typeof thread.cliVersion === "string" ? thread.cliVersion : null,
+        version_diagnostic: diagnoseCodexVersion(binary.cli_version, typeof thread.cliVersion === "string" ? thread.cliVersion : ""),
+        remediation: "Full history is unavailable: thread/read has no limit/cursor. Use codex_threads with thread_id and latest_messages (1..100) for bounded native items pagination, or the Desktop UI. No full turns or terminal are reconstructed.",
+      },
+    } };
+  }
+
   #cwd(args: Record<string, unknown>): string | undefined {
     const input = optionalString(args, "cwd", 1_000);
     return input ? this.platformPolicy.validateCwd(input) : undefined;
@@ -860,19 +885,22 @@ export class ControlSurface {
   }
 
   async #threads(args: Record<string, unknown>): Promise<unknown> {
-    onlyKeys(args, ["thread_id", "include_turns", "cwd", "search_term", "cursor", "limit"]);
+    onlyKeys(args, ["thread_id", "include_turns", "latest_messages", "cwd", "search_term", "cursor", "limit"]);
     const threadId = optionalString(args, "thread_id", 200);
     if (threadId) {
       if (args.cwd !== undefined || args.search_term !== undefined || args.cursor !== undefined || args.limit !== undefined) {
         throw new Error("thread_id cannot be combined with list/search fields");
       }
       const includeTurns = optionalBoolean(args, "include_turns") ?? false;
-      const result = await this.appServer.request("thread/read", {
-        threadId,
-        includeTurns,
-      });
-      return sanitizeForTransport({ source: "codex_app_server", mode: "read", ...responseRecord(result, "thread/read") });
+      const latestMessages = optionalInteger(args, "latest_messages", 1, 100);
+      if (includeTurns && latestMessages === undefined) {
+        throw new Error("Unbounded include_turns is disabled; provide latest_messages (1..100) for explicitly degraded bounded history");
+      }
+      const { result, degradation } = await this.#readHistory(threadId, includeTurns);
+      const recent = latestMessages === undefined ? {} : { recent_messages: await this.#latestMessages(threadId, latestMessages) };
+      return sanitizeForTransport({ source: "codex_app_server", mode: "read", ...responseRecord(result, "thread/read"), ...degradation, ...recent }, { maxArrayItems: 100 });
     }
+    if (args.latest_messages !== undefined) throw new Error("latest_messages is valid only with thread_id");
     if (args.include_turns !== undefined) {
       throw new Error("include_turns is valid only with thread_id");
     }
@@ -905,6 +933,47 @@ export class ControlSurface {
         totalCharBudget: 12_000,
       })),
     };
+  }
+
+  async #latestMessages(threadId: string, limit: number): Promise<unknown> {
+    const messages: Record<string, unknown>[] = [];
+    const cursors = new Set<string>();
+    const itemIds = new Set<string>();
+    let cursor: string | undefined;
+    let exhausted = false;
+    let pages = 0;
+    try {
+      for (; pages < 20;) {
+        const page = responseRecord(await this.appServer.request("thread/items/list", {
+          threadId, limit: 100, sortDirection: "desc", ...(cursor ? { cursor } : {}),
+        }), "thread/items/list");
+        pages += 1;
+        // Native entries omit threadId: the validated metadata and exact request scope bind them.
+        if (page.threadId !== undefined && page.threadId !== threadId) throw new Error("thread/items/list returned mismatched thread identity");
+        if (!Array.isArray(page.data) || page.data.length > 100) throw new Error("thread/items/list returned invalid data page");
+        if (page.nextCursor !== null && (typeof page.nextCursor !== "string" || !page.nextCursor || page.nextCursor.length > 10_000)) throw new Error("thread/items/list returned invalid cursor");
+        for (const raw of page.data) {
+          const entry = asObject(raw, "thread/items/list entry");
+          const item = asObject(entry.item, "thread/items/list item");
+          if (entry.threadId !== undefined && entry.threadId !== threadId) throw new Error("thread/items/list returned mismatched thread identity");
+          if (typeof entry.turnId !== "string" || !entry.turnId || typeof item.id !== "string" || !item.id || typeof item.type !== "string") throw new Error("thread/items/list returned invalid item identity");
+          if (itemIds.has(item.id)) throw new Error("thread/items/list returned duplicate item identity");
+          itemIds.add(item.id);
+          if (["userMessage", "agentMessage"].includes(item.type) && messages.length < limit) messages.push(entry);
+        }
+        exhausted = page.nextCursor === null;
+        if (messages.length === limit || exhausted) break;
+        cursor = page.nextCursor as string;
+        if (cursors.has(cursor)) throw new Error("thread/items/list returned cursor cycle");
+        cursors.add(cursor);
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const unknown = message.match(/unknown variant [`'"]([A-Za-z][A-Za-z0-9_]{0,100})[`'"]/);
+      if (!unknown && !/method not found|unknown method|unsupported method/i.test(message)) throw error;
+      return { source: "codex_app_server_thread_items_list", thread_id: threadId, order: "newest_first", available: false, complete: false, messages: [], compatibility: { classification: unknown ? "stored_item_incompatible" : "native_paging_unavailable", ...(unknown ? { unknown_item: unknown[1] } : {}) } };
+    }
+    return { source: "codex_app_server_thread_items_list", thread_id: threadId, order: "newest_first", available: true, complete: messages.length === limit || exhausted, scan_limit_reached: messages.length < limit && !exhausted, requested: limit, pages_read: pages, messages };
   }
 
   async #models(args: Record<string, unknown>): Promise<unknown> {
@@ -1082,10 +1151,7 @@ export class ControlSurface {
       return runtime;
     }
     throwIfAborted(signal);
-    const result = await this.appServer.request("thread/read", {
-      threadId,
-      includeTurns: true,
-    });
+    const { result, degradation } = await this.#readHistory(threadId, true);
     throwIfAborted(signal);
     return sanitizeForTransport({
       runtime_available: false,
@@ -1100,9 +1166,10 @@ export class ControlSurface {
       cursor_lost: false,
       has_more: false,
       pending_requests: [],
-      terminal: storedTerminal(result),
+      terminal: degradation ? null : storedTerminal(result),
       stored_thread: responseRecord(result, "thread/read").thread,
       source: "codex_app_server_thread_read",
+      ...degradation,
     });
   }
 
