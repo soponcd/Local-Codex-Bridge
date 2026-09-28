@@ -123,6 +123,51 @@ test("metadata/list remain distinct and native history pages preserve cursors, o
   assert.equal(manager.runtime.hasThread("thread-1"), false);
 });
 
+test("compatibility canary: interrupted turns retain errors in observe and lossless history", async () => {
+  // Lock the existing status-first behavior without changing the installed schema baseline.
+  const error = {
+    message: "Turn interrupted after repeated approval denials",
+    codexErrorInfo: "tooManyDenials",
+    additionalDetails: null,
+  };
+  const finalText = "Stopped after approval was denied.";
+  const turn = {
+    id: "turn-interrupted", status: "interrupted", error,
+    items: [{ id: "final-message", type: "agentMessage", phase: "final_answer", text: finalText }],
+  };
+  const runtime = new RuntimeStore();
+  runtime.markTurnAccepted("thread-1", turn.id);
+  runtime.recordNotification("turn/completed", { threadId: "thread-1", turn });
+  const live = new ControlSurface({ runtime } as unknown as AppServerManager);
+  for (const view of ["raw", "compact"] as const) {
+    const observed = await live.call("codex_observe", { thread_id: "thread-1", cursor: 0, view }) as Record<string, unknown>;
+    const terminal = observed.terminal as Record<string, unknown>;
+    assert.equal(observed.runtime_status, "interrupted", view);
+    assert.equal(observed.active_turn_id, null, view);
+    assert.equal(terminal.status, "interrupted", view);
+    assert.equal(terminal.turn_id, turn.id, view);
+    assert.equal(terminal.final_result, finalText, view);
+    assert.deepEqual(view === "compact" ? JSON.parse(terminal.error as string) : terminal.error, error, view);
+  }
+
+  for (const historyMode of ["paginated", "legacy"] as const) {
+    const itemsView = historyMode === "paginated" ? "notLoaded" : "full";
+    const nativePage = page([{ ...turn, itemsView, items: historyMode === "paginated" ? [] : turn.items }]);
+    const manager = new StubAppServer((method, params) => {
+      assert.equal(method, "thread/turns/list");
+      assert.equal(params.itemsView, itemsView);
+      return nativePage;
+    });
+    manager.historyMode = historyMode;
+    const history = await callHistory(new ControlSurface(manager), { kind: "turns", limit: 1 }) as Record<string, unknown>;
+    assert.equal(history.history_mode, historyMode);
+    assert.deepEqual(history.data, nativePage.data, historyMode);
+    assert.equal(history.nextCursor, nativePage.nextCursor);
+    assert.equal(history.backwardsCursor, nativePage.backwardsCursor);
+    assert.equal(manager.runtime.hasThread("thread-1"), false, "persisted history must not rebuild live state");
+  }
+});
+
 test("invalid upstream pages and upstream cursor errors never fall back to full read", async () => {
   const malformed = [null, {}, { data: null, nextCursor: null, backwardsCursor: null },
     { data: [], nextCursor: undefined, backwardsCursor: null },
