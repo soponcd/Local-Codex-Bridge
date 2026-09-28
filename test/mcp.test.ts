@@ -777,6 +777,70 @@ test("MCP accepts independent Tunnel initialize handshakes on one stdio child", 
   }
 });
 
+test("MCP repeated initialize preserves pending requests and their response scope", { timeout: 3_000 }, async () => {
+  const runtime = new RuntimeStore();
+  const threadId = "thread-initialize-pending";
+  const turnId = "turn-initialize-pending";
+  const method = "item/commandExecution/requestApproval";
+  const requestIds = [7, "7"] as const;
+  runtime.markTurnAccepted(threadId, turnId);
+  for (const requestId of requestIds) {
+    runtime.recordServerRequest(requestId, method, {
+      threadId, turnId, itemId: `command-${typeof requestId}`, command: "echo initialize",
+    });
+  }
+  const responses: Array<{ id: RpcId; result: unknown }> = [];
+  const control = new ControlSurface({
+    runtime,
+    async respond(id: RpcId, result: unknown): Promise<void> { responses.push({ id, result }); },
+  } as unknown as AppServerManager);
+  await withInMemoryMcp(control, async (request) => {
+    let id = 1;
+    const observe = async (view: "raw" | "compact"): Promise<Record<string, unknown>> =>
+      structuredToolPayload(await request(id++, "tools/call", {
+        name: "codex_observe", arguments: { thread_id: threadId, cursor: 0, view },
+      }));
+    const beforeRaw = await observe("raw");
+    const beforeCompact = await observe("compact");
+    assert.deepEqual((beforeRaw.pending_requests as Array<Record<string, unknown>>).map((pending) => pending.request_id), requestIds);
+    const initialized = await request(id++, "initialize", {
+      protocolVersion: "2025-06-18", capabilities: { sampling: {} },
+      clientInfo: { name: "tunnel-discovery", version: "2" },
+    });
+    assert.equal(initialized.error, undefined);
+    assert.equal((initialized.result as Record<string, unknown>).protocolVersion, "2025-06-18");
+    assert.deepEqual(await observe("raw"), beforeRaw);
+    assert.deepEqual(await observe("compact"), beforeCompact);
+    assert.deepEqual(responses, [], "initialize must not answer a pending request");
+
+    const respondArgs = { thread_id: threadId, turn_id: turnId, method, decision: "accept" };
+    const wrongScope = await request(id++, "tools/call", {
+      name: "codex_respond", arguments: { ...respondArgs, request_id: 7, turn_id: "wrong-turn" },
+    });
+    assert.equal((wrongScope.result as Record<string, unknown>).isError, true);
+    assert.match(toolPayload(wrongScope).error as string, /scope does not match turn_id/);
+    assert.deepEqual(responses, []);
+    assert.deepEqual(await observe("raw"), beforeRaw, "scope rejection must preserve the pending requests");
+
+    for (const [index, requestId] of requestIds.entries()) {
+      const responded = structuredToolPayload(await request(id++, "tools/call", {
+        name: "codex_respond", arguments: { ...respondArgs, request_id: requestId },
+      }));
+      assert.deepEqual(responded, { responded: true, request_id: requestId, thread_id: threadId, turn_id: turnId, method });
+      const pending = (await observe("raw")).pending_requests as Array<Record<string, unknown>>;
+      assert.deepEqual(pending.map((entry) => entry.request_id), requestIds.slice(index + 1));
+    }
+    assert.deepEqual(responses, requestIds.map((requestId) => ({ id: requestId, result: { decision: "accept" } })));
+    assert.equal(Object.hasOwn(await observe("compact"), "pending_requests"), false);
+    const duplicate = await request(id++, "tools/call", {
+      name: "codex_respond", arguments: { ...respondArgs, request_id: 7 },
+    });
+    assert.equal((duplicate.result as Record<string, unknown>).isError, true);
+    assert.match(toolPayload(duplicate).error as string, /No pending app-server request/);
+    assert.equal(responses.length, 2);
+  });
+});
+
 test("MCP rejects duplicate active typed request ids without disturbing distinct ids", async () => {
   const client = new TestClient();
   try {
@@ -804,7 +868,7 @@ test("MCP rejects duplicate active typed request ids without disturbing distinct
   }
 });
 
-test("MCP duplicate active typed id preserves cancellation suppression and safe reuse", async () => {
+test("MCP repeated initialize and duplicate active typed id preserve cancellation and safe reuse", async () => {
   const runtime = new RuntimeStore();
   const threadId = "thread-duplicate-cancellation";
   const turnId = "turn-duplicate-cancellation";
@@ -863,6 +927,22 @@ test("MCP duplicate active typed id preserves cancellation suppression and safe 
   const tick = async (): Promise<void> => {
     await new Promise<void>((resolve) => setImmediate(resolve));
   };
+  const reinitialize = async (id: number): Promise<void> => {
+    const before = runtime.observe(threadId, 0, 50);
+    send({
+      id, method: "initialize", params: {
+        protocolVersion: "2025-06-18", capabilities: { sampling: {} },
+        clientInfo: { name: "tunnel-discovery", version: "2" },
+      },
+    });
+    const response = await nextMessage();
+    assert.equal(response.id, id);
+    assert.equal(response.error, undefined);
+    assert.equal((response.result as Record<string, unknown>).protocolVersion, "2025-06-18");
+    await tick();
+    assert.deepEqual(runtime.observe(threadId, 0, 50), before);
+    assert.equal(messages.length, 0, "initialize must not settle the active observe");
+  };
   let server: McpStdioServer | undefined;
 
   Object.defineProperty(process, "stdin", { configurable: true, value: input });
@@ -887,6 +967,7 @@ test("MCP duplicate active typed id preserves cancellation suppression and safe 
     };
     send({ id: 17, method: "tools/call", params: observe });
     await new Promise<void>((resolve) => setTimeout(resolve, 25));
+    await reinitialize(2);
 
     // Keep the original request active while cancellation and the duplicate
     // arrive in the same input batch. The duplicate error must not consume
@@ -924,6 +1005,7 @@ test("MCP duplicate active typed id preserves cancellation suppression and safe 
     // the same typed id can be reused and its new waiter must still wake.
     send({ id: 17, method: "tools/call", params: observe });
     await tick();
+    await reinitialize(3);
     runtime.recordNotification("item/started", {
       threadId,
       turnId,

@@ -229,6 +229,8 @@ Bridge 不尝试推断当前 thread 正在使用哪个模型。
 
 默认 `view: "compact"` 跨保留事件 chunks 排掉 silent events，仅交付有界的 typed supervision facts 与实际扫描到的保留活动计数；`limit` 约束投影后的 facts。命中内部排水上限会明确返回 `continuation: "drainage_yield"`。`view: "raw"` 返回真实的 sanitized 单条保留事件，沿用进入 thread runtime 时的递增 cursor，不合并、不重新编号；内部 cursor 可以有缺口，因此不是完整 native stream。可用指定 runtime cursor 与 `wait_ms: 0` 重放仍在 ring 中的事件。
 
+当 `runtime_available: true` 时，`pending_requests` 表示本次读取时的全部待响应请求，不是增量补丁。compact 在集合为空时省略该字段；缺省表示当前无待响应请求，调用方应清除此前观察到的列表，不能理解为“未更新”。当 `runtime_available: false` 时，待响应状态未知，字段缺省或空数组都不能证明没有待响应请求。
+
 `stream_lost` 表示合法 allowlist 流式 delta 已被淘汰，`facts_lost` 表示其余事件已被淘汰；`cursor_lost` 总括两类缺失。loss 覆盖本次读取检查的未扫描 cursor 到当前 head 的范围，不限于本页返回记录之间。`cursor_floor` 仅表示最早保留记录之前的位置，不保证之后连续完整。两种 view 都必须用 `next_cursor` 续读；不能因 loss 跳到 floor，从而漏过仍保留的事件。真的没有新活动或 loss、待处理请求或终态时，截止返回仅含 `runtime_available`、`runtime_status`、`active_turn_id`、`next_cursor`、`no_change: true` 五字段；它不表示 stalled。
 
 一个典型流程是：
