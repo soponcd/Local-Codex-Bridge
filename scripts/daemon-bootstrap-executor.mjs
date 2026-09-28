@@ -22,7 +22,7 @@ for(const k of ['NODE_OPTIONS','OPENAI_API_KEY','LCB_VERIFY_OPENAI_API_KEY','CON
 const {gate,tunnelSnapshot,restartForRollback,verifyRollbackAttempt}=await import(pathToFileURL(path.join(repo,'scripts/bootstrap-method.mjs')));
 const production=c.scope.production, agent=c.scope.agent;
 const stageName = target => path.join(path.dirname(target),`.lcb-bootstrap-${invocation}-${path.basename(target)}.tmp`);
-let backup, invocation, manifestDigest, manifest, ledger=[], mutated=false, replaced=false, applyRestart=false, rollbackRestart=false;
+let backup, invocation, manifestDigest, manifest, ledger=[], mutated=false, replaced=false, wrapperReplacement, applyRestart=false, rollbackRestart=false;
 let verifyLive,verifyDaemon,daemonConfig,remoteModels;
 const ownedProofPids=new Set();
 const retainedScratch=new Map();
@@ -126,7 +126,8 @@ const mkdir = (dir,withLedger=false) => {
 const restoreGuard = () => {
   assert(sameMeta(meta(c.backup.root),c.backup.prestate),'backup root identity drift');
   const ownedDirectory=ledger.find(x=>x.path===backup && x.action==='backup_invocation');
-  assert(ownedDirectory && sameMeta(meta(backup),ownedDirectory),'backup invocation identity drift');
+  assert(ownedDirectory?.created_by_this_invocation===true && sameMeta(ownedDirectory,manifest.backup_invocation_directory_identity) && sameMeta(meta(backup),manifest.backup_invocation_directory_identity),'backup invocation identity drift');
+  assert(sameMeta(meta(path.join(backup,'owned-targets.jsonl')),manifest.ownership_ledger_identity),'backup ledger identity drift');
   assert(hash(fs.readFileSync(path.join(backup,'manifest.json')))===manifestDigest,'frozen manifest mismatch');
   assert(hash(fs.readFileSync(path.join(backup,'contract.json')))===contractHash,'frozen contract mismatch');
   const bytes=fs.readFileSync(path.join(backup,'original-wrapper.bin'));
@@ -138,7 +139,15 @@ const replace = (target,bytes,mode,expectedPrior) => {
   const staging=stageName(target); const st=exclusive(staging,bytes,parseInt(mode,8)); record({...st,action:'stage'});
   assert(st.sha256===hash(bytes)&&st.length===bytes.length&&st.mode===mode,'staging verify');
   if(expectedPrior)assert(sameOwned(identify(target),expectedPrior),'replacement target drift');else assert(absent(target),'absent target race');
-  fs.renameSync(staging,target);fsyncDir(path.dirname(target));
+  // Persist the recovery identity before rename; post-rename readback is not its authority.
+  const intent={action:'replacement_intent',destination:target,stage:st,expected_prior:expectedPrior??{path:target,state:'absent'}};
+  record(intent);
+  if(target===original.path && bytes.equals(Buffer.from(wrapper.proposed_bytes)))wrapperReplacement={...st,path:target};
+  assert(sameOwned(identify(staging),st),'replacement stage drift');
+  fs.renameSync(staging,target);
+  if(target===original.path)replaced=true;
+  ledger.push({invocation,created_by_this_invocation:true,...st,path:target,action:'replace_pending',staging});
+  fsyncDir(path.dirname(target));
   const installed=identify(target);assert(sameMeta({...st,path:target},installed)&&installed.sha256===st.sha256,'rename identity');record({...installed,action:'replace',staging});return installed;
 };
 const loadGates = async () => {
@@ -165,7 +174,7 @@ const prepare = async () => {
   exclusive(path.join(backup,'owned-targets.jsonl'),Buffer.alloc(0));exclusive(path.join(backup,'verification-attempts.jsonl'),Buffer.alloc(0));
   append('owned-targets.jsonl',{invocation,...backupRoot,action:'preserved_backup_root',created_by_this_invocation:false});record({...backupDir,action:'backup_invocation'});
   exclusive(path.join(backup,'contract.json'),contractBytes);exclusive(path.join(backup,'original-wrapper.bin'),fs.readFileSync(original.path));
-  manifest={schema:3,invocation_id:invocation,contract_sha256:contractHash,candidate7_frozen_anchor:c.release_anchor,refreshed_at:new Date().toISOString(),execution_git_head:head,backup_invocation_directory_identity:backupDir,uid:502,gid:20,
+  manifest={schema:3,invocation_id:invocation,contract_sha256:contractHash,candidate7_frozen_anchor:c.release_anchor,refreshed_at:new Date().toISOString(),execution_git_head:head,backup_invocation_directory_identity:backupDir,ownership_ledger_identity:meta(path.join(backup,'owned-targets.jsonl')),uid:502,gid:20,
     original_wrapper_bytes_sha256_length_mode_uid_gid_dev_ino:identify(original.path),backup_wrapper_sha256_and_length:identify(path.join(backup,'original-wrapper.bin')),
     all_target_prestates_including_absent_parent_run:c.targets.map(t=>t.prestate),backup_root_prestate_and_created_by_this_invocation:{prestate:c.backup.prestate,current:backupRoot,created_by_this_invocation:false},
     preserved_parent_directory_identity:c.live_prestate.parent_directories,production_dist_hashes:c.live_prestate.production_dist_sha256,production_git_head_index_sha256:{head:c.live_prestate.production_git_head,index_sha256:c.live_prestate.production_git_index_sha256},
@@ -211,7 +220,7 @@ const cleanupOwned = () => {
 };
 const rollback = async (before) => {
   restoreGuard();const result={attempted:true};
-  if(replaced){const own=ledger.filter(x=>x.path===original.path&&x.action==='replace').at(-1);assert(own&&sameOwned(identify(original.path),own),'rollback wrapper ownership');replace(original.path,fs.readFileSync(path.join(backup,'original-wrapper.bin')),original.mode,own);result.wrapper_restored=true;}
+  if(replaced){const own=wrapperReplacement;assert(own&&sameOwned(identify(original.path),own),'rollback wrapper ownership');replace(original.path,fs.readFileSync(path.join(backup,'original-wrapper.bin')),original.mode,own);result.wrapper_restored=true;}
   else checkFile(original.path,original.sha256,385,'0700');
   Object.assign(result,await restartForRollback({applyRestart,readTunnel:()=>tunnelOnly(),restoreGuard:()=>{restoreGuard();baseline('old');},kick:()=>{rollbackRestart=true;return kick();}}));
   if(applyRestart)assert(result.restart.status===0,'rollback restart uncertain');
@@ -227,20 +236,25 @@ const rollback = async (before) => {
 };
 const execute = async () => {
   backup=backupPath;manifestDigest=manifestHash;assert(/^\/[\s\S]+$/.test(backup??'')&&/^[a-f0-9]{64}$/.test(manifestDigest??''),'external invocation args');
-  ancestors(backup);manifest=JSON.parse(fs.readFileSync(path.join(backup,'manifest.json')));invocation=manifest.invocation_id;
-  assert(backup===path.join(c.backup.root,invocation) && manifest.execution_git_head===head,'invocation path/head');assert(hash(fs.readFileSync(selfPath))===manifest.executor.sha256,'executor drift');restoreGuard();
-  ledger=fs.readFileSync(path.join(backup,'owned-targets.jsonl'),'utf8').trim().split('\n').filter(Boolean).map(JSON.parse);
-  assert(ledger.every(x=>x.invocation===invocation),'ledger identity');await frozenSources();await loadGates();
-  let receipt={schema:2,task_id:'LCB-BOOTSTRAP-19',status:'blocked',contract_sha256:contractHash,manifest_sha256:manifestDigest,invocation,backup,production_modified:false,candidate_deployed:false,execution_record:{effective_model:'gpt-6-sol',requested_effort:'high',requested_role:'difficult',attempts:1,usage:'unknown'}};
+  ancestors(backup);const manifestBytes=fs.readFileSync(path.join(backup,'manifest.json'));
+  assert(hash(manifestBytes)===manifestDigest,'external frozen manifest mismatch');
+  manifest=JSON.parse(manifestBytes);assert(canonical(manifest).equals(manifestBytes),'manifest canonical drift');invocation=manifest.invocation_id;
+  assert(/^bootstrap-\d{8}T\d{9}Z-[a-f0-9]{32}$/.test(invocation) && backup===path.join(c.backup.root,invocation) && manifest.execution_git_head===head && manifest.contract_sha256===contractHash,'invocation path/head/contract');
+  assert(sameMeta(meta(c.backup.root),c.backup.prestate) && sameMeta(meta(backup),manifest.backup_invocation_directory_identity),'frozen backup invocation identity drift');
+  const ledgerPath=path.join(backup,'owned-targets.jsonl');assert(sameMeta(meta(ledgerPath),manifest.ownership_ledger_identity) && manifest.ownership_ledger_identity.path===ledgerPath && manifest.ownership_ledger_identity.type==='file' && manifest.ownership_ledger_identity.mode==='0600' && manifest.ownership_ledger_identity.uid===502 && manifest.ownership_ledger_identity.gid===20,'frozen backup ledger identity drift');
+  ledger=fs.readFileSync(ledgerPath,'utf8').trim().split('\n').filter(Boolean).map(JSON.parse);
+  assert(ledger.length===2 && ledger.every(x=>x.invocation===invocation) && ledger[0].action==='preserved_backup_root' && ledger[0].created_by_this_invocation===false && sameMeta(ledger[0],c.backup.prestate) && ledger[1].action==='backup_invocation' && ledger[1].created_by_this_invocation===true && sameMeta(ledger[1],manifest.backup_invocation_directory_identity),'illegal prepared ownership ledger');
+  assert(hash(fs.readFileSync(selfPath))===manifest.executor.sha256,'executor drift');restoreGuard();await frozenSources();await loadGates();
+  let receipt={schema:2,task_id:'LCB-BOOTSTRAP-21',status:'blocked',contract_sha256:contractHash,manifest_sha256:manifestDigest,invocation,backup,production_modified:false,candidate_deployed:false,execution_record:{effective_model:'unknown',requested_model:'gpt-6-sol',requested_effort:'high',requested_role:'difficult',attempts:1,usage:'unknown'}};
   let before;
   try{
     for(const t of c.targets)if(t.prestate.state==='absent')assert(absent(t.target),'apply absence drift');baseline('old');await frozenSources();before=native('old');
     const live=await verifyLive({wrapper:true,deadline:Date.now()+90000});assert(live.ok&&live.control_plane.pid===before.tunnel.pid,'apply original preflight');assert(canonical(native('old')).equals(canonical(before)),'apply old identity');receipt.preflight={ok:true,health:live,identity:before};restoreGuard();baseline('old');
     for(const t of c.targets)if(t.prestate.state==='absent')assert(absent(t.target),'first write absence');
-    mutated=true;mkdir('/Users/ZGH/.local/run',true);mkdir('/Users/ZGH/.local/run/lcb-attest',true);mkdir('/Users/ZGH/.local/share/lcb-daemon-attestation',true);
+    mutated=true;for(const t of c.targets.filter(t=>t.type==='directory'))mkdir(t.target,true);
     for(const t of c.targets.filter(t=>t.source))replace(t.target,fs.readFileSync(t.source),t.mode);
     baseline('old');await frozenSources();restoreGuard();const currentOriginal=identify(original.path);assert(sameMeta(currentOriginal,original),'wrapper original inode');
-    replace(wrapper.target,Buffer.from(wrapper.proposed_bytes),wrapper.mode,currentOriginal);replaced=true;
+    replace(wrapper.target,Buffer.from(wrapper.proposed_bytes),wrapper.mode,currentOriginal);
     baseline('new');restoreGuard();await frozenSources();receipt.restart_before=native('old');applyRestart=true;receipt.restart=kick();const deadline=Date.now()+90000;receipt.acceptance_deadline=new Date(deadline).toISOString();assert(receipt.restart.status===0,'apply kickstart uncertain');
     receipt.validation=await acceptNew(deadline,receipt.restart_before);receipt.status='bootstrapped';receipt.old_production_version=manifest.preflight.production_version;
     receipt.new_host_hashes=Object.fromEntries(c.targets.filter(t=>t.type==='file').map(t=>[t.target,identify(t.target)]));receipt.attestation=receipt.validation.daemon_loaded_runtime;receipt.remote_route=receipt.validation.remote_codex_models;
