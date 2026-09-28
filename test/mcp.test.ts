@@ -734,7 +734,7 @@ test("MCP stdio initializes idempotently and lists exactly twelve fully annotate
   }
 });
 
-test("MCP rejects materially different repeated initialize identities", async () => {
+test("MCP accepts independent Tunnel initialize handshakes on one stdio child", async () => {
   const client = new TestClient();
   try {
     const first = await client.request(1, "initialize", {
@@ -744,29 +744,34 @@ test("MCP rejects materially different repeated initialize identities", async ()
     });
     assert.equal(first.error, undefined);
 
-    const mismatches: Array<[string, Record<string, unknown>]> = [
+    const handshakes: Array<[string, Record<string, unknown>, string]> = [
       ["protocolVersion", {
         protocolVersion: "2025-06-18",
         capabilities: {},
         clientInfo: { name: "test", version: "1" },
-      }],
+      }, "2025-06-18"],
       ["capabilities", {
         protocolVersion: "2025-03-26",
         capabilities: { sampling: {} },
         clientInfo: { name: "test", version: "1" },
-      }],
+      }, "2025-03-26"],
       ["clientInfo", {
         protocolVersion: "2025-03-26",
         capabilities: {},
         clientInfo: { name: "other", version: "1" },
-      }],
+      }, "2025-03-26"],
     ];
-    for (const [field, params] of mismatches) {
+    for (const [field, params, version] of handshakes) {
       const response = await client.request(field, "initialize", params);
-      const error = response.error as Record<string, unknown>;
-      assert.equal(error.code, -32602);
-      assert.match(error.message as string, new RegExp(field));
+      assert.equal(response.error, undefined);
+      assert.equal((response.result as Record<string, unknown>).protocolVersion, version);
     }
+    const listed = await client.request(2, "tools/list", {});
+    assert.equal(listed.error, undefined);
+    assert.equal(((listed.result as Record<string, unknown>).tools as unknown[]).length, 12);
+
+    const invalid = await client.request(3, "initialize", { clientInfo: { name: "other" } });
+    assert.equal((invalid.error as Record<string, unknown>).code, -32602);
   } finally {
     assert.equal(await client.close(), 0);
   }

@@ -20,12 +20,6 @@ interface RpcError {
   data?: unknown;
 }
 
-interface InitializeCompatibility {
-  protocolVersion: string;
-  capabilities: unknown;
-  clientInfo: unknown;
-}
-
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === "object" && !Array.isArray(value)
     ? (value as Record<string, unknown>)
@@ -49,60 +43,12 @@ function safeErrorMessage(error: unknown): string {
   return typeof sanitized === "string" ? sanitized : "Tool call failed";
 }
 
-function initializeCompatibility(params: unknown): InitializeCompatibility | null {
+function initializeProtocolVersion(params: unknown): string | null {
   const record = asRecord(params);
   if (typeof record?.protocolVersion !== "string") {
     return null;
   }
-  return {
-    protocolVersion: record.protocolVersion,
-    capabilities: record.capabilities,
-    clientInfo: record.clientInfo,
-  };
-}
-
-function structurallyEqual(left: unknown, right: unknown): boolean {
-  if (Object.is(left, right)) {
-    return true;
-  }
-  if (left === null || right === null || typeof left !== "object" || typeof right !== "object") {
-    return false;
-  }
-  if (Array.isArray(left) || Array.isArray(right)) {
-    if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length) {
-      return false;
-    }
-    return left.every((value, index) => structurallyEqual(value, right[index]));
-  }
-  const leftRecord = asRecord(left);
-  const rightRecord = asRecord(right);
-  if (!leftRecord || !rightRecord) {
-    return false;
-  }
-  const leftKeys = Object.keys(leftRecord).sort();
-  const rightKeys = Object.keys(rightRecord).sort();
-  if (leftKeys.length !== rightKeys.length) {
-    return false;
-  }
-  return leftKeys.every((key, index) =>
-    key === rightKeys[index] && structurallyEqual(leftRecord[key], rightRecord[key])
-  );
-}
-
-function initializeMismatch(
-  first: InitializeCompatibility | null,
-  repeated: InitializeCompatibility,
-): keyof InitializeCompatibility | null {
-  if (!first || first.protocolVersion !== repeated.protocolVersion) {
-    return "protocolVersion";
-  }
-  if (!structurallyEqual(first.capabilities, repeated.capabilities)) {
-    return "capabilities";
-  }
-  if (!structurallyEqual(first.clientInfo, repeated.clientInfo)) {
-    return "clientInfo";
-  }
-  return null;
+  return record.protocolVersion;
 }
 
 export interface McpStdioServerOptions {
@@ -117,8 +63,7 @@ export class McpStdioServer {
   readonly #onClose: () => void | Promise<void>;
 
   #buffer = Buffer.alloc(0);
-  #initializeResult: Record<string, unknown> | null = null;
-  #initializeCompatibility: InitializeCompatibility | null = null;
+  #initialized = false;
   #closing = false;
   #writeChain: Promise<void> = Promise.resolve();
 
@@ -262,30 +207,14 @@ export class McpStdioServer {
     signal: AbortSignal,
   ): Promise<void> {
     if (method === "initialize") {
-      const compatibility = initializeCompatibility(params);
-      if (this.#initializeResult !== null) {
-        if (!compatibility) {
-          await this.#sendError(id, { code: -32602, message: "initialize requires protocolVersion" });
-          return;
-        }
-        const mismatch = initializeMismatch(this.#initializeCompatibility, compatibility);
-        if (mismatch) {
-          await this.#sendError(id, {
-            code: -32602,
-            message: `initialize request is incompatible with the established session: ${mismatch} differs`,
-          });
-          return;
-        }
-        await this.#sendResult(id, this.#initializeResult);
-        return;
-      }
-      if (!compatibility) {
+      const protocolVersion = initializeProtocolVersion(params);
+      if (protocolVersion === null) {
         await this.#sendError(id, { code: -32602, message: "initialize requires protocolVersion" });
         return;
       }
       const initializeResult = {
-        protocolVersion: SUPPORTED_PROTOCOL_VERSIONS.has(compatibility.protocolVersion)
-          ? compatibility.protocolVersion
+        protocolVersion: SUPPORTED_PROTOCOL_VERSIONS.has(protocolVersion)
+          ? protocolVersion
           : LATEST_PROTOCOL_VERSION,
         capabilities: { tools: { listChanged: false } },
         serverInfo: {
@@ -294,12 +223,14 @@ export class McpStdioServer {
           version: VERSION,
         },
       };
-      this.#initializeCompatibility = compatibility;
-      this.#initializeResult = initializeResult;
+      // Tunnel discovery and calls can forward independent initialize handshakes
+      // through one long-lived stdio child. Bridge has no client-scoped state, so
+      // each handshake can negotiate independently without resetting live state.
+      this.#initialized = true;
       await this.#sendResult(id, initializeResult);
       return;
     }
-    if (this.#initializeResult === null) {
+    if (!this.#initialized) {
       await this.#sendError(id, { code: -32002, message: "Server not initialized" });
       return;
     }
