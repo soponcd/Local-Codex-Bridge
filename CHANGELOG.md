@@ -1,6 +1,10 @@
 # 更新日志
 
-版本章节记录公共仓库的工程变更；提交与 push 不等于已创建 tag、GitHub Release 或完成部署。当前公开版本为 **V2.3.0**；公共历史中没有单独的 V2.1.0 发布记录。
+版本章节记录公共仓库的工程变更；提交与 push 不等于已创建 tag、GitHub Release 或完成部署。当前公开版本为 **V2.3.1**；公共历史中没有单独的 V2.1.0 发布记录。
+
+## V2.3.1（2026-09-28）
+
+- 在最终版本 plist 状态下重新构建并 ad-hoc 签名 macOS Finder bundle，使 plist 与 bundle 签名一致，修复 GitHub macOS CI packaging check；Bridge runtime、MCP 工具与协议语义均未改变。
 
 ## V2.3.0（2026-09-28）
 
