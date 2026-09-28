@@ -44,7 +44,8 @@ if (addedMethods.length || addedTypes.length || removedMethods.length || removed
   throw new Error(JSON.stringify({ addedMethods, addedTypes, removedMethods, removedTypes }));
 }
 const descriptor = buildCompactDescriptorSource(schemaOutput, methods);
-const checkedIn = readFileSync(path.join(root, "src", "compact-descriptors.ts"), "utf8");
+// Git may use CRLF in a Windows checkout; schema content must still match exactly.
+const checkedIn = readFileSync(path.join(root, "src", "compact-descriptors.ts"), "utf8").replace(/\r\n/g, "\n");
 if (descriptor !== checkedIn) throw new Error("Installed compact notification shape changed; regenerate and review src/compact-descriptors.ts");
 for (const [method, filename] of Object.entries(RAW_NOTIFICATION_SCHEMAS)) {
   const typeName = filename.replace(/\.json$/, ".ts");
