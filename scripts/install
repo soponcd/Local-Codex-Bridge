@@ -1,4 +1,4 @@
 #!/bin/sh
 set -eu
-cd "$(dirname "$0")/.."
-exec ./deploy.sh "$@"
+printf '%s\n' 'Run the independently trusted external verifier with PACKAGE_ROOT --deploy.' >&2
+exit 64

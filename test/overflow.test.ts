@@ -7,6 +7,9 @@ import { setImmediate as nextEvent } from 'node:timers/promises';
 import test from 'node:test';
 import { createHash } from 'node:crypto';
 import { writeFile } from 'node:fs/promises';
+import { createReadStream, statSync } from 'node:fs';
+import { createInterface } from 'node:readline';
+import { randomUUID } from 'node:crypto';
 import { AppServerManager } from '../src/app-server.js';
 import { DARWIN_PLATFORM_POLICY } from '../src/platform.js';
 import { ControlSurface } from '../src/tools.js';
@@ -83,7 +86,7 @@ test('overflowed mutation never replayed; only explicit safe read restarts once'
 
 class HistoryProbe extends AppServerManager {
   calls: Array<{ method: string; params: any }> = [];
-  override async request(method: string, params: any) {
+  override async request(method: string, params: any): Promise<any> {
     this.calls.push({ method, params });
     if (method === 'thread/read') return { thread: { id: 'large-history', turns: params.includeTurns ? [{ id: 'large', items: [] }] : [] } };
     return { data: [], nextCursor: null };
@@ -117,12 +120,47 @@ test('30 MiB synthetic history source remains SHA-256 identical across bounded p
   const directory = await mkdtemp(join(tmpdir(), 'lcb-history-'));
   const file = join(directory, 'synthetic.jsonl');
   try {
-    await writeFile(file, Buffer.alloc(30 * 1024 * 1024, 120));
+    const ids = Array.from({ length: 512 }, () => randomUUID());
+    const lines = ids.map((id, index) => JSON.stringify({ turnId: 'synthetic-turn-' + index, item: { id, type: index < 105 ? 'commandExecution' : 'agentMessage', text: 'synthetic-' + index + ':' + 'x'.repeat(60 * 1024) } }));
+    await writeFile(file, lines.join('\n') + '\n');
+    assert.ok(statSync(file).size > 30 * 1024 * 1024);
     const hash = async () => createHash('sha256').update(await readFile(file)).digest('hex');
     const before = await hash();
-    const manager = new HistoryProbe();
+    class SourceHistoryProbe extends HistoryProbe {
+      sourceReads = 0;
+      servedEntries = 0;
+      override async request(method: string, params: any) {
+        if (method === 'thread/read') return super.request(method, params);
+        assert.equal(method, 'thread/items/list');
+        assert.equal(params.limit, 100);
+        assert.equal(params.sortDirection, 'desc');
+        this.calls.push({ method, params });
+        this.sourceReads++;
+        const start = Number(params.cursor ?? 0);
+        const data: any[] = [];
+        const input = createReadStream(file), reader = createInterface({ input, crlfDelay: Infinity });
+        let ordinal = 0;
+        try {
+          for await (const line of reader) {
+            if (ordinal++ < start) continue;
+            data.push(JSON.parse(line));
+            if (data.length === params.limit) break;
+          }
+        } finally { reader.close(); input.destroy(); }
+        this.servedEntries += data.length;
+        const page = { data, nextCursor: start + data.length < ids.length ? String(start + data.length) : null };
+        assert.ok(Buffer.byteLength(JSON.stringify(page)) < 10 * 1024 * 1024);
+        return page;
+      }
+    }
+    const manager = new SourceHistoryProbe();
     const surface = new ControlSurface(manager);
-    await surface.call('codex_threads', { thread_id: 'large-history', include_turns: true, latest_messages: 1 });
+    const result = await surface.call('codex_threads', { thread_id: 'large-history', include_turns: true, latest_messages: 1 }) as Record<string, any>;
+    assert.equal(result.recent_messages.pages_read, 2);
+    assert.equal(result.recent_messages.messages.length, 1);
+    assert.equal(result.recent_messages.messages[0].item.id, ids[105]);
+    assert.equal(manager.sourceReads, 2);
+    assert.equal(manager.servedEntries, 200);
     await assert.rejects(surface.call('codex_threads', { thread_id: 'large-history', include_turns: true }), /latest_messages|unbounded/);
     assert.equal(await hash(), before);
     assert.equal(manager.calls.filter(call => call.method === 'thread/read' && call.params.includeTurns).length, 0);

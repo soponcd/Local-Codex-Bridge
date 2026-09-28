@@ -204,5 +204,87 @@
         "log_sha256": "d18d7cd698228bb35f931e8d64d122655793971c13f37f67b8b1583a80f54c72"
       }
     ]
+  },
+  "review_fixes_green": {
+    "timestamp": "2026-09-28T11:09:27.530Z",
+    "node": "v26.3.1",
+    "results": [
+      {
+        "args": [
+          "run",
+          "typecheck"
+        ],
+        "status": 0,
+        "summary": [],
+        "log_sha256": "c39e12e06ad9dd1eecdedb130474a88ea42657959cd84fca64f37bd348e3d743"
+      },
+      {
+        "args": [
+          "test"
+        ],
+        "status": 0,
+        "summary": [
+          "ℹ tests 203",
+          "ℹ pass 201",
+          "ℹ fail 0",
+          "ℹ cancelled 0",
+          "ℹ skipped 2",
+          "ℹ tests 5",
+          "ℹ pass 5",
+          "ℹ fail 0",
+          "ℹ cancelled 0",
+          "ℹ skipped 0"
+        ],
+        "log_sha256": "cf565b2935d8e74d72660735a8bdd8483d848feabdab71e9dd08d7ad6a1973fc"
+      },
+      {
+        "args": [
+          "--test",
+          "--test-reporter=tap",
+          "dist/test/overflow.test.js"
+        ],
+        "status": 0,
+        "summary": [
+          "# tests 11",
+          "# pass 11",
+          "# fail 0",
+          "# cancelled 0",
+          "# skipped 0"
+        ],
+        "log_sha256": "080ede185a97bc7173c79b21017a5a5edf4d4257a81f23bd98511aafaf76804f"
+      },
+      {
+        "args": [
+          "--test",
+          "--test-reporter=tap",
+          "dist/test/deploy-fix.test.js",
+          "dist/test/remote-probe.test.js"
+        ],
+        "status": 0,
+        "summary": [
+          "# tests 44",
+          "# pass 44",
+          "# fail 0",
+          "# cancelled 0",
+          "# skipped 0"
+        ],
+        "log_sha256": "3f973206a0a054f4a309cf4d37fae6026273ed1c4f0261beb975fcb279015e7e"
+      }
+    ]
+  },
+  "review_rollback_red": {
+    "source_commit": "0dd2a544abf9d210f1833367593d2edb386d3297",
+    "source_sha256": "e279a4ad93d348ba12587419e39dc04ce8af232b8cbf2022e59a27e8aa1d6870",
+    "status": 1,
+    "expected_status": 1,
+    "summary": [
+      "# tests 1",
+      "# pass 0",
+      "# fail 1",
+      "# cancelled 0",
+      "# skipped 0"
+    ],
+    "reason": "new frozen-baseline regression rejects tampered backup; pre-fix implementation fails the rejection assertion",
+    "production_modified": false
   }
 }

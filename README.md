@@ -15,6 +15,7 @@
 发布：验证通过并提交源码后执行 `npm run package:local`；新目录不可覆盖。
 `releases/<version>/package` 是封存包，`releases/trust/<version>/verify-package.mjs` 是包外冻结信任锚点。
 信任锚点必须由可信渠道单独保存/复核，不能从待安装包提取或重新计算来接受篡改。
+唯一正式首入口是 `NODE EXTERNAL_VERIFIER PACKAGE_ROOT --verify|--check|--deploy|--rollback CONTRACT`；该包外runner先封存校验整个包，再执行固定的包内模块。不要直接执行包内shell或JS作为可信安装入口。
 发布包含源码和 dist，不含 node_modules；干净解包后可 `npm ci --ignore-scripts && npm test`。
 安装/回滚的显式配置、授权边界和异常恢复详见 [运维手册](ops/runbooks/operations.md)。
 外层 healthz/readyz=200 只能证明 Tunnel 层；完整健康还需要控制面轮询、MCP、真实远程只读调用和实际加载证明。

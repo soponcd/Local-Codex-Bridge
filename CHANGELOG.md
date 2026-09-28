@@ -8,6 +8,7 @@
 - 保留首个 JSONL fatal、限制诊断、释放缓冲；上限保持 10 MiB，mutation 不自动重放。
 - 历史读取改为 metadata + 原生分页，拒绝无界读取；不存储历史正文。
 - 信任锚点置于包外，部署与回滚保留 fail-closed、定向 kickstart 和旧运行实例加载证明；参数化 host/fixture 路径。
+- 独立复核修正：包外runner成为唯一首入口，校验全部包字节后才执行固定操作；冻结rollback合约绑定backup baseline digest；大历史fixture实际向两页native-shaped读取供数。
 - 隔离 tamper、rollback、overflow、remote 只读协议测试；增加版本化封存包和文档。未部署生产。
 - 兼容边界：Node.js 24+、macOS 当前验收；Windows 测试本机未运行。8 个工具保持不变。可选签名 launcher 未重编译，版本仍为 upstream 2.1.3。
 

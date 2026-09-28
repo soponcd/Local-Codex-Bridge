@@ -1,14 +1,16 @@
 import { readFileSync, writeFileSync, mkdirSync, mkdtempSync, cpSync, existsSync, renameSync, unlinkSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { spawnSync } from 'node:child_process';
-import { checkHashes, hashFile, nativeSwap, targetedRestart, validateChanged } from './deploy-fix.mjs';
+import { checkHashes, hashFile, nativeSwap, targetedRestart, validateChanged, externalTrustPath } from './deploy-fix.mjs';
 import { safePackagePath } from './verify-package.mjs';
 import { verifyLive } from './verify-fix-live.mjs';
 import { remoteModels } from './remote-model-probe.mjs';
 export async function rollback(config, ops) {
   const source = join(config.backup, 'files');
-  const old = JSON.parse(readFileSync(join(config.backup, 'baseline.json')));
+  const baselineFile = join(config.backup, 'baseline.json');
+  if (!/^[a-f0-9]{64}$/.test(config.backup_baseline_sha256 ?? '') || hashFile(baselineFile) !== config.backup_baseline_sha256) throw new Error('Frozen backup baseline digest mismatch');
+  const old = JSON.parse(readFileSync(baselineFile));
   const payload = Object.fromEntries(config.changed.map(name => [name, old[name] ?? '0'.repeat(64)]));
   validateChanged({ production: config.production, candidate: source, baseline: config.expected_current, payload, changed: config.changed });
   checkHashes(config.production, config.expected_current, 'current rollback baseline');
@@ -38,6 +40,10 @@ export async function rollback(config, ops) {
   }
 }
 async function main() {
+  const packageRoot = fileURLToPath(new URL('../', import.meta.url));
+  if (!process.env.LCB_TRUST_VERIFIER) throw new Error('External trusted runner required');
+  const { verifyAnchoredPackage } = await import(pathToFileURL(externalTrustPath(packageRoot, process.env.LCB_TRUST_VERIFIER)).href);
+  verifyAnchoredPackage(packageRoot);
   const contract = process.argv[2], anchor = process.env.LCB_ROLLBACK_CONTRACT_SHA256;
   if (!contract || !/^[a-f0-9]{64}$/.test(anchor ?? '') || hashFile(contract) !== anchor) throw new Error('Frozen external rollback contract required');
   const config = JSON.parse(readFileSync(contract));

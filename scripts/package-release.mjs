@@ -4,6 +4,7 @@ import { createHash } from 'node:crypto';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
+import { trustedRunnerSource } from './release-trust.mjs';
 const root = fileURLToPath(new URL('../', import.meta.url));
 const version = JSON.parse(readFileSync(join(root, 'package.json'))).version;
 const out = resolve(process.argv[2] ?? join(root, 'releases', version));
@@ -39,7 +40,7 @@ const sealed = JSON.stringify({ version, files: payload, links }, null, 2) + '\n
 writeFileSync(join(pkg, 'package-manifest.json'), sealed);
 const rootHash = sha(sealed);
 const verifier = readFileSync(join(root, 'scripts/verify-package.mjs'), 'utf8');
-const anchor = verifier + `\nexport const verifyAnchoredPackage = root => verifyPackage(root, '${rootHash}');\nif (process.argv[1] === new URL(import.meta.url).pathname) console.log(JSON.stringify(verifyAnchoredPackage(process.argv[2])));\n`;
+const anchor = trustedRunnerSource(verifier, rootHash);
 writeFileSync(join(trust, 'verify-package.mjs'), anchor, { mode: 0o500 });
 const checked = spawnSync(process.execPath, [join(trust, 'verify-package.mjs'), pkg], { encoding: 'utf8' });
 if (checked.status !== 0) throw new Error('Candidate seal verification failed');

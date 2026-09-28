@@ -4,14 +4,17 @@
 
 ## 配置与安装
 
-`deploy.sh` 在 sealed package 根目录运行。必须显式配置 `LCB_NODE`、`LCB_TRUST_VERIFIER`（包外）、`LCB_PRODUCTION_ROOT`、`LCB_LAUNCH_AGENT`、`LCB_BACKUP_ROOT`。
+唯一正式首入口是独立保存且已复核哈希的包外runner：`NODE EXTERNAL_VERIFIER PACKAGE_ROOT OPERATION`。
+OPERATION 为 `--verify`、`--check`、`--deploy` 或 `--rollback CONTRACT.json`。runner先校验整个sealed包，再按固定名称执行包内模块，并绑定其自身为外部trust verifier。
+不要执行包内 `deploy.sh`、`scripts/install`、`scripts/rollback` 或包内JS作为可信首入口；包内shell默认拒绝运行，即使它被篡改为exit0，正式包外入口仍先拒绝sealed hash不匹配。
+部署需显式配置 `LCB_PRODUCTION_ROOT`、`LCB_LAUNCH_AGENT`、`LCB_BACKUP_ROOT`。Node必须24+，包外runner路径和哈希应在可信渠道独立复核。
 `LCB_LAUNCH_AGENT` 仅接受 `gui/<uid>/com.openai.tunnel-client.lcb-remote`。
 验证配置还需 `CODEX_EXE`、`LCB_HEALTH_URL_FILE`、`LCB_TUNNEL_CLIENT`、`LCB_PID_FILE`、`LCB_STDIO_WRAPPER`；这些路径应在部署前 live-read，并与 manifest 的 host_code_hashes 相符。
 不要把 profile、URL 文件内容或凭据复制到仓库。模板不包含健康 URL 或实际认证配置。
 
-先运行 `scripts/verify PACKAGE_PATH` 或包的 `deploy.sh --check`。前者只校验发布封存，后者另核对生产/host 基线，均不重启。
+先运行包外runner的 `--verify` 或 `--check`。前者只校验发布封存，后者另核对生产/host 基线，均不重启。
 部署前独立复核、用户授权、活动任务确认、包外 verifier 哈希确认缺一不可。
-确认授权后包内 `deploy.sh` 执行隔离测试/构建、备份、manifest 文件替换、dist 原子交换、精确 kickstart。
+确认授权后包外runner的 `--deploy` 执行隔离测试/构建、备份、manifest 文件替换、dist 原子交换、精确 kickstart。
 运行证明必须包含实际模块 SHA-256、wrapper 子进程身份、Tunnel PID变化、MCP initialize/8 tools/codex_models 和真实远程路由。
 自动安装的额外历史验证目前需要显式 `LCB_ALLOW_HISTORY_VERIFICATION=1`、`LCB_TEST_HISTORY_ID`、`LCB_TEST_HISTORY_FILE`，且先批准专用隔离 fixture；没有配置会 fail-closed 并回滚。
 
@@ -31,8 +34,9 @@ Bridge unavailable 时区分外层 Tunnel 与内部 child；安全读取最多�
 ## 显式回滚
 
 自动部署失败会恢复文件与 dist，并重新定向启动旧实例；不确定 kickstart 仍触发恢复后的再次定向重启。
-显式 `scripts/rollback CONTRACT.json` 需要包外冻结的 `LCB_ROLLBACK_CONTRACT_SHA256`；合约字段为 `production`、`backup`、`changed`、`expected_current`、`agent`、`host_code_hashes`。
+显式包外runner `PACKAGE_ROOT --rollback CONTRACT.json` 需要包外冻结的 `LCB_ROLLBACK_CONTRACT_SHA256`；合约字段为 `production`、`backup`、`backup_baseline_sha256`、`changed`、`expected_current`、`agent`、`host_code_hashes`。
 合约须依据上次 JSON receipt 与完整备份生成、独立复核；expected_current 是当前部署文件哈希，backup/files 与 baseline.json 是旧版本来源。
+`backup_baseline_sha256` 必须在冻结合约时绑定已复核的backup/baseline.json字节，旧文件哈希由该冻结baseline授权；不能在回滚时按现有备份重新接受新hash。同步篡改备份文件和baseline将被拒绝。
 回滚先核对 current 和备份哈希，按 allowlist 恢复文件和原子交换 dist，然后精确重启并验证旧模块实际加载与真实远程只读调用。
 契约变化或 current mismatch 必须停止，不通过重新计算 current 哈希来绕过冻结基线。
 

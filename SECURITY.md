@@ -13,6 +13,8 @@ TLS 校验保持开启，不使用 `NODE_TLS_REJECT_UNAUTHORIZED=0` 连接或接
 stdout 专用于 MCP 协议。敏感日志、health URL、Tunnel profile、访问令牌禁止进入 Git。
 
 sealed manifest 的 SHA-256 必须由包外独立冻结 verifier 校验；包内自重算哈希无法授予信任。
+包外runner是唯一可信首入口，验证所有包字节后才执行固定deploy/rollback模块；不先执行待验证包内shell。
+回滚冻结合约同时绑定backup baseline字节摘要，旧文件哈希不能由未经信任的备份manifest自行重新授予。
 攻击者同时控制 trusted anchor 与 release 的情形不在该校验边界内，锚点需独立保管。
 部署 changed 路径采用精确 allowlist，拒绝绝对路径、`..`、奇异规范化和 symlink parent/leaf 逃逸。
 生产基线变化时 fail-closed；不扩大进程控制、不读取其他项目数据、不自动开启模型 turn。

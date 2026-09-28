@@ -1,4 +1,4 @@
 #!/bin/sh
 set -eu
-: "${LCB_NODE:?Explicit Node.js 24+ executable required}"
-exec "$LCB_NODE" "$(dirname "$0")/rollback.mjs" "$@"
+printf '%s\n' 'Run the independently trusted external verifier with PACKAGE_ROOT --rollback CONTRACT.' >&2
+exit 64
