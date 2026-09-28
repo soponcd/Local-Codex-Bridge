@@ -21,7 +21,11 @@ async function mcp(command, args, history, environment = {}, runtimeProof, deadl
   delete childEnv.LCB_RUNTIME_PROOF_CONFIG;
   delete childEnv.NODE_OPTIONS;
   const proof = runtimeProof ? createRuntimeProof(runtimeProof.root, runtimeProof.hashes) : null;
-  if (proof) { childEnv.LCB_RUNTIME_PROOF_CONFIG = proof.config; childEnv.NODE_OPTIONS = '--import=' + fileURLToPath(new URL('./runtime-load-proof.mjs', import.meta.url)); }
+  if (proof) {
+    childEnv.LCB_RUNTIME_PROOF_CONFIG = proof.config;
+    // Host bootstrap wrapper chooses its fixed explicit --import proof hook.
+    if (command === process.execPath) args = ['--import', fileURLToPath(new URL('./runtime-load-proof.mjs', import.meta.url)), ...args];
+  }
   const budget = remaining(deadline, 45000);
   const child = spawn(command, args, { stdio: ['pipe', 'pipe', 'pipe'], env: childEnv });
   const lifetime = setTimeout(() => child.kill('SIGKILL'), budget);

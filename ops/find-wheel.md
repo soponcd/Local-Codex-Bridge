@@ -13,6 +13,10 @@
 
 Phase1已找到直接匹配方案，停止，不进入学术Phase2。成本实际用量unknown，不声称已节省固定比例。
 
+## Daemon attestation (LCB-DAEMON-13)
+
+复用既有 `runtime-load-proof.mjs` 的捕获策略，抽出同步 `captureRuntimeLoads`。官方现成接口为 [Node registerHooks](https://nodejs.org/api/module.html#moduleregisterhooksoptions) 的 `nextLoad` 实际 source，以及 [Node net](https://nodejs.org/api/net.html) 的 Unix domain socket、超时与显式销毁。macOS 自带 ps/launchctl/lsof 提供独立进程关系与 socket 归属证据；没有增加第三方依赖、云服务或公共 MCP 工具。直接适合本机单用户环境；不将同一 UID 的恶意进程隔离作为该方案能力。开发期成本为固定小协议、进程绑定、隔离攻击测试；上线日无新增费用但需一次有备份的 wrapper bootstrap；增长期只跟踪 Node 与 macOS 接口，无供应商锁定。实际用量 unknown，Phase 1 结束。
+
 ## Stage E diagnostic repair (LCB-STAGEE-FIX-11)
 
 复用既有 manifest-scoped deploy/verifyLive 和 Node 内置有界超时，无新增重试库、服务或持久任务系统。官方接口来源：[AbortSignal.timeout](https://nodejs.org/api/globals.html#static-method-abortsignaltimeoutdelay)、[spawnSync timeout/killSignal](https://nodejs.org/api/child_process.html#child_processspawnsynccommand-args-options)。仅对部署后的只读健康门重试，不重放 mutation 或 restart。开发期成本是小范围诊断投影和虚拟时钟测试；上线日无新增依赖或费用；增长期仍是单用户有界窗口，无新锁定。实际用量 unknown。

@@ -7,6 +7,7 @@ import { checkHashes, hashFile, nativeSwap, targetedRestart, validateChanged, ex
 import { safePackagePath } from './verify-package.mjs';
 import { verifyLive } from './verify-fix-live.mjs';
 import { remoteModels } from './remote-model-probe.mjs';
+import { verifyDaemon, daemonConfig } from './daemon-attestation.mjs';
 export async function rollback(config, ops) {
   const source = join(config.backup, 'files');
   const baselineFile = join(config.backup, 'baseline.json');
@@ -19,6 +20,7 @@ export async function rollback(config, ops) {
   const restoreHashes = Object.fromEntries(Object.entries(old).filter(([name]) => name.startsWith('dist/') || config.changed.includes(name)));
   checkHashes(source, restoreHashes, 'backup');
   if (ops.identity) ops.identity();
+  requireDaemonRuntime(await ops.verifyBaseline());
   const stageRoot = mkdtempSync(join(dirname(config.production), '.lcb-rollback-stage-'));
   const stage = join(stageRoot, 'dist');
   cpSync(join(source, 'dist'), stage, { recursive: true });
@@ -52,20 +54,25 @@ async function main() {
   const contractBytes = readFileSync(contract);
   if (createHash('sha256').update(contractBytes).digest('hex') !== anchor) throw new Error('Frozen external rollback contract required');
   const config = JSON.parse(contractBytes);
-  requireDeploymentRuntimeReadiness();
+  requireDeploymentRuntimeReadiness(await verifyDaemon(daemonConfig(config.production, config.expected_current, config.agent)));
   const run = (cmd, args, timeout = 10000) => { const r = spawnSync(cmd, args, { encoding: 'utf8', timeout }); if (r.status !== 0) throw new Error('Target command failed'); return r; };
   const instance = (deadline = Infinity) => { const budget = Math.min(10000, deadline - Date.now()); if (budget <= 0) throw new Error('Daemon identity deadline'); const r = run('/bin/launchctl', ['print', config.agent], budget); const pid = Number(r.stdout.match(/^\s*pid = (\d+)$/m)?.[1]); if (!pid) throw new Error('LaunchAgent running identity missing'); return pid; };
   let previous;
   const receipt = await rollback(config, {
     identity: () => { for (const [path, hash] of Object.entries(config.host_code_hashes ?? {})) if (hashFile(path) !== hash) throw new Error('Host identity changed'); },
+    verifyBaseline: async () => ({ ok: true, daemon_loaded_runtime: await verifyDaemon(daemonConfig(config.production, config.expected_current, config.agent)) }),
     swap: nativeSwap,
     restart: async () => { previous = instance(); targetedRestart(config.agent, run); },
     verify: async old => {
       const result = await verifyWithRetries('rollback', { verify: async ({ deadline }) => {
         const result = await verifyLive({ wrapper: true, deadline, runtimeProof: { root: config.production, hashes: old } });
         if (result.ok && result.wrapper.probe_loaded_runtime?.ok && instance(deadline) !== previous) {
+          result.daemon_loaded_runtime = await verifyDaemon(daemonConfig(config.production, old, config.agent), { deadline });
+          if (result.daemon_loaded_runtime.tunnel_pid !== instance(deadline)) throw new Error('Daemon Tunnel identity mismatch');
           result.remote_codex_models = await remoteModels({ deadline });
-          result.daemon_loaded_runtime = { ok: false, error: 'Daemon loaded runtime proof missing' };
+          if (result.daemon_loaded_runtime.tunnel_pid !== instance(deadline)) throw new Error('Daemon instance replaced during remote acceptance');
+          const acceptedDaemon = await verifyDaemon(daemonConfig(config.production, old, config.agent), { deadline });
+          if (acceptedDaemon.instance_id !== result.daemon_loaded_runtime.instance_id || acceptedDaemon.pid !== result.daemon_loaded_runtime.pid) throw new Error('Daemon Bridge replaced during remote acceptance');
         } else result.ok = false;
         return result;
       } });

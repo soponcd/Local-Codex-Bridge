@@ -34,6 +34,7 @@ for (const scenario of ['success', 'baseline mismatch', 'payload mismatch', 'res
       if (scenario === 'baseline mismatch') writeFileSync(join(production, 'package.json'), 'user-change');
       if (scenario === 'payload mismatch') writeFileSync(join(candidate, 'package.json'), 'tampered');
       const ops = {
+        verifyBaseline: async () => ({ ok: true, daemon_loaded_runtime: { ok: true } }),
         build: async () => { events.push('build'); if (scenario === 'build fails') throw new Error('build fails'); if (scenario === 'fresh build') return { runtimePath: built }; },
         swap: (a: string, b: string) => { events.push('swap'); if (scenario === 'swap fails') throw new Error('swap fails'); const temp = a + '.test-swap'; renameSync(a, temp); renameSync(b, a); renameSync(temp, b); },
         restart: async () => {
@@ -147,7 +148,7 @@ for (const scenario of ['success', 'drift', 'missing load proof', 'backup baseli
       if (scenario === 'backup baseline tampered') writeFileSync(join(backup, 'baseline.json'), JSON.stringify({ 'package.json': hash('evil'), 'dist/index.js': hash('old-runtime') }));
       let restarts = 0;
       const config = { production, backup, backup_baseline_sha256: frozenBaseline, changed: ['package.json'], expected_current: { 'package.json': hash('new'), 'dist/index.js': hash('new-runtime') } };
-      const ops = { swap: (a: string, b: string) => { const tmp = a + '.swap'; renameSync(a, tmp); renameSync(b, a); renameSync(tmp, b); }, restart: async () => { restarts++; }, verify: async () => scenario === 'missing load proof' ? { ok: true } : { ok: true, daemon_loaded_runtime: { ok: true } } };
+      const ops = { verifyBaseline: async () => ({ ok: true, daemon_loaded_runtime: { ok: true } }), swap: (a: string, b: string) => { const tmp = a + '.swap'; renameSync(a, tmp); renameSync(b, a); renameSync(tmp, b); }, restart: async () => { restarts++; }, verify: async () => scenario === 'missing load proof' ? { ok: true } : { ok: true, daemon_loaded_runtime: { ok: true } } };
       if (scenario === 'success') { assert.equal((await rollback(config, ops)).rolled_back, true); assert.equal(restarts, 1); }
       else {
         const error = scenario === 'drift' ? /current rollback baseline mismatch/ : scenario === 'backup baseline tampered' ? /Frozen backup baseline digest mismatch/ : scenario === 'backup payload tampered' ? /backup mismatch/ : /MANUAL_RECOVERY_REQUIRED/;
@@ -255,6 +256,7 @@ for (const scenario of ['persistent timeouts', 'sensitive failure', 'probe is no
       let restarts = 0, deployedClock = 0;
       const secret = 'SENSITIVE_HISTORY_PROTOCOL_CREDENTIAL_BODY_SENTINEL';
       const ops = {
+        verifyBaseline: async () => ({ ok: true, daemon_loaded_runtime: { ok: true } }),
         build: async () => {}, restart: async () => { restarts++; },
         swap: (a: string, b: string) => { const tmp = a + '.swap'; renameSync(a, tmp); renameSync(b, a); renameSync(tmp, b); },
         verify: async (phase: string, onAttempt: any) => {
@@ -308,8 +310,8 @@ test('retry attempt count is bounded even for immediately failing gates', async 
 
 test('unavailable daemon attestation blocks the production entry before mutation', async () => {
   const { deploymentRuntimeReadiness, requireDeploymentRuntimeReadiness, requireDaemonRuntime } = await import(deployURL.href);
-  assert.deepEqual(deploymentRuntimeReadiness(), { deployment_ready: false, blocker: 'daemon_attestation_unavailable' });
-  assert.throws(() => requireDeploymentRuntimeReadiness(), /daemon_attestation_unavailable; production mutation not started/);
+  assert.deepEqual(deploymentRuntimeReadiness(), { deployment_ready: false, blocker: 'daemon_bootstrap_required' });
+  assert.throws(() => requireDeploymentRuntimeReadiness(), /daemon_bootstrap_required; production mutation not started/);
   assert.throws(() => requireDaemonRuntime({ ok: true, loaded_instance: { ok: true }, wrapper: { probe_loaded_runtime: { ok: true } } }), /Daemon loaded runtime proof missing/);
   assert.throws(() => requireDaemonRuntime({ ok: false, daemon_loaded_runtime: { ok: true } }), /health verification failed/);
 });

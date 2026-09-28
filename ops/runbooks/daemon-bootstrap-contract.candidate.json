@@ -1,0 +1,91 @@
+{
+  "schema": 1,
+  "task_id": "LCB-DAEMON-13",
+  "claim": "bootstrap_contract_candidate_not_executed",
+  "production": "/Users/ZGH/.local/share/local-codex-bridge",
+  "agent": "gui/502/com.openai.tunnel-client.lcb-remote",
+  "targets": [
+    {
+      "source": "/Users/ZGH/Codex/Local-Codex-Bridge/scripts/daemon-attestation-hook.mjs",
+      "target": "/Users/ZGH/.local/share/lcb-daemon-attestation/daemon-attestation-hook.mjs",
+      "mode": "0500",
+      "sha256": "796d25c5b6690b0e993fccd37992377ca5fbca12bb63235f0f3eb6862087cc53"
+    },
+    {
+      "source": "/Users/ZGH/Codex/Local-Codex-Bridge/scripts/runtime-load-proof.mjs",
+      "target": "/Users/ZGH/.local/share/lcb-daemon-attestation/runtime-load-proof.mjs",
+      "mode": "0500",
+      "sha256": "a1f943c7a3ce3b0f47db16a41929862351e42a13949f3a3b35cd07c19bb35178"
+    },
+    {
+      "source": "/Users/ZGH/Codex/Local-Codex-Bridge/scripts/daemon-attestation.mjs",
+      "target": "/Users/ZGH/.local/share/lcb-daemon-attestation/daemon-attestation.mjs",
+      "mode": "0500",
+      "sha256": "d870168c41a6769ba5b282652982ef1d75e542bbbf9a0ab05af9f70ebf93eb3e"
+    },
+    {
+      "target": "/Users/ZGH/.local/bin/lcb-remote-stdio",
+      "mode": "0755",
+      "sha256": "6304458c135645edd64b401ea223728d3074e0de2fda445dac425c191294ca68",
+      "proposed_bytes": "#!/bin/sh\nset -eu\nunset CONTROL_PLANE_API_KEY OPENAI_ADMIN_KEY NODE_OPTIONS\nexport CODEX_EXE='/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex'\nif [ -n \"${LCB_RUNTIME_PROOF_CONFIG:-}\" ]; then\n  unset LCB_DAEMON_ATTEST_DIR LCB_DAEMON_ATTEST_HOOK\n  exec '/opt/homebrew/Cellar/node/26.3.1/bin/node' --import '/Users/ZGH/.local/share/lcb-daemon-attestation/runtime-load-proof.mjs' '/Users/ZGH/.local/share/local-codex-bridge/dist/src/index.js'\nfi\nexport LCB_DAEMON_ATTEST_DIR='/Users/ZGH/.local/run/lcb-attest'\nexec '/opt/homebrew/Cellar/node/26.3.1/bin/node' --import '/Users/ZGH/.local/share/lcb-daemon-attestation/daemon-attestation-hook.mjs' '/Users/ZGH/.local/share/local-codex-bridge/dist/src/index.js'\n"
+    },
+    {
+      "target": "/Users/ZGH/.local/share/lcb-daemon-attestation",
+      "mode": "0700",
+      "type": "directory"
+    },
+    {
+      "target": "/Users/ZGH/.local/run/lcb-attest",
+      "mode": "0700",
+      "type": "directory"
+    }
+  ],
+  "baseline": {
+    "wrapper_sha256": "b7c4ece43cb0478db49251941bedfd3a59348480c56c190015428b461ed7d77d",
+    "canonical_node": "/opt/homebrew/Cellar/node/26.3.1/bin/node",
+    "expected_preexisting_hooks": "absent_or_stop_and_review",
+    "production_dist": "frozen_baseline_no_change",
+    "launchagent": "no_change"
+  },
+  "backup": {
+    "root": "/Users/ZGH/.local/share/lcb-daemon-attestation-backups",
+    "mode": "0700",
+    "contents": [
+      "original_wrapper_bytes_mode_owner_sha256",
+      "target_absence_inventory",
+      "production_dist_hashes",
+      "exact_tunnel_and_bridge_os_identity"
+    ],
+    "rule": "freeze_backup_hash_before_any_target_write"
+  },
+  "apply": [
+    "independently_verify_candidate_and_external_runner_hashes",
+    "verify_wrapper_baseline_and_absent_hook_targets",
+    "create_private_directories_without_symlinks",
+    "install_three_frozen_hook_files_atomically",
+    "atomic_wrapper_replace_preserve_owner",
+    "exact_target_kickstart_once",
+    "read_only_remote_codex_models_limit_1_to_establish_real_bridge",
+    "verify_baseline_daemon_nine_module_hashes_and_health_wrapper_remote_gates"
+  ],
+  "rollback": [
+    "restore_exact_original_wrapper_bytes_owner_mode_atomically",
+    "exact_target_kickstart_once",
+    "verify_original_wrapper_hash_and_existing_service_health_control_plane_wrapper_remote",
+    "remove_only_this_invocation_owned_hook_files_and_empty_directories_after_new_bridge_exit",
+    "original_wrapper_has_no_attestation_so_report_old_service_restored_separately_from_daemon_attestation"
+  ],
+  "verification": {
+    "environment": {
+      "LCB_NODE": "/opt/homebrew/Cellar/node/26.3.1/bin/node",
+      "LCB_DAEMON_ATTEST_HOOK": "/Users/ZGH/.local/share/lcb-daemon-attestation/daemon-attestation-hook.mjs",
+      "LCB_DAEMON_ATTEST_DIR": "/Users/ZGH/.local/run/lcb-attest"
+    },
+    "daemon": "launchctl_exact_tunnel_direct_bridge_os_identity_before_after_two_fresh_nonces_nine_loaded_sha256",
+    "wrapper": "explicit_node_import_no_NODE_OPTIONS_in_app_server",
+    "stdout": "MCP_only_eight_tools",
+    "deadline_ms": 90000
+  },
+  "release_followup": "candidate.7 freezes prebootstrap host hashes; after authorized bootstrap, freeze independently reviewed host hashes including all three external hook files and wrapper and reseal a new candidate before --deploy. Do not overwrite candidate.7 or relax identity checks.",
+  "host_modified": false
+}

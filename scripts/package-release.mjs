@@ -21,7 +21,7 @@ if (realpathSync(trust).startsWith(realpathSync(pkg) + '/') || realpathSync(trus
 for (const name of tracked) { mkdirSync(dirname(join(pkg, name)), { recursive: true }); cpSync(join(root, name), join(pkg, name), { verbatimSymlinks: true }); }
 cpSync(join(root, 'dist'), join(pkg, 'dist'), { recursive: true });
 const provenance = JSON.parse(readFileSync(join(root, 'incidents/2026-09-28-jsonl-overflow/provenance.json')));
-const changed = [...provenance.live_changed.map(row => row.path), 'package-lock.json', 'src/version.ts'];
+const changed = [...provenance.live_changed.map(row => row.path), 'package-lock.json', 'src/version.ts', 'scripts/rollback.mjs', 'scripts/daemon-attestation.mjs', 'scripts/daemon-attestation-hook.mjs', 'scripts/daemon-bootstrap-plan.mjs', 'test/daemon-attestation.test.ts', 'test/daemon-tunnel-fixture.mjs', 'test/daemon-app-server-fixture.mjs'];
 const payload = {}, links = {};
 function walk(dir, prefix = '') {
   for (const entry of readdirSync(dir, { withFileTypes: true })) {

@@ -54,3 +54,19 @@ Bridge unavailable 时区分外层 Tunnel 与内部 child；安全读取最多�
 当前实现没有安全绑定真实长驻 Bridge 子进程的模块加载字节，`daemon_loaded_runtime` 明确未证明。探针、Tunnel PID变化及真实远程只读调用不能替代这个门；自动恢复文件后若仍缺实例证明，继续报告 MANUAL_RECOVERY_REQUIRED，不能称服务恢复。candidate.6 只声明 local validation/check，不声明 installed/runtime effective/production accepted。
 
 由于缺少真正 daemon attestation，正式 `--check` 可以通过字节/host 基线检查，但同时输出 `deployment_ready=false`、`blocker=daemon_attestation_unavailable`。正式 `--deploy` 与 `--rollback` 在生产写入、dist 交换和 kickstart 之前拒绝；生产基线仍已恢复，当前不需要回滚。另一个候选切片必须先实现长驻 daemon attestation，不能仅修改 readiness 常量来绕过该门。
+
+## Candidate.7 daemon attestation（LCB-DAEMON-13）
+
+复核入口来自主控提供的 LCB-C6-REVIEW-12 PASS 与 daemon acceptance 交接。新增私有 socket 证明与 wrapper probe/remote gate 独立；8 个公共工具和 MCP stdout 未变。`node --import TRUSTED_HOOK ROOT/dist/src/index.js` 在 entry 前注册同步捕获，每个 nextLoad 的实际 source SHA-256 存内存；固定9模块清单完整匹配 frozen baseline/payload。磁盘后来变化不重写已加载内存表。
+
+socket 只在 canonical、当前 UID、0700 目录创建，固定名称 `bridge-PID.sock`、0600、请求仅 version/nonce。最大响应32KiB；最多4个连接，每个最多256字节请求与1秒idle timeout。无路径、命令、历史或凭据操作。固定响应携带 instance_id、PID/UID/initial PPID、ps lstart、root、hook_version 与9模块哈希。nonce 只接受64位hex，新鲜 challenge 两次绑定同一 instance_id；单进程去重缓存上限256，不作跨实例历史存储。
+
+verifier 用 exact `gui/<当前uid>/com.openai.tunnel-client.lcb-remote` launchctl、ps 真实 UID/PPID/start、精确 Node --import/entry argv、lsof Bridge socket归属、socket inode/owner/mode 前后三次检查。hook外置三文件必须0500、同UID、非symlink、匹配sealed源哈希；hook目录也必须0700。PID/父子关系/start/root/nonce/instance、清单缺失/额外/hash、socket symlink/owner/mode、超限、timeout、途中换代均拒绝。该证明适用于同一UID可信边界，不提供对同UID恶意进程的OS隔离。
+
+baseline预检在任何备份/生产写入之前执行。候选部署和rollback后先通过真实 daemon gate，再运行只读remote gate，并再次绑定 daemon实例。IPC接受共享deadline/AbortSignal，超时或取消立即销毁连接，不增加独立长窗口。wrapper probe采用显式import，hook读完proof配置即从环境删除；不使用NODE_OPTIONS污染app-server。
+
+host未bootstrap时 `--check` 返回 `deployment_ready=false, blocker=daemon_bootstrap_required` 和失败daemon门；deploy/rollback继续在生产写入之前拒绝。bootstrap不能由普通deploy自行启动。
+
+`NODE scripts/daemon-bootstrap-plan.mjs ops/runbooks/daemon-bootstrap-input.json` 只生成精确契约，不写host、不重启。输入为本机候选，未来执行前live核对target与baseline。先独立核验候选与包外runner，再0700备份原wrapper bytes/mode/owner/hash、target缺省状态、production dist与精确实例；安装3个0500外置hook文件及0700私有runtime目录，原子替换wrapper，精确kickstart一次。用真实只读codex_models建立Bridge后验收旧baseline9模块、wrapper/control-plane/remote各门。失败原子恢复原wrapper，精确重启并验证旧服务，再仅删除本次拥有的hook/空目录。旧wrapper没有attestation，所以旧服务恢复证明与daemon证明分别报告；不能把旧服务健康提高为已加载字节证明。
+
+本切片没有修改host或LaunchAgent。candidate.7封存仍绑定bootstrap前host hashes；bootstrap成功后，需独立冻结新wrapper和3个hook的host hashes并封存新candidate，再进入部署。禁止覆盖candidate.7、忽略host mismatch或重算旧基线后声称原契约仍有效。

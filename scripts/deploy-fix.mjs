@@ -7,6 +7,7 @@ import { spawnSync } from 'node:child_process';
 import { verifyLive } from './verify-fix-live.mjs';
 import { remoteModels } from './remote-model-probe.mjs';
 import { safePackagePath } from './verify-package.mjs';
+import { verifyDaemon, daemonConfig } from './daemon-attestation.mjs';
 const production = process.env.LCB_PRODUCTION_ROOT;
 const agent = process.env.LCB_LAUNCH_AGENT;
 const candidate = fileURLToPath(new URL('../', import.meta.url));
@@ -14,6 +15,7 @@ const trustVerifier = process.env.LCB_TRUST_VERIFIER;
 const allowedChanged = new Set(['package.json', 'src/app-server.ts', 'src/tools.ts', 'test/runtime.test.ts', 'test/tools.test.ts', 'test/compatibility.test.ts', 'test/overflow.test.ts', 'test/overflow-codex.mjs', 'test/deploy-fix.test.ts', 'test/remote-probe.test.ts', 'scripts/deploy-fix.mjs', 'scripts/remote-model-probe.mjs', 'scripts/verify-fix-live.mjs', 'scripts/validate-fix.mjs', 'scripts/verify-package.mjs', 'scripts/runtime-load-proof.mjs']);
 allowedChanged.add('package-lock.json');
 allowedChanged.add('src/version.ts');
+for (const name of ['scripts/rollback.mjs', 'scripts/daemon-attestation.mjs', 'scripts/daemon-attestation-hook.mjs', 'scripts/daemon-bootstrap-plan.mjs', 'test/daemon-attestation.test.ts', 'test/daemon-tunnel-fixture.mjs', 'test/daemon-app-server-fixture.mjs']) allowedChanged.add(name);
 export function targetedRestart(agent, run) {
   if (!/^gui\/\d+\/com\.openai\.tunnel-client\.lcb-remote$/.test(agent ?? '')) throw new Error('Unexpected LaunchAgent target');
   return run('/bin/launchctl', ['kickstart', '-k', agent]);
@@ -29,7 +31,7 @@ export function errorClassification(error) {
   const message = String(error?.message ?? error ?? '');
   if (['deadline', 'daemon_runtime_unverified', 'control_plane_unready', 'app_server_initialization_exit_1', 'jsonl_overflow', 'transport_failure', 'history_verification_failed', 'remote_route_failed', 'verification_failed'].includes(message)) return message;
   if (/deadline|timeout|timed out|ETIMEDOUT/i.test(message)) return 'deadline';
-  if (/daemon.*proof|loaded.*instance|loaded.*runtime|runtime.*proof/i.test(message)) return 'daemon_runtime_unverified';
+  if (/daemon|loaded.*instance|loaded.*runtime|runtime.*proof/i.test(message)) return 'daemon_runtime_unverified';
   if (/control.plane/i.test(message)) return 'control_plane_unready';
   if (/app_server_initialization_exit_1/.test(message)) return 'app_server_initialization_exit_1';
   if (/JSONL|jsonl_overflow/.test(message)) return 'jsonl_overflow';
@@ -65,11 +67,11 @@ export function requireDaemonRuntime(result) {
   if (result?.ok !== true) throw new Error('Deployment health verification failed');
   if (result?.daemon_loaded_runtime?.ok !== true) throw new Error('Daemon loaded runtime proof missing');
 }
-export function deploymentRuntimeReadiness() {
-  return { deployment_ready: false, blocker: 'daemon_attestation_unavailable' };
+export function deploymentRuntimeReadiness(proof) {
+  return proof?.ok === true ? { deployment_ready: true } : { deployment_ready: false, blocker: 'daemon_bootstrap_required' };
 }
-export function requireDeploymentRuntimeReadiness() {
-  if (!deploymentRuntimeReadiness().deployment_ready) throw new Error('daemon_attestation_unavailable; production mutation not started');
+export function requireDeploymentRuntimeReadiness(proof) {
+  if (!deploymentRuntimeReadiness(proof).deployment_ready) throw new Error('daemon_bootstrap_required; production mutation not started');
 }
 export function checkHashes(root, map, label) {
   for (const [name, expected] of Object.entries(map)) {
@@ -110,6 +112,7 @@ export async function deploy(config, ops) {
   checkLinks(config.production, config.baseline_links, 'baseline');
   checkLinks(config.candidate, config.payload_links, 'payload');
   if (ops.identity) ops.identity();
+  requireDaemonRuntime(await ops.verifyBaseline());
   mkdirSync(config.backupRoot, { recursive: true, mode: 0o700 });
   const backup = mkdtempSync(join(config.backupRoot, 'deployment-'));
   const restore = join(backup, 'files');
@@ -199,9 +202,10 @@ async function main() {
   checkLinks(production, manifest.baseline_links, 'baseline');
   checkLinks(candidate, manifest.payload_links, 'payload');
   // Read-only check mode does not restart or probe production write access.
-  if (process.argv.includes('--check')) { console.log(JSON.stringify({ ok: true, mode: 'check', production, changed: manifest.changed, agent, ...deploymentRuntimeReadiness() })); return; }
-  // No daemon attestation source exists yet: fail before build, file writes or restart.
-  requireDeploymentRuntimeReadiness();
+  let baselineDaemon;
+  try { baselineDaemon = await verifyDaemon(daemonConfig(production, manifest.baseline, agent)); } catch { baselineDaemon = { ok: false, error: 'daemon_runtime_unverified' }; }
+  if (process.argv.includes('--check')) { console.log(JSON.stringify({ ok: true, mode: 'check', production, changed: manifest.changed, agent, daemon_loaded_runtime: gate(baselineDaemon), ...deploymentRuntimeReadiness(baselineDaemon) })); return; }
+  requireDeploymentRuntimeReadiness(baselineDaemon);
   const run = (command, args, timeout = 15000) => {
     const childEnv = { ...process.env, PATH: dirname(process.execPath) + ':' + process.env.PATH };
     delete childEnv.LCB_VERIFY_OPENAI_API_KEY; delete childEnv.OPENAI_API_KEY;
@@ -223,6 +227,7 @@ async function main() {
   };
   const ops = {
     identity,
+    verifyBaseline: async () => ({ ok: true, daemon_loaded_runtime: await verifyDaemon(daemonConfig(production, manifest.baseline, agent)) }),
     build: async backup => {
       const result = run(process.execPath, [join(candidate, 'scripts/validate-fix.mjs'), '--isolated', '--output', backup], 120000);
       writeFileSync(join(backup, 'validation.log'), result.stdout + result.stderr);
@@ -240,9 +245,12 @@ async function main() {
         if (result.ok) try {
           const running = instance(deadline);
           if (!restartBefore || running.pid === restartBefore.pid || result.control_plane.pid !== running.pid || result.wrapper.probe_loaded_runtime?.ok !== true) throw new Error('Replaced daemon / probe runtime identity unverified');
+          result.daemon_loaded_runtime = await verifyDaemon(daemonConfig(production, phase === 'rollback' ? manifest.baseline : manifest.payload, agent), { deadline });
+          if (result.daemon_loaded_runtime.tunnel_pid !== running.pid) throw new Error('Daemon Tunnel identity mismatch');
           result.remote_codex_models = await remoteModels({ deadline });
           if (instance(deadline).pid !== running.pid) throw new Error('Running instance changed during acceptance');
-          result.daemon_loaded_runtime = { ok: false, error: 'Daemon loaded runtime proof missing', tunnel_pid: running.pid, replaced_tunnel_pid: restartBefore.pid };
+          const acceptedDaemon = await verifyDaemon(daemonConfig(production, phase === 'rollback' ? manifest.baseline : manifest.payload, agent), { deadline });
+          if (acceptedDaemon.instance_id !== result.daemon_loaded_runtime.instance_id || acceptedDaemon.pid !== result.daemon_loaded_runtime.pid) throw new Error('Daemon Bridge replaced during remote acceptance');
         } catch (error) { result.ok = false; result.error = errorClassification(error); }
         return result;
       } });
