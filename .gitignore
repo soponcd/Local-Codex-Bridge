@@ -12,6 +12,7 @@ windows/local-settings.json
 .DS_Store
 releases/*/package/
 releases/*.tar.gz
+releases/**/*.tar.gz
 releases/trust/
 .compat-verification/
 .validation/

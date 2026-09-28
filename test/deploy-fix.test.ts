@@ -115,6 +115,19 @@ test('targeted restart uses only the frozen LaunchAgent label and kickstart', as
   for (const wrong of ['system/com.openai.tunnel-client.lcb-remote', 'gui/123/com.other', 'gui/123/com.openai.tunnel-client.lcb-remote;killall']) assert.throws(() => targetedRestart(wrong, () => assert.fail('must not execute')), /Unexpected/);
 });
 
+test('external trust verifier cannot be an alias to a package-owned file', async () => {
+  const { externalTrustPath } = await import(deployURL.href);
+  const root = mkdtempSync(join(tmpdir(), 'lcb-trust-alias-'));
+  try {
+    const pkg = join(root, 'package'); mkdirSync(pkg);
+    writeFileSync(join(pkg, 'verify.mjs'), '// untrusted package-owned verifier');
+    const alias = join(root, 'external-looking.mjs'); symlinkSync(join(pkg, 'verify.mjs'), alias);
+    assert.throws(() => externalTrustPath(pkg, alias), /physically outside/);
+    const trusted = join(root, 'trusted.mjs'); writeFileSync(trusted, '// external anchor');
+    assert.equal(externalTrustPath(pkg, trusted), (await import('node:fs')).realpathSync(trusted));
+  } finally { rmSync(root, { recursive: true }); }
+});
+
 for (const scenario of ['success', 'drift', 'missing load proof']) {
   test(`explicit rollback ${scenario} remains frozen and proves old loaded runtime`, async () => {
     const { rollback } = await import(new URL('../../scripts/rollback.mjs', import.meta.url).href);

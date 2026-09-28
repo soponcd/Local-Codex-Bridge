@@ -1,5 +1,5 @@
 // Build output is sealed; the immutable verifier and frozen root live outside it.
-import { readFileSync, writeFileSync, mkdirSync, existsSync, cpSync, readdirSync, lstatSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, existsSync, cpSync, readdirSync, realpathSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -16,6 +16,7 @@ const sha = value => createHash('sha256').update(value).digest('hex');
 const incidentAllowlist = new Set(['incidents/2026-09-28-jsonl-overflow/README.md', 'incidents/2026-09-28-jsonl-overflow/provenance.json', 'incidents/2026-09-28-jsonl-overflow/acceptance-matrix.json', 'incidents/2026-09-28-jsonl-overflow/local-validation.json', 'incidents/2026-09-28-jsonl-overflow/historical-acceptance.json']);
 const tracked = git(['ls-files', '-z']).split('\0').filter(Boolean).filter(name => !name.startsWith('releases/') && (!name.startsWith('incidents/') || incidentAllowlist.has(name)));
 mkdirSync(pkg, { recursive: true }); mkdirSync(trust, { recursive: true, mode: 0o700 });
+if (realpathSync(trust).startsWith(realpathSync(pkg) + '/') || realpathSync(trust) === realpathSync(pkg)) throw new Error('External trust path must be physically outside package');
 for (const name of tracked) { mkdirSync(dirname(join(pkg, name)), { recursive: true }); cpSync(join(root, name), join(pkg, name), { verbatimSymlinks: true }); }
 cpSync(join(root, 'dist'), join(pkg, 'dist'), { recursive: true });
 const provenance = JSON.parse(readFileSync(join(root, 'incidents/2026-09-28-jsonl-overflow/provenance.json')));

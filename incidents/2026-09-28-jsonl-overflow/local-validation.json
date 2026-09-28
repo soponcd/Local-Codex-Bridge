@@ -137,5 +137,72 @@
       }
     ]
   },
-  "scope": "isolated synthetic local validation; not production acceptance"
+  "scope": "isolated synthetic local validation; not production acceptance",
+  "final_green": {
+    "timestamp": "2026-09-28T11:01:27.194Z",
+    "node": "v26.3.1",
+    "results": [
+      {
+        "args": [
+          "run",
+          "typecheck"
+        ],
+        "status": 0,
+        "summary": [],
+        "log_sha256": "c39e12e06ad9dd1eecdedb130474a88ea42657959cd84fca64f37bd348e3d743"
+      },
+      {
+        "args": [
+          "test"
+        ],
+        "status": 0,
+        "summary": [
+          "ℹ tests 199",
+          "ℹ pass 197",
+          "ℹ fail 0",
+          "ℹ cancelled 0",
+          "ℹ skipped 2",
+          "ℹ tests 5",
+          "ℹ pass 5",
+          "ℹ fail 0",
+          "ℹ cancelled 0",
+          "ℹ skipped 0"
+        ],
+        "log_sha256": "5e23a5b8b21cd9e055e5e51331afa837d61148bdc3a4870c2b8d8f6b4f595a66"
+      },
+      {
+        "args": [
+          "--test",
+          "--test-reporter=tap",
+          "dist/test/overflow.test.js"
+        ],
+        "status": 0,
+        "summary": [
+          "# tests 11",
+          "# pass 11",
+          "# fail 0",
+          "# cancelled 0",
+          "# skipped 0"
+        ],
+        "log_sha256": "2e7e21c087c735335676c8cad5a0b04886c7ee3ad8fc3c5b3923e00ecf0c8784"
+      },
+      {
+        "args": [
+          "--test",
+          "--test-reporter=tap",
+          "dist/test/deploy-fix.test.js",
+          "dist/test/remote-probe.test.js"
+        ],
+        "status": 0,
+        "summary": [
+          "# tests 40",
+          "# pass 40",
+          "# fail 0",
+          "# cancelled 0",
+          "# skipped 0"
+        ],
+        "log_sha256": "d18d7cd698228bb35f931e8d64d122655793971c13f37f67b8b1583a80f54c72"
+      }
+    ]
+  }
 }

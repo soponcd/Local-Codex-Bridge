@@ -1,6 +1,6 @@
 // Manifest-scoped deployment. No git mutations, history writes, or broad process control.
 import { createHash } from 'node:crypto';
-import { readFileSync, writeFileSync, existsSync, mkdirSync, mkdtempSync, cpSync, renameSync, unlinkSync, readlinkSync, lstatSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, mkdtempSync, cpSync, renameSync, unlinkSync, readlinkSync, lstatSync, realpathSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { spawnSync } from 'node:child_process';
@@ -17,6 +17,11 @@ allowedChanged.add('src/version.ts');
 export function targetedRestart(agent, run) {
   if (!/^gui\/\d+\/com\.openai\.tunnel-client\.lcb-remote$/.test(agent ?? '')) throw new Error('Unexpected LaunchAgent target');
   return run('/bin/launchctl', ['kickstart', '-k', agent]);
+}
+export function externalTrustPath(candidate, verifier) {
+  const pkg = realpathSync(candidate), trusted = realpathSync(verifier);
+  if (trusted === pkg || trusted.startsWith(pkg + '/')) throw new Error('Trust verifier must be physically outside release package');
+  return trusted;
 }
 export const hashFile = file => createHash('sha256').update(readFileSync(file)).digest('hex');
 export function checkHashes(root, map, label) {
@@ -119,8 +124,8 @@ export async function deploy(config, ops) {
 async function main() {
   if (process.platform !== 'darwin' || Number(process.versions.node.split('.')[0]) < 24) throw new Error('Requires macOS and Node.js 24+');
   if (!production || !/^gui\/\d+\/com\.openai\.tunnel-client\.lcb-remote$/.test(agent ?? '') || !trustVerifier) throw new Error('Explicit LCB_PRODUCTION_ROOT, LCB_LAUNCH_AGENT and external LCB_TRUST_VERIFIER required');
-  if (resolve(trustVerifier).startsWith(resolve(candidate) + '/')) throw new Error('Trust verifier must be outside release package');
-  const { verifyAnchoredPackage } = await import(pathToFileURL(trustVerifier).href);
+  const trustedPath = externalTrustPath(candidate, trustVerifier);
+  const { verifyAnchoredPackage } = await import(pathToFileURL(trustedPath).href);
   verifyAnchoredPackage(candidate);
   const manifest = JSON.parse(readFileSync(join(candidate, 'manifest.json')));
   if (manifest.production !== production || manifest.agent !== agent) throw new Error('Target identity mismatch');
