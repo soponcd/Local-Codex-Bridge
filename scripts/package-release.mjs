@@ -13,7 +13,8 @@ if (existsSync(out) || existsSync(trust)) throw new Error('Release and trust pat
 if (trust === pkg || trust.startsWith(pkg + '/')) throw new Error('External trust path required');
 const git = args => { const r = spawnSync('git', args, { cwd: root, encoding: 'utf8' }); if (r.status !== 0) throw new Error('Git inventory failed'); return r.stdout.trim(); };
 const sha = value => createHash('sha256').update(value).digest('hex');
-const tracked = git(['ls-files', '-z']).split('\0').filter(Boolean).filter(name => !name.startsWith('releases/') && !name.startsWith('incidents/'));
+const incidentAllowlist = new Set(['incidents/2026-09-28-jsonl-overflow/README.md', 'incidents/2026-09-28-jsonl-overflow/provenance.json', 'incidents/2026-09-28-jsonl-overflow/acceptance-matrix.json', 'incidents/2026-09-28-jsonl-overflow/local-validation.json', 'incidents/2026-09-28-jsonl-overflow/historical-acceptance.json']);
+const tracked = git(['ls-files', '-z']).split('\0').filter(Boolean).filter(name => !name.startsWith('releases/') && (!name.startsWith('incidents/') || incidentAllowlist.has(name)));
 mkdirSync(pkg, { recursive: true }); mkdirSync(trust, { recursive: true, mode: 0o700 });
 for (const name of tracked) { mkdirSync(dirname(join(pkg, name)), { recursive: true }); cpSync(join(root, name), join(pkg, name), { verbatimSymlinks: true }); }
 cpSync(join(root, 'dist'), join(pkg, 'dist'), { recursive: true });
