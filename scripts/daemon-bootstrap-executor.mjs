@@ -131,6 +131,7 @@ const restoreGuard = () => {
   assert(sameMeta(meta(path.join(backup,'owned-targets.jsonl')),manifest.ownership_ledger_identity),'backup ledger identity drift');
   assert(hash(fs.readFileSync(path.join(backup,'manifest.json')))===manifestDigest,'frozen manifest mismatch');
   assert(hash(fs.readFileSync(path.join(backup,'contract.json')))===contractHash,'frozen contract mismatch');
+  if(manifest.native_preflight_evidence)assert(sameOwned(identify(manifest.native_preflight_evidence.path),manifest.native_preflight_evidence) && manifest.native_preflight_evidence.path===path.join(backup,'native-preflight.json'),'native preflight evidence identity drift');
   const bytes=fs.readFileSync(path.join(backup,'original-wrapper.bin'));
   assert(sameOwned(identify(path.join(backup,'original-wrapper.bin')),manifest.backup_wrapper_sha256_and_length),'backup wrapper identity drift');
   assert(hash(bytes)===original.sha256&&bytes.length===385&&bytes.equals(Buffer.from(original.bytes)),'frozen wrapper mismatch');

@@ -115,6 +115,9 @@ test('prepare binds native preflight evidence outside scratch and retains exactl
     assert.equal(manifest.preflight.native_preflight.cleanup.ok, true);
     assert.equal(fs.readFileSync(path.join(result.backup, 'owned-targets.jsonl'), 'utf8').trim().split('\n').length, 2);
     assert.deepEqual(fs.readFileSync(f.wrapper), f.originalBytes);
+    f.write(evidence.path, '{}\n');
+    const rejected = await runBootstrap({ ...f.args, backupPath: result.backup, manifestHash: result.manifest_sha256 });
+    assert.equal(rejected.status, 'blocked'); assert.equal(rejected.host_target_mutations, false); assert.match(rejected.error_classification, /native preflight evidence/); assert.equal(f.kicks, 0);
   } finally { f.cleanup(); }
 });
 
