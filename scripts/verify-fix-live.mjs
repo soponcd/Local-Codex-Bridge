@@ -8,8 +8,13 @@ const healthFile = process.env.LCB_HEALTH_URL_FILE;
 const cli = process.env.CODEX_EXE;
 const historyId = process.env.LCB_TEST_HISTORY_ID;
 const rollout = process.env.LCB_TEST_HISTORY_FILE;
-const streamHash = async file => { const hash = createHash('sha256'); for await (const b of createReadStream(file)) hash.update(b); return hash.digest('hex'); };
-async function mcp(command, args, history, environment = {}, runtimeProof) {
+const streamHash = async (file, deadline) => { const hash = createHash('sha256'); for await (const b of createReadStream(file)) { remaining(deadline, 5000); hash.update(b); } return hash.digest('hex'); };
+const remaining = (deadline, cap) => {
+  const ms = Math.min(cap, (deadline ?? Infinity) - Date.now());
+  if (ms <= 0) throw new Error('Verification deadline');
+  return Math.max(1, Math.trunc(ms));
+};
+async function mcp(command, args, history, environment = {}, runtimeProof, deadline) {
   const childEnv = { ...process.env, ...environment, CODEX_EXE: cli };
   delete childEnv.LCB_VERIFY_OPENAI_API_KEY;
   delete childEnv.OPENAI_API_KEY;
@@ -17,12 +22,15 @@ async function mcp(command, args, history, environment = {}, runtimeProof) {
   delete childEnv.NODE_OPTIONS;
   const proof = runtimeProof ? createRuntimeProof(runtimeProof.root, runtimeProof.hashes) : null;
   if (proof) { childEnv.LCB_RUNTIME_PROOF_CONFIG = proof.config; childEnv.NODE_OPTIONS = '--import=' + fileURLToPath(new URL('./runtime-load-proof.mjs', import.meta.url)); }
+  const budget = remaining(deadline, 45000);
   const child = spawn(command, args, { stdio: ['pipe', 'pipe', 'pipe'], env: childEnv });
+  const lifetime = setTimeout(() => child.kill('SIGKILL'), budget);
   let buffer = Buffer.alloc(0), next = 0, stderrBytes = 0, protocolError = false;
   const pending = new Map();
   child.stderr.on('data', b => { stderrBytes += b.length; });
   const fail = () => { protocolError = true; for (const p of pending.values()) { clearTimeout(p.timer); p.reject(new Error('MCP transport failure')); } pending.clear(); };
   child.on('error', fail);
+  child.stdin.on('error', fail);
   const exit = new Promise(resolve => child.once('close', (code, signal) => { fail(); resolve({ code, signal }); }));
   child.stdout.on('data', b => {
     buffer = Buffer.concat([buffer, b]);
@@ -34,7 +42,7 @@ async function mcp(command, args, history, environment = {}, runtimeProof) {
   });
   const request = (method, params) => new Promise((resolve, reject) => {
     const id = ++next;
-    const timer = setTimeout(() => { pending.delete(id); reject(new Error('MCP response deadline')); }, 10000);
+    const timer = setTimeout(() => { pending.delete(id); reject(new Error('MCP response deadline')); }, remaining(deadline, 10000));
     pending.set(id, { resolve, reject, timer });
     child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
   });
@@ -59,21 +67,21 @@ async function mcp(command, args, history, environment = {}, runtimeProof) {
     summary.initialize = true; summary.tools = 8; summary.models = 1;
     if (history) {
       if (!historyId || !rollout || process.env.LCB_ALLOW_HISTORY_VERIFICATION !== '1') throw new Error('Explicit isolated history fixture authorization required');
-      const size = statSync(rollout).size, before = await streamHash(rollout);
+      const size = statSync(rollout).size, before = await streamHash(rollout, deadline);
       const rejected = await request('tools/call', { name: 'codex_threads', arguments: { thread_id: historyId, include_turns: true } });
       if (rejected.result?.isError !== true || !/latest_messages/.test(rejected.result.content?.[0]?.text ?? '')) throw new Error('Unbounded history was not rejected');
       const recent = await call('codex_threads', { thread_id: historyId, include_turns: true, latest_messages: 1 });
       if (recent.thread?.id !== historyId || recent.history_available !== false || recent.recent_messages?.available !== true || recent.recent_messages.messages.length > 1) throw new Error('Bounded native history regression failed');
       const observed = await call('codex_observe', { thread_id: historyId });
       if (observed.terminal !== null || observed.history_available !== false) throw new Error('Observe metadata degradation failed');
-      const after = await streamHash(rollout);
+      const after = await streamHash(rollout, deadline);
       if (before !== after) throw new Error('History file changed during read-only regression');
       summary.history = { thread_id: historyId, bytes: size, sha256_before: before, sha256_after: after, unbounded_rejected: true, available: true, count: recent.recent_messages.messages.length, pages: recent.recent_messages.pages_read, observe_metadata_only: true };
     }
-    if (proof) summary.runtime_proof = readRuntimeProof(proof, child.pid);
+    if (proof) summary.probe_loaded_runtime = { ...readRuntimeProof(proof, child.pid), scope: 'short_lived_wrapper_probe', daemon_bound: false };
     summary.ok = true;
   } catch (error) { summary.error = error.message; }
-  finally { child.stdin.end(); const deadline = setTimeout(() => child.kill('SIGTERM'), 5000); summary.exit = await exit; clearTimeout(deadline); summary.stderr_bytes = stderrBytes; if (summary.exit.code !== 0 || buffer.length) summary.ok = false; }
+  finally { child.stdin.end(); const cleanup = setTimeout(() => child.kill('SIGKILL'), Math.max(1, Math.min(5000, (deadline ?? Infinity) - Date.now()))); summary.exit = await exit; clearTimeout(cleanup); clearTimeout(lifetime); summary.stderr_bytes = stderrBytes; if (summary.exit.code !== 0 || buffer.length) summary.ok = false; }
   return summary;
 }
 export async function verifyLive(options = {}) {
@@ -82,13 +90,20 @@ export async function verifyLive(options = {}) {
     if (!healthFile || !cli || !process.env.LCB_TUNNEL_CLIENT || !process.env.LCB_PID_FILE || (options.wrapper && !process.env.LCB_STDIO_WRAPPER)) throw new Error('Explicit host verification paths required');
     const base = readFileSync(healthFile, 'utf8').trim();
     if (!/^http:\/\/127\.0\.0\.1:\d+\/?$/.test(base)) throw new Error('Unexpected health URL');
-    for (const name of ['healthz', 'readyz']) { const r = await fetch(base.replace(/\/$/, '') + '/' + name, { signal: AbortSignal.timeout(5000) }); result[name] = { ok: r.status === 200, status: r.status }; await r.body?.cancel(); }
-    const poll = spawnSync(process.env.LCB_TUNNEL_CLIENT, ['health', '--url-file', healthFile, '--pid-file', process.env.LCB_PID_FILE, '--require-control-plane-poll', '--json'], { encoding: 'utf8', timeout: 10000 });
+    for (const name of ['healthz', 'readyz']) {
+      try { const r = await fetch(base.replace(/\/$/, '') + '/' + name, { signal: AbortSignal.timeout(remaining(options.deadline, 5000)) }); result[name] = { ok: r.status === 200, status: r.status }; await r.body?.cancel(); }
+      catch { result[name] = { ok: false, error: 'Health request deadline or transport failure' }; }
+    }
+    const poll = spawnSync(process.env.LCB_TUNNEL_CLIENT, ['health', '--url-file', healthFile, '--pid-file', process.env.LCB_PID_FILE, '--require-control-plane-poll', '--json'], { encoding: 'utf8', timeout: remaining(options.deadline, 10000), killSignal: 'SIGKILL', maxBuffer: 1024 * 1024 });
     let health; try { health = JSON.parse(poll.stdout); } catch {}
-    result.control_plane = { ok: poll.status === 0 && health?.control_plane_poll?.ok === true, pid: health?.process?.pid, last_poll: health?.control_plane_poll?.value };
-    if (options.wrapper) result.wrapper = await mcp(process.env.LCB_STDIO_WRAPPER, [], false, options.environment, options.runtimeProof);
-    if (options.history) result.candidate_history = await mcp(process.execPath, [join(options.candidate, 'dist/src/index.js')], true, options.environment);
-    result.ok = result.healthz.ok && result.readyz.ok && result.control_plane.ok && (!options.wrapper || result.wrapper.ok) && (!options.history || result.candidate_history.ok);
+    result.control_plane = { ok: poll.status === 0 && health?.control_plane_poll?.ok === true, pid: Number.isSafeInteger(health?.process?.pid) ? health.process.pid : undefined };
+    if (!result.control_plane.ok) result.control_plane.error = poll.error?.code === 'ETIMEDOUT' ? 'Control plane deadline' : 'Control plane unready';
+    // Do not repeatedly spawn expensive probes while the outer control plane is unready.
+    if (result.healthz.ok && result.readyz.ok && result.control_plane.ok) {
+      if (options.wrapper) result.wrapper = await mcp(process.env.LCB_STDIO_WRAPPER, [], false, options.environment, options.runtimeProof, options.deadline);
+      if (options.history) result.candidate_history = await mcp(process.execPath, [join(options.candidate, 'dist/src/index.js')], true, options.environment, undefined, options.deadline);
+    }
+    result.ok = result.healthz.ok && result.readyz.ok && result.control_plane.ok && (!options.wrapper || result.wrapper?.ok === true) && (!options.history || result.candidate_history?.ok === true);
   } catch (error) { result.ok = false; result.error = error.message; }
   return result;
 }

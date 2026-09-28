@@ -3,7 +3,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { checkHashes, hashFile, nativeSwap, targetedRestart, validateChanged, externalTrustPath } from './deploy-fix.mjs';
+import { checkHashes, hashFile, nativeSwap, targetedRestart, validateChanged, externalTrustPath, requireDaemonRuntime, requireDeploymentRuntimeReadiness, verifyWithRetries, verificationSummary } from './deploy-fix.mjs';
 import { safePackagePath } from './verify-package.mjs';
 import { verifyLive } from './verify-fix-live.mjs';
 import { remoteModels } from './remote-model-probe.mjs';
@@ -32,8 +32,9 @@ export async function rollback(config, ops) {
     checkHashes(config.production, old, 'restored baseline');
     await ops.restart();
     const verification = await ops.verify(old);
-    if (verification?.ok !== true || verification?.loaded_instance?.ok !== true) throw new Error('Old loaded instance proof missing');
-    const receipt = { rolled_back: true, backup: config.backup, displaced_runtime: stage, verification };
+    if (verification?.ok !== true) throw new Error('Rollback health verification failed');
+    requireDaemonRuntime(verification);
+    const receipt = { rolled_back: true, backup: config.backup, displaced_runtime: stage, verification: verificationSummary(verification) };
     writeFileSync(join(stageRoot, 'rollback-receipt.json'), JSON.stringify(receipt, null, 2));
     return receipt;
   } catch (error) {
@@ -51,21 +52,25 @@ async function main() {
   const contractBytes = readFileSync(contract);
   if (createHash('sha256').update(contractBytes).digest('hex') !== anchor) throw new Error('Frozen external rollback contract required');
   const config = JSON.parse(contractBytes);
-  const run = (cmd, args) => { const r = spawnSync(cmd, args, { encoding: 'utf8', timeout: 10000 }); if (r.status !== 0) throw new Error('Target command failed'); return r; };
-  const instance = () => { const r = run('/bin/launchctl', ['print', config.agent]); const pid = Number(r.stdout.match(/^\s*pid = (\d+)$/m)?.[1]); if (!pid) throw new Error('LaunchAgent running identity missing'); return pid; };
+  requireDeploymentRuntimeReadiness();
+  const run = (cmd, args, timeout = 10000) => { const r = spawnSync(cmd, args, { encoding: 'utf8', timeout }); if (r.status !== 0) throw new Error('Target command failed'); return r; };
+  const instance = (deadline = Infinity) => { const budget = Math.min(10000, deadline - Date.now()); if (budget <= 0) throw new Error('Daemon identity deadline'); const r = run('/bin/launchctl', ['print', config.agent], budget); const pid = Number(r.stdout.match(/^\s*pid = (\d+)$/m)?.[1]); if (!pid) throw new Error('LaunchAgent running identity missing'); return pid; };
   let previous;
   const receipt = await rollback(config, {
     identity: () => { for (const [path, hash] of Object.entries(config.host_code_hashes ?? {})) if (hashFile(path) !== hash) throw new Error('Host identity changed'); },
     swap: nativeSwap,
     restart: async () => { previous = instance(); targetedRestart(config.agent, run); },
     verify: async old => {
-      const deadline = Date.now() + 45000;
-      do {
-        const result = await verifyLive({ wrapper: true, runtimeProof: { root: config.production, hashes: old } });
-        if (result.ok && result.wrapper.runtime_proof?.ok && instance() !== previous) { result.remote_codex_models = await remoteModels(); result.loaded_instance = result.wrapper.runtime_proof; return result; }
-        await new Promise(resolve => setTimeout(resolve, 250));
-      } while (Date.now() < deadline);
-      throw new Error('Rollback loaded-instance verification deadline');
+      const result = await verifyWithRetries('rollback', { verify: async ({ deadline }) => {
+        const result = await verifyLive({ wrapper: true, deadline, runtimeProof: { root: config.production, hashes: old } });
+        if (result.ok && result.wrapper.probe_loaded_runtime?.ok && instance(deadline) !== previous) {
+          result.remote_codex_models = await remoteModels({ deadline });
+          result.daemon_loaded_runtime = { ok: false, error: 'Daemon loaded runtime proof missing' };
+        } else result.ok = false;
+        return result;
+      } });
+      requireDaemonRuntime(result);
+      return result;
     },
   });
   console.log(JSON.stringify(receipt));

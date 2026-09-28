@@ -24,6 +24,53 @@ export function externalTrustPath(candidate, verifier) {
   return trusted;
 }
 export const hashFile = file => createHash('sha256').update(readFileSync(file)).digest('hex');
+// Receipts contain only fixed classifications and explicitly projected scalars.
+export function errorClassification(error) {
+  const message = String(error?.message ?? error ?? '');
+  if (['deadline', 'daemon_runtime_unverified', 'control_plane_unready', 'app_server_initialization_exit_1', 'jsonl_overflow', 'transport_failure', 'history_verification_failed', 'remote_route_failed', 'verification_failed'].includes(message)) return message;
+  if (/deadline|timeout|timed out|ETIMEDOUT/i.test(message)) return 'deadline';
+  if (/daemon.*proof|loaded.*instance|loaded.*runtime|runtime.*proof/i.test(message)) return 'daemon_runtime_unverified';
+  if (/control.plane/i.test(message)) return 'control_plane_unready';
+  if (/app_server_initialization_exit_1/.test(message)) return 'app_server_initialization_exit_1';
+  if (/JSONL|jsonl_overflow/.test(message)) return 'jsonl_overflow';
+  if (/transport/i.test(message)) return 'transport_failure';
+  if (/history/i.test(message)) return 'history_verification_failed';
+  if (/remote/i.test(message)) return 'remote_route_failed';
+  return 'verification_failed';
+}
+const number = value => Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+const gate = value => ({ state: value == null ? 'not_run' : value.ok === true ? 'passed' : 'failed', ...(value?.error ? { error_classification: errorClassification(value.error) } : {}) });
+export function verificationSummary(result = {}) {
+  const summary = { ok: result.ok === true, body_recorded: false, healthz: { ...gate(result.healthz), status: number(result.healthz?.status) }, readyz: { ...gate(result.readyz), status: number(result.readyz?.status) }, control_plane: { ...gate(result.control_plane), pid: number(result.control_plane?.pid) }, wrapper: gate(result.wrapper), history: gate(result.candidate_history), probe_loaded_runtime: gate(result.wrapper?.probe_loaded_runtime), daemon_loaded_runtime: gate(result.daemon_loaded_runtime), remote_codex_models: gate(result.remote_codex_models) };
+  if (result.error) summary.error_classification = errorClassification(result.error);
+  return summary;
+}
+export const verificationPolicy = Object.freeze({ window_ms: 90000, max_attempts: 18, retry_interval_ms: 5000 });
+export async function verifyWithRetries(phase, ops, policy = verificationPolicy) {
+  const now = ops.now ?? Date.now, sleep = ops.sleep ?? (ms => new Promise(resolve => setTimeout(resolve, ms)));
+  const started = now(), deadline = started + policy.window_ms;
+  for (let attempt = 1; attempt <= policy.max_attempts && now() < deadline; attempt++) {
+    let result;
+    try { result = await ops.verify({ deadline }); } catch (error) { result = { ok: false, error: errorClassification(error) }; }
+    const elapsed = now() - started;
+    const accepted = result.ok === true && elapsed < policy.window_ms;
+    ops.onAttempt?.({ phase: phase === 'rollback' ? 'rollback' : 'deployed', attempt, elapsed_ms: Math.max(0, Math.trunc(elapsed)), ...verificationSummary({ ...result, ok: accepted }) });
+    if (accepted) return result;
+    if (attempt < policy.max_attempts && now() < deadline) await sleep(Math.min(policy.retry_interval_ms, deadline - now()));
+  }
+  throw new Error('Deployment verification deadline');
+}
+export function requireDaemonRuntime(result) {
+  // Probe module bytes are not evidence for the long-lived Tunnel Bridge child.
+  if (result?.ok !== true) throw new Error('Deployment health verification failed');
+  if (result?.daemon_loaded_runtime?.ok !== true) throw new Error('Daemon loaded runtime proof missing');
+}
+export function deploymentRuntimeReadiness() {
+  return { deployment_ready: false, blocker: 'daemon_attestation_unavailable' };
+}
+export function requireDeploymentRuntimeReadiness() {
+  if (!deploymentRuntimeReadiness().deployment_ready) throw new Error('daemon_attestation_unavailable; production mutation not started');
+}
 export function checkHashes(root, map, label) {
   for (const [name, expected] of Object.entries(map)) {
     const file = safePackagePath(root, name);
@@ -89,14 +136,23 @@ export async function deploy(config, ops) {
   const installed = [];
   let swapped = false;
   let restartAttempted = false;
+  const verificationAttempts = [];
+  const recordAttempt = row => {
+    if (verificationAttempts.length >= verificationPolicy.max_attempts * 2) return;
+    // Re-project even adapter-provided attempts; never persist arbitrary fields.
+    const gates = Object.fromEntries(['healthz', 'readyz', 'control_plane', 'wrapper', 'history', 'probe_loaded_runtime', 'daemon_loaded_runtime', 'remote_codex_models'].map(name => [name, { state: ['passed', 'failed', 'not_run'].includes(row[name]?.state) ? row[name].state : 'not_run', ...(row[name]?.error_classification ? { error_classification: errorClassification(row[name].error_classification) } : {}), ...(name === 'healthz' || name === 'readyz' ? { status: number(row[name]?.status) } : {}), ...(name === 'control_plane' ? { pid: number(row[name]?.pid) } : {}) }]));
+    verificationAttempts.push({ phase: row.phase === 'rollback' ? 'rollback' : 'deployed', attempt: number(row.attempt), elapsed_ms: number(row.elapsed_ms), ok: row.ok === true, body_recorded: false, ...gates, ...(row.error_classification ? { error_classification: errorClassification(row.error_classification) } : {}) });
+    writeFileSync(join(backup, 'verification-attempts.json'), JSON.stringify(verificationAttempts, null, 2), { mode: 0o600 });
+  };
   try {
     for (const name of config.changed) { validateChanged(config); atomicFile(safePackagePath(config.candidate, name), safePackagePath(config.production, name)); installed.push(name); }
     ops.swap(join(config.production, 'dist'), stage);
     swapped = true;
     restartAttempted = true;
     await ops.restart();
-    const verification = await ops.verify('deployed');
-    const result = { deployed: true, backup, priorRuntime: stage, verification };
+    const verification = await ops.verify('deployed', recordAttempt);
+    requireDaemonRuntime(verification);
+    const result = { deployed: true, backup, priorRuntime: stage, verification: verificationSummary(verification), verification_attempts: verificationAttempts };
     writeFileSync(join(backup, 'result.json'), JSON.stringify(result, null, 2));
     return result;
   } catch (error) {
@@ -113,11 +169,12 @@ export async function deploy(config, ops) {
     if (restartAttempted && rollbackErrors.length === 0) try { await ops.restart(); } catch (e) { rollbackErrors.push('rollback restart uncertain: ' + e.message); }
     let rollbackHealth;
     if (restartAttempted) try {
-      rollbackHealth = await ops.verify('rollback');
-      if (rollbackHealth?.ok !== true || rollbackHealth?.loaded_instance?.ok !== true) throw new Error('Old loaded instance proof missing');
+      rollbackHealth = await ops.verify('rollback', recordAttempt);
+      if (rollbackHealth?.ok !== true) throw new Error('Rollback health verification failed');
+      requireDaemonRuntime(rollbackHealth);
     } catch (e) { rollbackErrors.push('rollback runtime unverified: ' + e.message); }
     const manualRecoveryRequired = rollbackErrors.length > 0;
-    writeFileSync(join(backup, 'result.json'), JSON.stringify({ deployed: false, error: error.message, restart_attempted: restartAttempted, rolled_back: !manualRecoveryRequired, manual_recovery_required: manualRecoveryRequired, rollbackErrors, rollbackHealth }, null, 2));
+    writeFileSync(join(backup, 'result.json'), JSON.stringify({ deployed: false, error_classification: errorClassification(error), restart_attempted: restartAttempted, rolled_back: !manualRecoveryRequired, manual_recovery_required: manualRecoveryRequired, rollbackErrors: rollbackErrors.map(errorClassification), rollbackHealth: rollbackHealth ? verificationSummary(rollbackHealth) : undefined, verification_attempts: verificationAttempts }, null, 2), { mode: 0o600 });
     throw new Error(error.message + (manualRecoveryRequired ? '; MANUAL_RECOVERY_REQUIRED; ' + rollbackErrors.join('; ') : '; rollback completed') + '; backup=' + backup);
   }
 }
@@ -142,7 +199,9 @@ async function main() {
   checkLinks(production, manifest.baseline_links, 'baseline');
   checkLinks(candidate, manifest.payload_links, 'payload');
   // Read-only check mode does not restart or probe production write access.
-  if (process.argv.includes('--check')) { console.log(JSON.stringify({ ok: true, mode: 'check', production, changed: manifest.changed, agent })); return; }
+  if (process.argv.includes('--check')) { console.log(JSON.stringify({ ok: true, mode: 'check', production, changed: manifest.changed, agent, ...deploymentRuntimeReadiness() })); return; }
+  // No daemon attestation source exists yet: fail before build, file writes or restart.
+  requireDeploymentRuntimeReadiness();
   const run = (command, args, timeout = 15000) => {
     const childEnv = { ...process.env, PATH: dirname(process.execPath) + ':' + process.env.PATH };
     delete childEnv.LCB_VERIFY_OPENAI_API_KEY; delete childEnv.OPENAI_API_KEY;
@@ -154,8 +213,10 @@ async function main() {
   if (!baselineHealth.ok) throw new Error('Baseline health failed; deployment not started');
   const remoteBefore = await remoteModels();
   let restartBefore;
-  const instance = () => {
-    const read = run('/bin/launchctl', ['print', agent]);
+  const instance = (deadline = Infinity) => {
+    const budget = Math.min(15000, deadline - Date.now());
+    if (budget <= 0) throw new Error('Daemon identity deadline');
+    const read = run('/bin/launchctl', ['print', agent], budget);
     const pid = Number(read.stdout.match(/^\s*pid = (\d+)$/m)?.[1]);
     if (!pid || !/^\s*state = running$/m.test(read.stdout)) throw new Error('Target LaunchAgent running instance unverified');
     return { pid };
@@ -173,22 +234,20 @@ async function main() {
     },
     swap: nativeSwap,
     restart: async () => { restartBefore = instance(); targetedRestart(agent, run); },
-    verify: async phase => {
-      const deadline = Date.now() + 45000;
-      do {
-        const result = await verifyLive({ wrapper: true, history: phase !== 'rollback', candidate: production, runtimeProof: { root: production, hashes: phase === 'rollback' ? manifest.baseline : manifest.payload } });
-        if (result.ok) {
-          const running = instance();
-          if (!restartBefore || running.pid === restartBefore.pid || result.control_plane.pid !== running.pid || result.wrapper.runtime_proof?.ok !== true) throw new Error('Replaced daemon / loaded Bridge instance unverified');
-          result.remote_codex_models = await remoteModels();
-          if (instance().pid !== running.pid) throw new Error('Running instance changed during acceptance');
-          result.loaded_instance = { ...result.wrapper.runtime_proof, tunnel_pid: running.pid, replaced_tunnel_pid: restartBefore.pid };
-          return result;
-        }
-        // Poll readiness with a deadline, never assume a fixed delay means success.
-        await new Promise(resolve => setTimeout(resolve, 500));
-      } while (Date.now() < deadline);
-      throw new Error('Deployment health/wrapper/history verification failed');
+    verify: async (phase, onAttempt) => {
+      const result = await verifyWithRetries(phase, { onAttempt, verify: async ({ deadline }) => {
+        const result = await verifyLive({ wrapper: true, history: phase !== 'rollback', candidate: production, deadline, runtimeProof: { root: production, hashes: phase === 'rollback' ? manifest.baseline : manifest.payload } });
+        if (result.ok) try {
+          const running = instance(deadline);
+          if (!restartBefore || running.pid === restartBefore.pid || result.control_plane.pid !== running.pid || result.wrapper.probe_loaded_runtime?.ok !== true) throw new Error('Replaced daemon / probe runtime identity unverified');
+          result.remote_codex_models = await remoteModels({ deadline });
+          if (instance(deadline).pid !== running.pid) throw new Error('Running instance changed during acceptance');
+          result.daemon_loaded_runtime = { ok: false, error: 'Daemon loaded runtime proof missing', tunnel_pid: running.pid, replaced_tunnel_pid: restartBefore.pid };
+        } catch (error) { result.ok = false; result.error = errorClassification(error); }
+        return result;
+      } });
+      requireDaemonRuntime(result);
+      return result;
     },
   };
   if (!process.env.LCB_BACKUP_ROOT) throw new Error('Explicit LCB_BACKUP_ROOT required');

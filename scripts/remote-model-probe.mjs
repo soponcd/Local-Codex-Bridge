@@ -5,7 +5,7 @@ import { spawn } from 'node:child_process';
 import { StringDecoder } from 'node:string_decoder';
 import { homedir } from 'node:os';
 const tool = 'local_codex_bridge.codex_models';
-export async function remoteModels({ authPath = path.join(homedir(), '.codex/auth.json'), spawnImpl = spawn, timeoutMs = 20000, env = process.env, cli = env.CODEX_EXE } = {}) {
+export async function remoteModels({ authPath = path.join(homedir(), '.codex/auth.json'), spawnImpl = spawn, timeoutMs = 20000, deadline = Infinity, env = process.env, cli = env.CODEX_EXE } = {}) {
   if (!cli) throw new Error('Explicit CODEX_EXE required for remote verification');
   let auth;
   try { auth = JSON.parse(fs.readFileSync(authPath, 'utf8')); } catch { throw new Error('Existing ChatGPT connector login unavailable'); }
@@ -47,7 +47,9 @@ export async function remoteModels({ authPath = path.join(homedir(), '.codex/aut
     });
     const request = (method, params) => new Promise((resolve, reject) => {
       if (fatal) { reject(fatal); return; }
-      const id = ++next, timer = setTimeout(() => fail(new Error('Native connector deadline: ' + method)), timeoutMs);
+      const budget = Math.min(timeoutMs, deadline - Date.now());
+      if (budget <= 0) { reject(new Error('Native connector acceptance deadline')); return; }
+      const id = ++next, timer = setTimeout(() => fail(new Error('Native connector deadline: ' + method)), budget);
       pending.set(id, { resolve, reject, timer });
       child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
     });
@@ -57,7 +59,7 @@ export async function remoteModels({ authPath = path.join(homedir(), '.codex/aut
     const threadId = started?.thread?.id;
     if (!threadId) throw new Error('Native connector ephemeral context unavailable');
     let apps;
-    const readyDeadline = Date.now() + timeoutMs;
+    const readyDeadline = Math.min(Date.now() + timeoutMs, deadline);
     do {
       const status = await request('mcpServerStatus/list', { threadId, limit: 20, detail: 'toolsAndAuthOnly' });
       apps = status?.data?.find(s => s.name === 'codex_apps');

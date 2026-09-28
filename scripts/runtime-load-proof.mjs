@@ -13,9 +13,9 @@ export function createRuntimeProof(root, hashes, scratch = '/private/tmp') {
   return proof;
 }
 export function readRuntimeProof(proof, pid) {
-  let receipt; try { receipt = JSON.parse(readFileSync(proof.receipt, 'utf8')); } catch { throw new Error('Loaded instance proof missing'); }
-  if (receipt.pid !== pid || receipt.root !== proof.root || receipt.failure || !receipt.loaded['dist/src/index.js'] || !receipt.loaded['dist/src/app-server.js']) throw new Error('Loaded instance proof mismatch');
-  for (const [name, digest] of Object.entries(receipt.loaded)) if (proof.expected[name] !== digest) throw new Error('Loaded instance proof byte mismatch');
+  let receipt; try { receipt = JSON.parse(readFileSync(proof.receipt, 'utf8')); } catch { throw new Error('Probe loaded runtime proof missing'); }
+  if (receipt.pid !== pid || receipt.root !== proof.root || receipt.failure || !receipt.loaded['dist/src/index.js'] || !receipt.loaded['dist/src/app-server.js']) throw new Error('Probe loaded runtime proof mismatch');
+  for (const [name, digest] of Object.entries(receipt.loaded)) if (proof.expected[name] !== digest) throw new Error('Probe loaded runtime proof byte mismatch');
   return { ok: true, pid, root: proof.root, loaded_sha256: receipt.loaded, body_recorded: false };
 }
 if (process.env.LCB_RUNTIME_PROOF_CONFIG) {

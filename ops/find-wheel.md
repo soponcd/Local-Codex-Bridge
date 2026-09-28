@@ -12,3 +12,7 @@
 | 增长期 | 单用户维护fork需跟踪upstream差异，Native协议变更需独立兼容评估，无新供应商锁定 |
 
 Phase1已找到直接匹配方案，停止，不进入学术Phase2。成本实际用量unknown，不声称已节省固定比例。
+
+## Stage E diagnostic repair (LCB-STAGEE-FIX-11)
+
+复用既有 manifest-scoped deploy/verifyLive 和 Node 内置有界超时，无新增重试库、服务或持久任务系统。官方接口来源：[AbortSignal.timeout](https://nodejs.org/api/globals.html#static-method-abortsignaltimeoutdelay)、[spawnSync timeout/killSignal](https://nodejs.org/api/child_process.html#child_processspawnsynccommand-args-options)。仅对部署后的只读健康门重试，不重放 mutation 或 restart。开发期成本是小范围诊断投影和虚拟时钟测试；上线日无新增依赖或费用；增长期仍是单用户有界窗口，无新锁定。实际用量 unknown。

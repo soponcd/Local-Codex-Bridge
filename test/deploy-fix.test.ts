@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { existsSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, renameSync, cpSync, symlinkSync, appendFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, renameSync, cpSync, symlinkSync, appendFileSync, readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
+import { createServer } from 'node:http';
 const deployURL = new URL('../../scripts/deploy-fix.mjs', import.meta.url);
 const hash = (text: string) => createHash('sha256').update(text).digest('hex');
 for (const scenario of ['success', 'baseline mismatch', 'payload mismatch', 'restart denied', 'restart nonzero', 'restart timeout', 'rollback restart timeout', 'rollback missing load proof', 'rollback health fails', 'unhealthy', 'build fails', 'fresh build', 'remote fails', 'swap fails']) {
@@ -48,7 +49,7 @@ for (const scenario of ['success', 'baseline mismatch', 'payload mismatch', 'res
           if (scenario === 'rollback health fails' && phase === 'rollback') throw new Error('rollback health fails');
           if (scenario === 'remote fails' && phase !== 'rollback') throw new Error('remote fails');
           if (scenario === 'rollback missing load proof' && phase === 'rollback') return { ok: true };
-          return { ok: true, loaded_instance: { ok: true, pid: 123, loaded_sha256: hash('old-runtime') } };
+          return { ok: true, daemon_loaded_runtime: { ok: true, pid: 123, loaded_sha256: hash('old-runtime') } };
         },
       };
       if (scenario === 'success' || scenario === 'fresh build') {
@@ -146,7 +147,7 @@ for (const scenario of ['success', 'drift', 'missing load proof', 'backup baseli
       if (scenario === 'backup baseline tampered') writeFileSync(join(backup, 'baseline.json'), JSON.stringify({ 'package.json': hash('evil'), 'dist/index.js': hash('old-runtime') }));
       let restarts = 0;
       const config = { production, backup, backup_baseline_sha256: frozenBaseline, changed: ['package.json'], expected_current: { 'package.json': hash('new'), 'dist/index.js': hash('new-runtime') } };
-      const ops = { swap: (a: string, b: string) => { const tmp = a + '.swap'; renameSync(a, tmp); renameSync(b, a); renameSync(tmp, b); }, restart: async () => { restarts++; }, verify: async () => scenario === 'missing load proof' ? { ok: true } : { ok: true, loaded_instance: { ok: true } } };
+      const ops = { swap: (a: string, b: string) => { const tmp = a + '.swap'; renameSync(a, tmp); renameSync(b, a); renameSync(tmp, b); }, restart: async () => { restarts++; }, verify: async () => scenario === 'missing load proof' ? { ok: true } : { ok: true, daemon_loaded_runtime: { ok: true } } };
       if (scenario === 'success') { assert.equal((await rollback(config, ops)).rolled_back, true); assert.equal(restarts, 1); }
       else {
         const error = scenario === 'drift' ? /current rollback baseline mismatch/ : scenario === 'backup baseline tampered' ? /Frozen backup baseline digest mismatch/ : scenario === 'backup payload tampered' ? /backup mismatch/ : /MANUAL_RECOVERY_REQUIRED/;
@@ -215,9 +216,135 @@ test('actual Node module load proves old runtime bytes and rejects replacement b
     const first = run(); assert.equal(first.status, 0, first.stderr);
     const receipt = JSON.parse(readFileSync(proof.receipt, 'utf8'));
     assert.equal(readRuntimeProof(proof, receipt.pid).ok, true);
-    assert.throws(() => readRuntimeProof(proof, receipt.pid + 1), /instance proof/);
+    assert.throws(() => readRuntimeProof(proof, receipt.pid + 1), /runtime proof/);
     writeFileSync(join(root, 'dist/src/index.js'), "console.log('different version');\n");
     assert.notEqual(run().status, 0);
-    assert.throws(() => readRuntimeProof(proof, receipt.pid), /instance proof/);
+    assert.throws(() => readRuntimeProof(proof, receipt.pid), /runtime proof/);
   } finally { rmSync(root, { recursive: true }); }
+});
+
+test('control-plane 35-second timeout can recover after the former 45-second window', async () => {
+  const { verifyWithRetries } = await import(deployURL.href);
+  let clock = 0, calls = 0;
+  const attempts: any[] = [];
+  const result = await verifyWithRetries('deployed', {
+    now: () => clock, sleep: async (ms: number) => { clock += ms; }, onAttempt: (row: any) => attempts.push(row),
+    verify: async () => {
+      calls++;
+      if (calls === 1) { clock += 35000; return { ok: false, healthz: { ok: true, status: 200 }, readyz: { ok: true, status: 200 }, control_plane: { ok: false, error: 'Control plane deadline' } }; }
+      clock += 10000;
+      return { ok: true, healthz: { ok: true, status: 200 }, readyz: { ok: true, status: 200 }, control_plane: { ok: true, pid: 12 }, wrapper: { ok: true, probe_loaded_runtime: { ok: true } }, candidate_history: { ok: true } };
+    },
+  });
+  assert.equal(result.ok, true);
+  assert.equal(clock, 50000);
+  assert.equal(attempts.length, 2);
+  assert.equal(attempts[0].control_plane.error_classification, 'deadline');
+  assert.equal(attempts[0].wrapper.state, 'not_run');
+  assert.equal(attempts[1].history.state, 'passed');
+});
+
+for (const scenario of ['persistent timeouts', 'sensitive failure', 'probe is not daemon']) {
+  test(`failure receipt retains bounded redacted diagnostics: ${scenario}`, async () => {
+    const { deploy, verifyWithRetries } = await import(deployURL.href);
+    const root = mkdtempSync(join(tmpdir(), 'lcb-diagnostic-test-'));
+    try {
+      const production = join(root, 'production'), candidate = join(root, 'candidate');
+      for (const path of [production, candidate]) { mkdirSync(join(path, 'dist'), { recursive: true }); writeFileSync(join(path, 'package.json'), path === production ? 'old' : 'new'); writeFileSync(join(path, 'dist/index.js'), path === production ? 'old-runtime' : 'new-runtime'); }
+      const config = { production, candidate, backupRoot: join(root, 'backups'), changed: ['package.json'], baseline: { 'package.json': hash('old'), 'dist/index.js': hash('old-runtime') }, payload: { 'package.json': hash('new'), 'dist/index.js': hash('new-runtime') } };
+      let restarts = 0, deployedClock = 0;
+      const secret = 'SENSITIVE_HISTORY_PROTOCOL_CREDENTIAL_BODY_SENTINEL';
+      const ops = {
+        build: async () => {}, restart: async () => { restarts++; },
+        swap: (a: string, b: string) => { const tmp = a + '.swap'; renameSync(a, tmp); renameSync(b, a); renameSync(tmp, b); },
+        verify: async (phase: string, onAttempt: any) => {
+          if (phase === 'rollback') {
+            const result = { ok: true, daemon_loaded_runtime: scenario === 'probe is not daemon' ? { ok: false } : { ok: true }, wrapper: { ok: true, probe_loaded_runtime: { ok: true, secret } }, control_plane: { ok: true, pid: 12 } };
+            return verifyWithRetries(phase, { onAttempt, verify: async () => result });
+          }
+          if (scenario === 'probe is not daemon') return verifyWithRetries(phase, { onAttempt, verify: async () => ({ ok: true, wrapper: { ok: true, probe_loaded_runtime: { ok: true } }, loaded_instance: { ok: true }, daemon_loaded_runtime: { ok: false } }) });
+          return verifyWithRetries(phase, {
+            onAttempt, now: () => deployedClock, sleep: async (ms: number) => { deployedClock += ms; },
+            verify: async ({ deadline }: { deadline: number }) => {
+              deployedClock = Math.min(deployedClock + 35000, deadline);
+              return { ok: false, healthz: { ok: true, status: 200 }, readyz: { ok: true, status: 200 }, control_plane: { ok: false, error: 'Control plane deadline: ' + secret, response: secret }, wrapper: { ok: false, error: secret, protocol: secret }, candidate_history: { ok: false, error: secret, history: { messages: [secret] } }, error: secret, credentials: secret };
+            },
+          });
+        },
+      };
+      await assert.rejects(deploy(config, ops), scenario === 'probe is not daemon' ? /MANUAL_RECOVERY_REQUIRED/ : /rollback completed/);
+      assert.equal(restarts, 2);
+      assert.equal(readFileSync(join(production, 'package.json'), 'utf8'), 'old');
+      assert.equal(readFileSync(join(production, 'dist/index.js'), 'utf8'), 'old-runtime');
+      const backup = join(config.backupRoot, readdirSync(config.backupRoot)[0]!);
+      const raw = readFileSync(join(backup, 'result.json'), 'utf8');
+      const diagnosticRaw = readFileSync(join(backup, 'verification-attempts.json'), 'utf8');
+      for (const text of [raw, diagnosticRaw]) { assert.ok(!text.includes(secret)); assert.ok(!text.includes('messages')); assert.ok(!text.includes('credentials')); assert.ok(!text.includes('loaded_instance')); }
+      const receipt = JSON.parse(raw), attempts = receipt.verification_attempts;
+      assert.deepEqual(JSON.parse(diagnosticRaw), attempts);
+      assert.equal(receipt.rolled_back, scenario !== 'probe is not daemon');
+      assert.equal(receipt.manual_recovery_required, scenario === 'probe is not daemon');
+      if (scenario !== 'probe is not daemon') {
+        assert.equal(deployedClock, 90000);
+        assert.equal(attempts.filter((a: any) => a.phase === 'deployed').length, 3);
+        assert.equal(attempts[0].control_plane.error_classification, 'deadline');
+        assert.equal(attempts[0].wrapper.state, 'failed');
+        assert.equal(attempts[0].history.state, 'failed');
+        assert.equal(attempts[2].elapsed_ms, 90000);
+      } else assert.equal(attempts[0].probe_loaded_runtime.state, 'passed');
+      assert.equal(attempts.at(-1).phase, 'rollback');
+      assert.ok(attempts.length <= 36);
+    } finally { rmSync(root, { recursive: true }); }
+  });
+}
+
+test('retry attempt count is bounded even for immediately failing gates', async () => {
+  const { verifyWithRetries, verificationPolicy } = await import(deployURL.href);
+  let clock = 0, attempts = 0;
+  await assert.rejects(verifyWithRetries('deployed', { now: () => clock, sleep: async (ms: number) => { clock += ms; }, verify: async () => ({ ok: false }), onAttempt: () => { attempts++; } }), /deadline/);
+  assert.equal(attempts, verificationPolicy.max_attempts);
+  assert.equal(clock, 85000);
+});
+
+test('unavailable daemon attestation blocks the production entry before mutation', async () => {
+  const { deploymentRuntimeReadiness, requireDeploymentRuntimeReadiness, requireDaemonRuntime } = await import(deployURL.href);
+  assert.deepEqual(deploymentRuntimeReadiness(), { deployment_ready: false, blocker: 'daemon_attestation_unavailable' });
+  assert.throws(() => requireDeploymentRuntimeReadiness(), /daemon_attestation_unavailable; production mutation not started/);
+  assert.throws(() => requireDaemonRuntime({ ok: true, loaded_instance: { ok: true }, wrapper: { probe_loaded_runtime: { ok: true } } }), /Daemon loaded runtime proof missing/);
+  assert.throws(() => requireDaemonRuntime({ ok: false, daemon_loaded_runtime: { ok: true } }), /health verification failed/);
+});
+
+test('a gate reporting success at the exact deadline is rejected', async () => {
+  const { verifyWithRetries } = await import(deployURL.href);
+  let clock = 0;
+  await assert.rejects(verifyWithRetries('deployed', { now: () => clock, verify: async () => { clock = 90000; return { ok: true }; } }), /deadline/);
+});
+
+test('live verification projects control-plane output and skips probes while unready', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'lcb-live-diagnostic-'));
+  const server = createServer((request, response) => { response.writeHead(request.url === '/healthz' ? 503 : 200); response.end('SENSITIVE_HEALTH_BODY'); });
+  const names = ['LCB_HEALTH_URL_FILE', 'CODEX_EXE', 'LCB_TUNNEL_CLIENT', 'LCB_PID_FILE', 'LCB_STDIO_WRAPPER'];
+  const saved = Object.fromEntries(names.map(name => [name, process.env[name]]));
+  try {
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    const address = server.address(); assert.ok(address && typeof address !== 'string');
+    const health = join(root, 'health-url'), tunnel = join(root, 'fake-tunnel.mjs');
+    writeFileSync(health, `http://127.0.0.1:${address.port}`);
+    writeFileSync(tunnel, `#!${process.execPath}\nconsole.log(JSON.stringify({ process:{pid:123}, control_plane_poll:{ok:false,value:'SENSITIVE_POLL_BODY'}, credentials:'SENSITIVE_CREDENTIAL_BODY' })); process.exitCode=1;\n`, { mode: 0o700 });
+    Object.assign(process.env, { LCB_HEALTH_URL_FILE: health, CODEX_EXE: '/synthetic/unused-codex', LCB_TUNNEL_CLIENT: tunnel, LCB_PID_FILE: join(root, 'unused-pid'), LCB_STDIO_WRAPPER: '/synthetic/must-not-spawn' });
+    const { verifyLive } = await import(new URL('../../scripts/verify-fix-live.mjs?diagnostic-fixture', import.meta.url).href);
+    const result = await verifyLive({ wrapper: true, history: true, deadline: Date.now() + 1000 });
+    assert.equal(result.ok, false);
+    assert.equal(result.healthz.status, 503);
+    assert.equal(result.readyz.status, 200);
+    assert.equal(result.control_plane.pid, 123);
+    assert.equal(result.control_plane.error, 'Control plane unready');
+    assert.equal(result.wrapper, undefined);
+    assert.equal(result.candidate_history, undefined);
+    assert.ok(!JSON.stringify(result).includes('SENSITIVE_'));
+  } finally {
+    for (const name of names) { if (saved[name] === undefined) delete process.env[name]; else process.env[name] = saved[name]; }
+    await new Promise<void>(resolve => server.close(() => resolve()));
+    rmSync(root, { recursive: true });
+  }
 });

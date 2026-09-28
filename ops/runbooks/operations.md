@@ -15,7 +15,7 @@ OPERATION 为 `--verify`、`--check`、`--deploy` 或 `--rollback CONTRACT.json`
 先运行包外runner的 `--verify` 或 `--check`。前者只校验发布封存，后者另核对生产/host 基线，均不重启。
 部署前独立复核、用户授权、活动任务确认、包外 verifier 哈希确认缺一不可。
 确认授权后包外runner的 `--deploy` 执行隔离测试/构建、备份、manifest 文件替换、dist 原子交换、精确 kickstart。
-运行证明必须包含实际模块 SHA-256、wrapper 子进程身份、Tunnel PID变化、MCP initialize/8 tools/codex_models 和真实远程路由。
+运行证明必须包含实际模块 SHA-256、wrapper 子进程身份、Tunnel PID变化、MCP initialize/8 tools/codex_models 和真实远程路由。`probe_loaded_runtime` 仅证明验证器启动的短命 wrapper 所加载字节，不能提升为 Tunnel 长驻 Bridge 的 loaded-instance claim；后者须独立 `daemon_loaded_runtime` 证明。
 自动安装的额外历史验证目前需要显式 `LCB_ALLOW_HISTORY_VERIFICATION=1`、`LCB_TEST_HISTORY_ID`、`LCB_TEST_HISTORY_FILE`，且先批准专用隔离 fixture；没有配置会 fail-closed 并回滚。
 
 ## 只读健康与正常启动
@@ -44,3 +44,13 @@ Bridge unavailable 时区分外层 Tunnel 与内部 child；安全读取最多�
 
 保留 receipt、backup 与 displaced runtime，停止扩大修改。先核对精确文件/进程身份和旧文件哈希。
 只有明确目标、有效备份、回滚和验证路径后才进行授权恢复。不能证明旧实例加载时，文件恢复不能报告为服务恢复。
+
+## Stage E candidate.6 诊断修复
+
+来源：LCB-STAGEE-REVIEW-10 的主控提供脱敏结论（无单独复核文件）。其 P1 是逐轮子门未持久化；P2 是短命 wrapper probe 被误称为长驻 loaded instance。复核指出日志中候选 poller 于 13:41:21.745Z 启动，13:41:56.750Z 超时，13:42:05.286Z 开始回滚；35 秒 timeout 是控制面线索，历史失败子门仍未知，不能追认单一根因。
+
+部署后只读健康窗口为90秒、最多18轮、轮间最多5秒，容纳两次35秒控制面请求及恢复间隔；每轮操作共享剩余截止预算，owned child 清理最多额外6秒。仅重试验证，不重试 kickstart 或 mutation。每轮将 phase、attempt、elapsed_ms、healthz/readyz/control-plane/wrapper/history/probe/daemon/remote 门的 passed/failed/not_run 和固定错误分类即时写入 backup/verification-attempts.json，并带入 result.json；两阶段总记录最多36轮。没有协议正文、历史正文、凭据或完整远程响应。
+
+当前实现没有安全绑定真实长驻 Bridge 子进程的模块加载字节，`daemon_loaded_runtime` 明确未证明。探针、Tunnel PID变化及真实远程只读调用不能替代这个门；自动恢复文件后若仍缺实例证明，继续报告 MANUAL_RECOVERY_REQUIRED，不能称服务恢复。candidate.6 只声明 local validation/check，不声明 installed/runtime effective/production accepted。
+
+由于缺少真正 daemon attestation，正式 `--check` 可以通过字节/host 基线检查，但同时输出 `deployment_ready=false`、`blocker=daemon_attestation_unavailable`。正式 `--deploy` 与 `--rollback` 在生产写入、dist 交换和 kickstart 之前拒绝；生产基线仍已恢复，当前不需要回滚。另一个候选切片必须先实现长驻 daemon attestation，不能仅修改 readiness 常量来绕过该门。
