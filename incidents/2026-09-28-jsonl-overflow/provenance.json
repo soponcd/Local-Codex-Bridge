@@ -187,5 +187,16 @@
     "windows/local-settings.example.json": "59121f5b935fdd37e71728ea7dc2d6f5852d077174ca8a4ae539eb7daef6e1dc",
     "windows/test-tray.ps1": "8726efa6965ed72879059eabcfcf1a177bbd3767bafc9d4f4ba653f3e1dafbd1"
   },
-  "captured_at": "2026-09-28T10:42:07.391Z"
+  "captured_at": "2026-09-28T10:42:07.391Z",
+  "production_identity": {
+    "agent": "gui/502/com.openai.tunnel-client.lcb-remote",
+    "git_index_hash": "64a9f41651312d06ea80fb3925f65451f4aa7b31b35b2920226d0b2079253241",
+    "host_code_hashes": {
+      "/Users/ZGH/.local/bin/lcb-remote-stdio": "b7c4ece43cb0478db49251941bedfd3a59348480c56c190015428b461ed7d77d",
+      "/Users/ZGH/.local/bin/lcb-remote-tunnel": "3cb9c3d7a0ac14f2bbcf85d2bc2bb4d80880b0c379f697b0321bfbd8f7826130",
+      "/Users/ZGH/.local/bin/tunnel-client": "309fd85da5a8c2ca8dae920deea8ac10a4d7934ed18ac46e7df0c200139cc9c5",
+      "/Users/ZGH/Library/LaunchAgents/com.openai.tunnel-client.lcb-remote.plist": "0e367d640414fc08c7b3de6eee8d7f87b037d357f692e9b5bdb7e7caf0256d8f",
+      "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex": "3e11ccc743e8198a5ef84fb57c89941d845b0ea0302485ed1fbac2f0821aca5a"
+    }
+  }
 }

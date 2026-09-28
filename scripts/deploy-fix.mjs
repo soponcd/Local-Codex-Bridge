@@ -1,4 +1,4 @@
-// Incident-scoped deployment. No git mutations, history writes, or broad process control.
+// Manifest-scoped deployment. No git mutations, history writes, or broad process control.
 import { createHash } from 'node:crypto';
 import { readFileSync, writeFileSync, existsSync, mkdirSync, mkdtempSync, cpSync, renameSync, unlinkSync, readlinkSync, lstatSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
@@ -7,11 +7,17 @@ import { spawnSync } from 'node:child_process';
 import { verifyLive } from './verify-fix-live.mjs';
 import { remoteModels } from './remote-model-probe.mjs';
 import { safePackagePath } from './verify-package.mjs';
-const production = '/Users/ZGH/.local/share/local-codex-bridge';
-const agent = 'gui/502/com.openai.tunnel-client.lcb-remote';
+const production = process.env.LCB_PRODUCTION_ROOT;
+const agent = process.env.LCB_LAUNCH_AGENT;
 const candidate = fileURLToPath(new URL('../', import.meta.url));
-const trustVerifier = '/Users/ZGH/Documents/Codex/2026-09-17/yt/lcb-incident-20260928/deploy-trust/verify-package.mjs';
+const trustVerifier = process.env.LCB_TRUST_VERIFIER;
 const allowedChanged = new Set(['package.json', 'src/app-server.ts', 'src/tools.ts', 'test/runtime.test.ts', 'test/tools.test.ts', 'test/compatibility.test.ts', 'test/overflow.test.ts', 'test/overflow-codex.mjs', 'test/deploy-fix.test.ts', 'test/remote-probe.test.ts', 'scripts/deploy-fix.mjs', 'scripts/remote-model-probe.mjs', 'scripts/verify-fix-live.mjs', 'scripts/validate-fix.mjs', 'scripts/verify-package.mjs', 'scripts/runtime-load-proof.mjs']);
+allowedChanged.add('package-lock.json');
+allowedChanged.add('src/version.ts');
+export function targetedRestart(agent, run) {
+  if (!/^gui\/\d+\/com\.openai\.tunnel-client\.lcb-remote$/.test(agent ?? '')) throw new Error('Unexpected LaunchAgent target');
+  return run('/bin/launchctl', ['kickstart', '-k', agent]);
+}
 export const hashFile = file => createHash('sha256').update(readFileSync(file)).digest('hex');
 export function checkHashes(root, map, label) {
   for (const [name, expected] of Object.entries(map)) {
@@ -112,6 +118,8 @@ export async function deploy(config, ops) {
 }
 async function main() {
   if (process.platform !== 'darwin' || Number(process.versions.node.split('.')[0]) < 24) throw new Error('Requires macOS and Node.js 24+');
+  if (!production || !/^gui\/\d+\/com\.openai\.tunnel-client\.lcb-remote$/.test(agent ?? '') || !trustVerifier) throw new Error('Explicit LCB_PRODUCTION_ROOT, LCB_LAUNCH_AGENT and external LCB_TRUST_VERIFIER required');
+  if (resolve(trustVerifier).startsWith(resolve(candidate) + '/')) throw new Error('Trust verifier must be outside release package');
   const { verifyAnchoredPackage } = await import(pathToFileURL(trustVerifier).href);
   verifyAnchoredPackage(candidate);
   const manifest = JSON.parse(readFileSync(join(candidate, 'manifest.json')));
@@ -159,7 +167,7 @@ async function main() {
       return { runtimePath };
     },
     swap: nativeSwap,
-    restart: async () => { restartBefore = instance(); run('/bin/launchctl', ['kickstart', '-k', agent]); },
+    restart: async () => { restartBefore = instance(); targetedRestart(agent, run); },
     verify: async phase => {
       const deadline = Date.now() + 45000;
       do {
@@ -178,7 +186,8 @@ async function main() {
       throw new Error('Deployment health/wrapper/history verification failed');
     },
   };
-  const result = await deploy({ ...manifest, candidate, backupRoot: join(dirname(trustVerifier), '../deployment-backups') }, ops);
+  if (!process.env.LCB_BACKUP_ROOT) throw new Error('Explicit LCB_BACKUP_ROOT required');
+  const result = await deploy({ ...manifest, candidate, backupRoot: resolve(process.env.LCB_BACKUP_ROOT) }, ops);
   result.remote_before = remoteBefore;
   console.log(JSON.stringify(result));
 }

@@ -3,9 +3,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { StringDecoder } from 'node:string_decoder';
-const cli = '/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex';
+import { homedir } from 'node:os';
 const tool = 'local_codex_bridge.codex_models';
-export async function remoteModels({ authPath = '/Users/ZGH/.codex/auth.json', spawnImpl = spawn, timeoutMs = 20000, env = process.env } = {}) {
+export async function remoteModels({ authPath = path.join(homedir(), '.codex/auth.json'), spawnImpl = spawn, timeoutMs = 20000, env = process.env, cli = env.CODEX_EXE } = {}) {
+  if (!cli) throw new Error('Explicit CODEX_EXE required for remote verification');
   let auth;
   try { auth = JSON.parse(fs.readFileSync(authPath, 'utf8')); } catch { throw new Error('Existing ChatGPT connector login unavailable'); }
   if (auth.auth_mode !== 'chatgpt' || !auth.tokens?.access_token) throw new Error('Existing ChatGPT connector login unavailable');

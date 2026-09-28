@@ -4,10 +4,10 @@ import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import { createRuntimeProof, readRuntimeProof } from './runtime-load-proof.mjs';
 import { fileURLToPath } from 'node:url';
-const healthFile = '/Users/ZGH/Library/Application Support/lcb-remote-tunnel/health.url';
-const cli = '/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex';
-const historyId = '01a0aea5-ab02-78a3-ab96-d7859c1ecd24';
-const rollout = '/Users/ZGH/.codex/sessions/2026/09/17/rollout-2026-09-17T17-14-47-01a0aea5-ab02-78a3-ab96-d7859c1ecd24.jsonl';
+const healthFile = process.env.LCB_HEALTH_URL_FILE;
+const cli = process.env.CODEX_EXE;
+const historyId = process.env.LCB_TEST_HISTORY_ID;
+const rollout = process.env.LCB_TEST_HISTORY_FILE;
 const streamHash = async file => { const hash = createHash('sha256'); for await (const b of createReadStream(file)) hash.update(b); return hash.digest('hex'); };
 async function mcp(command, args, history, environment = {}, runtimeProof) {
   const childEnv = { ...process.env, ...environment, CODEX_EXE: cli };
@@ -58,6 +58,7 @@ async function mcp(command, args, history, environment = {}, runtimeProof) {
     if (!Array.isArray(models.data) || models.data.length !== 1) throw new Error('model read failed');
     summary.initialize = true; summary.tools = 8; summary.models = 1;
     if (history) {
+      if (!historyId || !rollout || process.env.LCB_ALLOW_HISTORY_VERIFICATION !== '1') throw new Error('Explicit isolated history fixture authorization required');
       const size = statSync(rollout).size, before = await streamHash(rollout);
       const rejected = await request('tools/call', { name: 'codex_threads', arguments: { thread_id: historyId, include_turns: true } });
       if (rejected.result?.isError !== true || !/latest_messages/.test(rejected.result.content?.[0]?.text ?? '')) throw new Error('Unbounded history was not rejected');
@@ -78,13 +79,14 @@ async function mcp(command, args, history, environment = {}, runtimeProof) {
 export async function verifyLive(options = {}) {
   const result = { timestamp: new Date().toISOString(), production_modified: false };
   try {
+    if (!healthFile || !cli || !process.env.LCB_TUNNEL_CLIENT || !process.env.LCB_PID_FILE || (options.wrapper && !process.env.LCB_STDIO_WRAPPER)) throw new Error('Explicit host verification paths required');
     const base = readFileSync(healthFile, 'utf8').trim();
     if (!/^http:\/\/127\.0\.0\.1:\d+\/?$/.test(base)) throw new Error('Unexpected health URL');
     for (const name of ['healthz', 'readyz']) { const r = await fetch(base.replace(/\/$/, '') + '/' + name, { signal: AbortSignal.timeout(5000) }); result[name] = { ok: r.status === 200, status: r.status }; await r.body?.cancel(); }
-    const poll = spawnSync('/Users/ZGH/.local/bin/tunnel-client', ['health', '--url-file', healthFile, '--pid-file', '/Users/ZGH/Library/Application Support/lcb-remote-tunnel/daemon.pid', '--require-control-plane-poll', '--json'], { encoding: 'utf8', timeout: 10000 });
+    const poll = spawnSync(process.env.LCB_TUNNEL_CLIENT, ['health', '--url-file', healthFile, '--pid-file', process.env.LCB_PID_FILE, '--require-control-plane-poll', '--json'], { encoding: 'utf8', timeout: 10000 });
     let health; try { health = JSON.parse(poll.stdout); } catch {}
     result.control_plane = { ok: poll.status === 0 && health?.control_plane_poll?.ok === true, pid: health?.process?.pid, last_poll: health?.control_plane_poll?.value };
-    if (options.wrapper) result.wrapper = await mcp('/Users/ZGH/.local/bin/lcb-remote-stdio', [], false, options.environment, options.runtimeProof);
+    if (options.wrapper) result.wrapper = await mcp(process.env.LCB_STDIO_WRAPPER, [], false, options.environment, options.runtimeProof);
     if (options.history) result.candidate_history = await mcp(process.execPath, [join(options.candidate, 'dist/src/index.js')], true, options.environment);
     result.ok = result.healthz.ok && result.readyz.ok && result.control_plane.ok && (!options.wrapper || result.wrapper.ok) && (!options.history || result.candidate_history.ok);
   } catch (error) { result.ok = false; result.error = error.message; }
