@@ -13,6 +13,10 @@
 
 Phase1已找到直接匹配方案，停止，不进入学术Phase2。成本实际用量unknown，不声称已节省固定比例。
 
+## Candidate.8 reseal (LCB-RESEAL-29)
+
+Phase 1 复用本仓库 `package-release.mjs`、`release-trust.mjs` 和 `verify-package.mjs`；原有不可覆盖输出和包外冻结信任锚点直接适合当前 reseal。唯一适配是显式摘要绑定的 bootstrap receipt/contract 和四个 host 文件身份输入。没有新增包、服务或运行时功能。假设是独立 review28 的 BOOTSTRAP_ACCEPTED 只授权 reseal，生产部署另行裁决。开发期为小范围打包参数和证据读回；上线日没有新增费用；增长期沿用现有封存流程且无新增供应商锁定。实际用量 unknown，Phase 1 结束。
+
 ## Daemon attestation (LCB-DAEMON-13)
 
 复用既有 `runtime-load-proof.mjs` 的捕获策略，抽出同步 `captureRuntimeLoads`。官方现成接口为 [Node registerHooks](https://nodejs.org/api/module.html#moduleregisterhooksoptions) 的 `nextLoad` 实际 source，以及 [Node net](https://nodejs.org/api/net.html) 的 Unix domain socket、超时与显式销毁。macOS 自带 ps/launchctl/lsof 提供独立进程关系与 socket 归属证据；没有增加第三方依赖、云服务或公共 MCP 工具。直接适合本机单用户环境；不将同一 UID 的恶意进程隔离作为该方案能力。开发期成本为固定小协议、进程绑定、隔离攻击测试；上线日无新增费用但需一次有备份的 wrapper bootstrap；增长期只跟踪 Node 与 macOS 接口，无供应商锁定。实际用量 unknown，Phase 1 结束。

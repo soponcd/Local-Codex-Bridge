@@ -40,6 +40,14 @@ Bridge unavailable 时区分外层 Tunnel 与内部 child；安全读取最多�
 回滚先核对 current 和备份哈希，按 allowlist 恢复文件和原子交换 dist，然后精确重启并验证旧模块实际加载与真实远程只读调用。
 契约变化或 current mismatch 必须停止，不通过重新计算 current 哈希来绕过冻结基线。
 
+## Candidate.8 reseal（LCB-RESEAL-29）
+
+bootstrap27 已由独立 review28 接受，四个外置 host 文件在 `ops/runbooks/candidate8-reseal-input.json` 绑定完整 hash、dev/ino、mode、uid/gid 和长度；其中 receipt/contract 引用也有冻结 SHA-256。复核结论来源为主控 handoff，没有独立 repo review 文件。
+
+封存入口为 `NODE scripts/package-release.mjs NEW_RELEASE_DIR NEW_EXTERNAL_TRUST_DIR RESEAL_INPUT RESEAL_INPUT_SHA256`。封存前核对输入摘要、bootstrap 全门与 scratch cleanup、receipt/contract 摘要、四个 host 的实际身份和其他 host 不变哈希。新 manifest 保留事故的 production 基线，增补新 host 基线和 bootstrap acceptance；candidate.7 和历史 provenance 不改。candidate.8 的包外 `--check` 必须真实 daemon 基线通过并返回 `deployment_ready=true`。该 readiness 只证明只读部署前条件，不代表已经部署或生产接受。
+
+native scratch preflight 的有界元数据清单、RPC/cleanup 分别记账，以及 attempt23/合成旧残留 `preserved_not_adopted` 边界继续有效；reseal 不启动 bootstrap，也不操作旧残留。
+
 ## MANUAL_RECOVERY_REQUIRED
 
 保留 receipt、backup 与 displaced runtime，停止扩大修改。先核对精确文件/进程身份和旧文件哈希。

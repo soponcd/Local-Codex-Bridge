@@ -1,5 +1,5 @@
 // Build output is sealed; the immutable verifier and frozen root live outside it.
-import { readFileSync, writeFileSync, mkdirSync, existsSync, cpSync, readdirSync, realpathSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, existsSync, cpSync, readdirSync, realpathSync, lstatSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -14,13 +14,40 @@ if (existsSync(out) || existsSync(trust)) throw new Error('Release and trust pat
 if (trust === pkg || trust.startsWith(pkg + '/')) throw new Error('External trust path required');
 const git = args => { const r = spawnSync('git', args, { cwd: root, encoding: 'utf8' }); if (r.status !== 0) throw new Error('Git inventory failed'); return r.stdout.trim(); };
 const sha = value => createHash('sha256').update(value).digest('hex');
+const provenance = JSON.parse(readFileSync(join(root, 'incidents/2026-09-28-jsonl-overflow/provenance.json')));
+// A reseal accepts only an explicitly frozen, independently accepted bootstrap.
+// Historical incident provenance and already sealed candidates remain immutable.
+let reseal;
+if (process.argv[4]) {
+  const inputBytes = readFileSync(resolve(process.argv[4]));
+  if (!/^[a-f0-9]{64}$/.test(process.argv[5] ?? '') || sha(inputBytes) !== process.argv[5]) throw new Error('Frozen reseal input digest required');
+  reseal = JSON.parse(inputBytes);
+  if (reseal.schema !== 1 || reseal.review.verdict !== 'BOOTSTRAP_ACCEPTED' || reseal.review.task_id !== 'LCB-BOOTSTRAP-REVIEW-28') throw new Error('Independent bootstrap acceptance required');
+  const reference = ref => {
+    if (!ref || !/^[a-f0-9]{64}$/.test(ref.sha256 ?? '') || !ref.path || resolve(root, ref.path) !== join(root, ref.path) || !resolve(root, ref.path).startsWith(root)) throw new Error('Invalid reseal evidence reference');
+    const bytes = readFileSync(join(root, ref.path));
+    if (sha(bytes) !== ref.sha256) throw new Error('Reseal evidence digest mismatch');
+    return JSON.parse(bytes);
+  };
+  const receipt = reference(reseal.bootstrap_receipt), contract = reference(reseal.bootstrap_contract);
+  if (receipt.task_id !== 'LCB-BOOTSTRAP-27' || receipt.contract_sha256 !== reseal.bootstrap_contract.sha256 || receipt.production.modified !== false || receipt.scratch_cleanup.ok !== true || receipt.scratch_cleanup.retained.length !== 0 || !Object.values(receipt.acceptance.gates).every(state => state === 'passed')) throw new Error('Bootstrap acceptance gates incomplete');
+  if (receipt.production.git_head !== provenance.baseline_head || receipt.production.index_sha256 !== provenance.production_identity.git_index_hash) throw new Error('Reseal production provenance mismatch');
+  if (JSON.stringify(reseal.host_files) !== JSON.stringify(receipt.new_host_hashes) || Object.keys(reseal.host_files).length !== 4) throw new Error('Reseal host metadata differs from receipt');
+  for (const [path, expected] of Object.entries(reseal.host_files)) {
+    const target = contract.targets.find(row => row.target === path && row.type === 'file');
+    if (!target || target.sha256 !== expected.sha256 || target.mode !== expected.mode || target.uid !== expected.uid || target.gid !== expected.gid) throw new Error('Reseal host contract mismatch');
+    const stat = lstatSync(path);
+    const actual = { dev: stat.dev, gid: stat.gid, ino: stat.ino, length: stat.size, mode: '0' + (stat.mode & 0o7777).toString(8), path, sha256: sha(readFileSync(path)), type: stat.isFile() && !stat.isSymbolicLink() ? 'file' : 'other', uid: stat.uid };
+    if (JSON.stringify(actual) !== JSON.stringify(expected) || realpathSync(path) !== path) throw new Error('Reseal live host identity mismatch');
+  }
+  for (const [path, expected] of Object.entries(receipt.unchanged_host_code_sha256)) if (provenance.production_identity.host_code_hashes[path] !== expected || sha(readFileSync(path)) !== expected) throw new Error('Unchanged host baseline mismatch');
+}
 const incidentAllowlist = new Set(['incidents/2026-09-28-jsonl-overflow/README.md', 'incidents/2026-09-28-jsonl-overflow/provenance.json', 'incidents/2026-09-28-jsonl-overflow/acceptance-matrix.json', 'incidents/2026-09-28-jsonl-overflow/local-validation.json', 'incidents/2026-09-28-jsonl-overflow/historical-acceptance.json']);
 const tracked = git(['ls-files', '-z']).split('\0').filter(Boolean).filter(name => !name.startsWith('releases/') && (!name.startsWith('incidents/') || incidentAllowlist.has(name)));
 mkdirSync(pkg, { recursive: true }); mkdirSync(trust, { recursive: true, mode: 0o700 });
 if (realpathSync(trust).startsWith(realpathSync(pkg) + '/') || realpathSync(trust) === realpathSync(pkg)) throw new Error('External trust path must be physically outside package');
 for (const name of tracked) { mkdirSync(dirname(join(pkg, name)), { recursive: true }); cpSync(join(root, name), join(pkg, name), { verbatimSymlinks: true }); }
 cpSync(join(root, 'dist'), join(pkg, 'dist'), { recursive: true });
-const provenance = JSON.parse(readFileSync(join(root, 'incidents/2026-09-28-jsonl-overflow/provenance.json')));
 const changed = [...provenance.live_changed.map(row => row.path), 'package-lock.json', 'src/version.ts', 'scripts/rollback.mjs', 'scripts/daemon-attestation.mjs', 'scripts/daemon-attestation-hook.mjs', 'scripts/daemon-bootstrap-plan.mjs', 'test/daemon-attestation.test.ts', 'test/daemon-tunnel-fixture.mjs', 'test/daemon-app-server-fixture.mjs'];
 const payload = {}, links = {};
 function walk(dir, prefix = '') {
@@ -33,6 +60,11 @@ function walk(dir, prefix = '') {
 }
 walk(pkg);
 const manifest = { version, claim: 'candidate', source_commit: git(['rev-parse', 'HEAD']), upstream_commit: provenance.baseline_head, production: provenance.production, agent: provenance.production_identity.agent, git_head: provenance.baseline_head, git_index_hash: provenance.production_identity.git_index_hash, host_code_hashes: provenance.production_identity.host_code_hashes, changed, baseline: { ...provenance.production_files_before }, payload, baseline_links: {}, payload_links: {} };
+if (reseal) {
+  manifest.host_code_hashes = { ...manifest.host_code_hashes, ...Object.fromEntries(Object.entries(reseal.host_files).map(([path, identity]) => [path, identity.sha256])) };
+  manifest.host_code_metadata = reseal.host_files;
+  manifest.bootstrap_acceptance = { ...reseal, reseal_input_sha256: process.argv[5] };
+}
 for (const name of changed) if (!(name in manifest.baseline)) manifest.baseline[name] = null;
 writeFileSync(join(pkg, 'manifest.json'), JSON.stringify(manifest, null, 2) + '\n');
 payload['manifest.json'] = sha(readFileSync(join(pkg, 'manifest.json')));
