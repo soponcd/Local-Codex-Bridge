@@ -1,5 +1,16 @@
 # 更新日志
 
+当前本地候选版本为 **V2.1.3-local.1**。本地 fork 基于已部署的 upstream V2.1.3 / `ff5d8804008a5a8c483a5925bd20c90f21cc67fd`；上游最新版本可能不同，本次不升级 API。
+
+## V2.1.3-local.1（2026-09-28 candidate）
+
+- 精确导入生产 manifest 的 16 个已部署路径和两项既有兼容验证脚本，导入 SHA-256 见事故 provenance。
+- 保留首个 JSONL fatal、限制诊断、释放缓冲；上限保持 10 MiB，mutation 不自动重放。
+- 历史读取改为 metadata + 原生分页，拒绝无界读取；不存储历史正文。
+- 信任锚点置于包外，部署与回滚保留 fail-closed、定向 kickstart 和旧运行实例加载证明；参数化 host/fixture 路径。
+- 隔离 tamper、rollback、overflow、remote 只读协议测试；增加版本化封存包和文档。未部署生产。
+- 兼容边界：Node.js 24+、macOS 当前验收；Windows 测试本机未运行。8 个工具保持不变。可选签名 launcher 未重编译，版本仍为 upstream 2.1.3。
+
 本文件只记录当前公共仓库 Git 历史中可以核验的事实。当前公开版本为 **V2.1.3**；公共历史中没有单独的 V2.1.0 发布记录。
 
 ## V2.1.3（2026-08-24）

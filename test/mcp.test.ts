@@ -13,6 +13,7 @@ import { CHECKPOINT_DIRECTORY_ENV } from "../src/checkpoint.js";
 import { McpStdioServer } from "../src/mcp.js";
 import { RuntimeStore } from "../src/runtime.js";
 import { ControlSurface } from "../src/tools.js";
+import { VERSION } from "../src/version.js";
 
 type RpcId = string | number;
 
@@ -147,7 +148,7 @@ test("MCP stdio initializes idempotently and lists exactly eight fully annotated
       {
         name: "local-codex-bridge",
         title: "Local Codex Bridge",
-        version: "2.1.3",
+        version: VERSION,
       },
     );
 

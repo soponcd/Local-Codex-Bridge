@@ -5,6 +5,8 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setImmediate as nextEvent } from 'node:timers/promises';
 import test from 'node:test';
+import { createHash } from 'node:crypto';
+import { writeFile } from 'node:fs/promises';
 import { AppServerManager } from '../src/app-server.js';
 import { DARWIN_PLATFORM_POLICY } from '../src/platform.js';
 import { ControlSurface } from '../src/tools.js';
@@ -109,4 +111,20 @@ test('include_turns with bounded latest_messages uses metadata plus native item 
     { method: 'thread/read', params: { threadId: 'large-history', includeTurns: false } },
     { method: 'thread/items/list', params: { threadId: 'large-history', limit: 100, sortDirection: 'desc' } },
   ]);
+});
+
+test('30 MiB synthetic history source remains SHA-256 identical across bounded pagination', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'lcb-history-'));
+  const file = join(directory, 'synthetic.jsonl');
+  try {
+    await writeFile(file, Buffer.alloc(30 * 1024 * 1024, 120));
+    const hash = async () => createHash('sha256').update(await readFile(file)).digest('hex');
+    const before = await hash();
+    const manager = new HistoryProbe();
+    const surface = new ControlSurface(manager);
+    await surface.call('codex_threads', { thread_id: 'large-history', include_turns: true, latest_messages: 1 });
+    await assert.rejects(surface.call('codex_threads', { thread_id: 'large-history', include_turns: true }), /latest_messages|unbounded/);
+    assert.equal(await hash(), before);
+    assert.equal(manager.calls.filter(call => call.method === 'thread/read' && call.params.includeTurns).length, 0);
+  } finally { await rm(directory, { recursive: true }); }
 });

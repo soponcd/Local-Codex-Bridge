@@ -43,7 +43,7 @@ for (const scenario of ['success', 'login missing', 'wrong origin', 'missing too
       return spawn(process.execPath, ['-e', source], options);
     };
     try {
-      const options = { authPath, spawnImpl, timeoutMs: scenario === 'deadline' ? 150 : 3000, env: { OPENAI_API_KEY: 'synthetic-api-key', LCB_VERIFY_OPENAI_API_KEY: 'synthetic-api-key', NODE_TLS_REJECT_UNAUTHORIZED: '0' } };
+      const options = { authPath, spawnImpl, cli: process.execPath, timeoutMs: scenario === 'deadline' ? 150 : 3000, env: { OPENAI_API_KEY: 'synthetic-api-key', LCB_VERIFY_OPENAI_API_KEY: 'synthetic-api-key', NODE_TLS_REJECT_UNAUTHORIZED: '0' } };
       if (scenario === 'success') {
         const result = await remoteModels(options);
         assert.equal(result.ok, true); assert.equal(result.count, 1);

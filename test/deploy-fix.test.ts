@@ -7,7 +7,7 @@ import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 const deployURL = new URL('../../scripts/deploy-fix.mjs', import.meta.url);
 const hash = (text: string) => createHash('sha256').update(text).digest('hex');
-for (const scenario of ['success', 'baseline mismatch', 'payload mismatch', 'restart denied', 'restart nonzero', 'restart timeout', 'rollback restart timeout', 'rollback missing load proof', 'rollback health fails', 'unhealthy', 'build fails', 'fresh build', 'remote fails']) {
+for (const scenario of ['success', 'baseline mismatch', 'payload mismatch', 'restart denied', 'restart nonzero', 'restart timeout', 'rollback restart timeout', 'rollback missing load proof', 'rollback health fails', 'unhealthy', 'build fails', 'fresh build', 'remote fails', 'swap fails']) {
   test(`deployment ${scenario} preserves baseline or rolls back`, async () => {
     assert.ok(existsSync(deployURL), 'Safe deployment implementation must exist');
     const { deploy } = await import(deployURL.href);
@@ -34,7 +34,7 @@ for (const scenario of ['success', 'baseline mismatch', 'payload mismatch', 'res
       if (scenario === 'payload mismatch') writeFileSync(join(candidate, 'package.json'), 'tampered');
       const ops = {
         build: async () => { events.push('build'); if (scenario === 'build fails') throw new Error('build fails'); if (scenario === 'fresh build') return { runtimePath: built }; },
-        swap: (a: string, b: string) => { events.push('swap'); const temp = a + '.test-swap'; renameSync(a, temp); renameSync(b, a); renameSync(temp, b); },
+        swap: (a: string, b: string) => { events.push('swap'); if (scenario === 'swap fails') throw new Error('swap fails'); const temp = a + '.test-swap'; renameSync(a, temp); renameSync(b, a); renameSync(temp, b); },
         restart: async () => {
           events.push('restart');
           const attempt = events.filter(e => e === 'restart').length;
@@ -107,13 +107,53 @@ test('whitelisted changed path cannot traverse a symlink parent', async () => {
   } finally { rmSync(root, { recursive: true }); }
 });
 
+test('targeted restart uses only the frozen LaunchAgent label and kickstart', async () => {
+  const { targetedRestart } = await import(deployURL.href);
+  const calls: unknown[] = [];
+  targetedRestart('gui/123/com.openai.tunnel-client.lcb-remote', (...args: unknown[]) => calls.push(args));
+  assert.deepEqual(calls, [['/bin/launchctl', ['kickstart', '-k', 'gui/123/com.openai.tunnel-client.lcb-remote']]]);
+  for (const wrong of ['system/com.openai.tunnel-client.lcb-remote', 'gui/123/com.other', 'gui/123/com.openai.tunnel-client.lcb-remote;killall']) assert.throws(() => targetedRestart(wrong, () => assert.fail('must not execute')), /Unexpected/);
+});
+
+for (const scenario of ['success', 'drift', 'missing load proof']) {
+  test(`explicit rollback ${scenario} remains frozen and proves old loaded runtime`, async () => {
+    const { rollback } = await import(new URL('../../scripts/rollback.mjs', import.meta.url).href);
+    const root = mkdtempSync(join(tmpdir(), 'lcb-explicit-rollback-'));
+    try {
+      const production = join(root, 'production'), backup = join(root, 'backup');
+      mkdirSync(join(production, 'dist'), { recursive: true });
+      mkdirSync(join(backup, 'files/dist'), { recursive: true });
+      writeFileSync(join(production, 'package.json'), scenario === 'drift' ? 'user-change' : 'new');
+      writeFileSync(join(production, 'dist/index.js'), 'new-runtime');
+      writeFileSync(join(backup, 'files/package.json'), 'old');
+      writeFileSync(join(backup, 'files/dist/index.js'), 'old-runtime');
+      writeFileSync(join(backup, 'baseline.json'), JSON.stringify({ 'package.json': hash('old'), 'dist/index.js': hash('old-runtime') }));
+      let restarts = 0;
+      const config = { production, backup, changed: ['package.json'], expected_current: { 'package.json': hash('new'), 'dist/index.js': hash('new-runtime') } };
+      const ops = { swap: (a: string, b: string) => { const tmp = a + '.swap'; renameSync(a, tmp); renameSync(b, a); renameSync(tmp, b); }, restart: async () => { restarts++; }, verify: async () => scenario === 'missing load proof' ? { ok: true } : { ok: true, loaded_instance: { ok: true } } };
+      if (scenario === 'success') { assert.equal((await rollback(config, ops)).rolled_back, true); assert.equal(restarts, 1); }
+      else { await assert.rejects(rollback(config, ops), scenario === 'drift' ? /current rollback baseline mismatch/ : /MANUAL_RECOVERY_REQUIRED/); if (scenario === 'drift') assert.equal(restarts, 0); }
+      assert.equal(readFileSync(join(production, 'package.json'), 'utf8'), scenario === 'drift' ? 'user-change' : 'old');
+    } finally { rmSync(root, { recursive: true }); }
+  });
+}
+
 for (const mutation of ['package-manifest.json', 'manifest.json', 'deploy.sh', 'rehash payload and manifests']) {
   test(`formal --check rejects ${mutation} tampering`, () => {
-    const packageRoot = '/Users/ZGH/Documents/Codex/2026-09-17/yt/lcb-incident-20260928/deploy-package';
     const root = mkdtempSync('/private/tmp/lcb-seal-test-');
+    const trustRoot = mkdtempSync('/private/tmp/lcb-trust-test-');
     try {
-      cpSync(packageRoot, root, { recursive: true, verbatimSymlinks: true });
-      const check = () => spawnSync('/bin/bash', [join(root, 'deploy.sh'), '--check'], { encoding: 'utf8', timeout: 15000 });
+      mkdirSync(join(root, 'src'));
+      writeFileSync(join(root, 'src/tools.ts'), '// synthetic source\n');
+      writeFileSync(join(root, 'deploy.sh'), '#!/bin/bash\nexit 0\n');
+      writeFileSync(join(root, 'manifest.json'), JSON.stringify({ payload: { 'src/tools.ts': hash('// synthetic source\n') } }));
+      const files = Object.fromEntries(['src/tools.ts', 'deploy.sh', 'manifest.json'].map(name => [name, hash(readFileSync(join(root, name), 'utf8'))]));
+      writeFileSync(join(root, 'package-manifest.json'), JSON.stringify({ files, links: {} }));
+      const frozen = hash(readFileSync(join(root, 'package-manifest.json'), 'utf8'));
+      const verifier = readFileSync(new URL('../../scripts/verify-package.mjs', import.meta.url), 'utf8');
+      const anchor = join(trustRoot, 'verify.mjs');
+      writeFileSync(anchor, verifier + `\nverifyPackage(process.argv[2], '${frozen}');\n`);
+      const check = () => spawnSync(process.execPath, [anchor, root], { encoding: 'utf8', timeout: 15000 });
       assert.equal(check().status, 0, 'Untampered package must pass the same formal entry');
       if (mutation === 'rehash payload and manifests') {
         appendFileSync(join(root, 'src/tools.ts'), '\n// mirror tampering\n');
@@ -127,7 +167,7 @@ for (const mutation of ['package-manifest.json', 'manifest.json', 'deploy.sh', '
       } else appendFileSync(join(root, mutation), '\n');
       const rejected = check();
       assert.notEqual(rejected.status, 0, 'Every sealed package byte must be anchored, not self-rehashable');
-    } finally { rmSync(root, { recursive: true }); }
+    } finally { rmSync(root, { recursive: true }); rmSync(trustRoot, { recursive: true }); }
   });
 }
 

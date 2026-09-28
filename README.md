@@ -1,5 +1,25 @@
 # Local Codex Bridge
 
+本地正式维护项目的唯一源码源位于本仓库；安装目录仅承载经过批准的发布版本。
+本次 **V2.1.3-local.1** 是 candidate，未执行生产部署。完整上游说明保留在下文。
+
+```text
+本仓库源码 → 隔离测试/构建 → sealed release + 包外 trust verifier
+  → 生产基线核对 → 备份 → manifest 文件替换 + dist 原子交换
+  → 定向 kickstart → 实际模块加载证明 → MCP initialize / 8 tools
+  → native app-server → codex_apps → local_codex_bridge.codex_models(limit=1)
+```
+
+开发要求 Node.js 24+：`npm ci --ignore-scripts`、`npm run typecheck`、`npm test`。
+隔离验证：`node scripts/validate-fix.mjs --isolated --output .validation`。
+发布：验证通过并提交源码后执行 `npm run package:local`；新目录不可覆盖。
+`releases/<version>/package` 是封存包，`releases/trust/<version>/verify-package.mjs` 是包外冻结信任锚点。
+信任锚点必须由可信渠道单独保存/复核，不能从待安装包提取或重新计算来接受篡改。
+发布包含源码和 dist，不含 node_modules；干净解包后可 `npm ci --ignore-scripts && npm test`。
+安装/回滚的显式配置、授权边界和异常恢复详见 [运维手册](ops/runbooks/operations.md)。
+外层 healthz/readyz=200 只能证明 Tunnel 层；完整健康还需要控制面轮询、MCP、真实远程只读调用和实际加载证明。
+事故机制和未知触发 RPC 详见 [事故报告](incidents/2026-09-28-jsonl-overflow/README.md)。
+
 *A thin supervisory MCP bridge between external AI supervisors and native Codex.*
 
 Local Codex Bridge 是一个面向 Windows 与 macOS 的轻量 MCP stdio 适配器：
@@ -30,7 +50,7 @@ Bridge 本身保持薄层：
 
 ## 当前测试候选版本
 
-**V2.1.3** · [CHANGELOG](CHANGELOG.md)
+**V2.1.3-local.1** · [CHANGELOG](CHANGELOG.md)
 
 V2.1.3 继续收紧 Bridge 作为 supervisory adapter 的边界，并补充：
 
