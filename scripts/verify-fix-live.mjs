@@ -2,7 +2,8 @@ import { spawn, spawnSync } from 'node:child_process';
 import { readFileSync, createReadStream, statSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { join } from 'node:path';
-import { createRuntimeProof, readRuntimeProof } from './runtime-load-proof.mjs';
+import { readRuntimeProof } from './runtime-load-proof.mjs';
+import { ownedProofLifecycle } from './bootstrap-method.mjs';
 import { fileURLToPath } from 'node:url';
 const healthFile = process.env.LCB_HEALTH_URL_FILE;
 const cli = process.env.CODEX_EXE;
@@ -20,14 +21,17 @@ async function mcp(command, args, history, environment = {}, runtimeProof, deadl
   delete childEnv.OPENAI_API_KEY;
   delete childEnv.LCB_RUNTIME_PROOF_CONFIG;
   delete childEnv.NODE_OPTIONS;
-  const proof = runtimeProof ? createRuntimeProof(runtimeProof.root, runtimeProof.hashes) : null;
+  const lifecycle = runtimeProof ? ownedProofLifecycle(runtimeProof.record, runtimeProof.scratch) : null;
+  const proof = lifecycle ? lifecycle.create(runtimeProof.root, runtimeProof.hashes) : null;
   if (proof) {
     childEnv.LCB_RUNTIME_PROOF_CONFIG = proof.config;
     // Host bootstrap wrapper chooses its fixed explicit --import proof hook.
     if (command === process.execPath) args = ['--import', fileURLToPath(new URL('./runtime-load-proof.mjs', import.meta.url)), ...args];
   }
-  const budget = remaining(deadline, 45000);
-  const child = spawn(command, args, { stdio: ['pipe', 'pipe', 'pipe'], env: childEnv });
+  let budget, child;
+  try { budget = remaining(deadline, 45000); child = spawn(command, args, { stdio: ['pipe', 'pipe', 'pipe'], env: childEnv }); }
+  catch (error) { return { ok: false, error: 'MCP start/deadline failed', runtime_proof_cleanup: proof ? lifecycle.finish(proof, { code: null, signal: null, spawn_error: true }) : undefined }; }
+  if (proof && child.pid) lifecycle.spawned(proof, child.pid);
   const lifetime = setTimeout(() => child.kill('SIGKILL'), budget);
   let buffer = Buffer.alloc(0), next = 0, stderrBytes = 0, protocolError = false;
   const pending = new Map();
@@ -82,10 +86,21 @@ async function mcp(command, args, history, environment = {}, runtimeProof, deadl
       if (before !== after) throw new Error('History file changed during read-only regression');
       summary.history = { thread_id: historyId, bytes: size, sha256_before: before, sha256_after: after, unbounded_rejected: true, available: true, count: recent.recent_messages.messages.length, pages: recent.recent_messages.pages_read, observe_metadata_only: true };
     }
-    if (proof) summary.probe_loaded_runtime = { ...readRuntimeProof(proof, child.pid), scope: 'short_lived_wrapper_probe', daemon_bound: false };
     summary.ok = true;
   } catch (error) { summary.error = error.message; }
-  finally { child.stdin.end(); const cleanup = setTimeout(() => child.kill('SIGKILL'), Math.max(1, Math.min(5000, (deadline ?? Infinity) - Date.now()))); summary.exit = await exit; clearTimeout(cleanup); clearTimeout(lifetime); summary.stderr_bytes = stderrBytes; if (summary.exit.code !== 0 || buffer.length) summary.ok = false; }
+  finally {
+    child.stdin.end(); const cleanup = setTimeout(() => child.kill('SIGKILL'), Math.max(1, Math.min(5000, (deadline ?? Infinity) - Date.now())));
+    summary.exit = await exit; clearTimeout(cleanup); clearTimeout(lifetime); summary.stderr_bytes = stderrBytes;
+    if (summary.exit.code !== 0 || buffer.length) summary.ok = false;
+    if (proof) {
+      try { summary.probe_loaded_runtime = { ...readRuntimeProof(proof, child.pid), scope: 'short_lived_wrapper_probe', daemon_bound: false }; }
+      catch (error) { summary.ok = false; summary.error ??= error.message; }
+      summary.verification_ok = summary.ok;
+      summary.runtime_proof_cleanup = lifecycle.finish(proof, { ...summary.exit, ...(!child.pid ? { spawn_error: true } : {}) });
+      if (summary.runtime_proof_cleanup.receipt_state !== 'complete') { summary.verification_ok = false; summary.ok = false; }
+      if (!summary.runtime_proof_cleanup.cleanup.ok) summary.ok = false;
+    }
+  }
   return summary;
 }
 export async function verifyLive(options = {}) {

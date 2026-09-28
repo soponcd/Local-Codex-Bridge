@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 const moduleURL = new URL('../../scripts/remote-model-probe.mjs', import.meta.url);
-for (const scenario of ['success', 'login missing', 'wrong origin', 'missing tool', 'tool error', 'invalid result', 'deadline']) {
+for (const scenario of ['success', 'login missing', 'wrong origin', 'missing tool', 'tool error', 'invalid result', 'deadline', 'unknown scratch']) {
   test(`native remote acceptance ${scenario} is verified or fails closed`, async () => {
     const { remoteModels } = await import(moduleURL.href);
     const root = fs.mkdtempSync('/private/tmp/lcb-native-test-');
@@ -19,6 +19,7 @@ for (const scenario of ['success', 'login missing', 'wrong origin', 'missing too
         if(q.method==='thread/start'){
           if(!q.params.ephemeral||q.params.approvalPolicy!=='never'||q.params.sandbox!=='read-only')process.exit(12);
           result={thread:{id:'private-test-context'}};
+          if(scenario==='unknown scratch')require('fs').writeFileSync(require('path').join(process.env.CODEX_HOME,'unknown'),'preserve');
         }
         if(q.method==='mcpServerStatus/list'){
           if(scenario==='deadline')return;
@@ -54,9 +55,13 @@ for (const scenario of ['success', 'login missing', 'wrong origin', 'missing too
         const entry = fs.readFileSync(new URL('../../deploy.sh', import.meta.url), 'utf8');
         assert.ok(!/read -r -s|\/dev\/tty|API key|Responses/.test(entry));
         assert.ok(!fs.readFileSync(moduleURL, 'utf8').includes('api.openai.com'));
-      } else await assert.rejects(remoteModels(options), /login|connector|tool|result|deadline/i);
+      } else await assert.rejects(remoteModels(options), /login|connector|tool|result|deadline|scratch/i);
       assert.equal(spawned, scenario === 'login missing' ? 0 : 1);
-      if (privateHome) assert.equal(fs.existsSync(privateHome), false, 'owned OAuth scratch directory must be removed');
+      if (privateHome && scenario === 'unknown scratch') {
+        assert.equal(fs.readFileSync(path.join(privateHome, 'unknown'), 'utf8'), 'preserve');
+        assert.deepEqual(fs.readdirSync(privateHome).sort(), ['auth.json', 'unknown']);
+        fs.unlinkSync(path.join(privateHome, 'unknown')); fs.unlinkSync(path.join(privateHome, 'auth.json')); fs.rmdirSync(privateHome);
+      } else if (privateHome) assert.equal(fs.existsSync(privateHome), false, 'owned OAuth scratch directory must be removed');
     } finally { fs.rmSync(root, { recursive: true, force: true }); }
   });
 }

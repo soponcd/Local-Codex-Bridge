@@ -70,3 +70,13 @@ host未bootstrap时 `--check` 返回 `deployment_ready=false, blocker=daemon_boo
 `NODE scripts/daemon-bootstrap-plan.mjs ops/runbooks/daemon-bootstrap-input.json` 只生成精确契约，不写host、不重启。输入为本机候选，未来执行前live核对target与baseline。先独立核验候选与包外runner，再0700备份原wrapper bytes/mode/owner/hash、target缺省状态、production dist与精确实例；安装3个0500外置hook文件及0700私有runtime目录，原子替换wrapper，精确kickstart一次。用真实只读codex_models建立Bridge后验收旧baseline9模块、wrapper/control-plane/remote各门。失败原子恢复原wrapper，精确重启并验证旧服务，再仅删除本次拥有的hook/空目录。旧wrapper没有attestation，所以旧服务恢复证明与daemon证明分别报告；不能把旧服务健康提高为已加载字节证明。
 
 本切片没有修改host或LaunchAgent。candidate.7封存仍绑定bootstrap前host hashes；bootstrap成功后，需独立冻结新wrapper和3个hook的host hashes并封存新candidate，再进入部署。禁止覆盖candidate.7、忽略host mismatch或重算旧基线后声称原契约仍有效。
+
+## Bootstrap 方法修复（LCB-BOOTSTRAP-FIX-19）
+
+新的执行入口为 `scripts/daemon-bootstrap-executor.mjs`，冻结契约为 `ops/runbooks/daemon-bootstrap-contract.current.json`；原 candidate 契约和 candidate.7 保留。`scripts/read-daemon-bootstrap-prestate.mjs CONTRACT` 只读核对 wrapper、备份根目录、production Git/dist/host 哈希及精确服务身份。执行器 import 无效果；本次没有运行 prepare/execute、host 写入或服务重启。
+
+proof 显式记录目录与 config 身份/哈希、receipt 初始缺失、child PID/close/exit 和 receipt 最终身份/哈希；每次 child 退出后立即清理精确已知文件。missing/partial/truncated/failed receipt 独立分类；未知文件、symlink 或身份漂移保留并报告。远程 scratch 同样只删除精确已知 auth 文件和空目录。gate 只标记正在失败的门，之后保留 not_run；scratch cleanup 独立报告并进入 retained_paths，不能以已恢复服务掩盖未完成清理。
+
+回滚先核对备份/manifest/wrapper/生产基线，再以精确 LaunchAgent/Tunnel 身份执行一次已授权的 rollback kickstart；新 Bridge 不存在不阻止这一步。恢复验收仍要求旧 Bridge 的父子关系、health/control-plane/wrapper/真实 remote 和最终身份稳定。保留已有 mode0700/uid502/gid20 备份根目录；下一 invocation 只创建独占子目录，绝不复用或删除历史内容。
+
+独立复核通过后，主控需冻结最终 reviewed commit 与外部 contract SHA-256；prepare 接口为 `NODE EXECUTOR prepare CONTRACT CONTRACT_SHA256 REVIEWED_HEAD`，它会写 host 备份证据。仅在相应执行授权下，execute 接口为 `NODE EXECUTOR execute CONTRACT CONTRACT_SHA256 SAME_REVIEWED_HEAD BACKUP_DIR MANIFEST_SHA256`。两阶段都严格核对外部 digest、clean repo/HEAD 和完整 source/currentness；任何漂移停止，不自动重放或重新接受旧 digest。

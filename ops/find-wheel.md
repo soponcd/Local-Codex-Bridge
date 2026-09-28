@@ -20,3 +20,7 @@ Phase1已找到直接匹配方案，停止，不进入学术Phase2。成本实�
 ## Stage E diagnostic repair (LCB-STAGEE-FIX-11)
 
 复用既有 manifest-scoped deploy/verifyLive 和 Node 内置有界超时，无新增重试库、服务或持久任务系统。官方接口来源：[AbortSignal.timeout](https://nodejs.org/api/globals.html#static-method-abortsignaltimeoutdelay)、[spawnSync timeout/killSignal](https://nodejs.org/api/child_process.html#child_processspawnsynccommand-args-options)。仅对部署后的只读健康门重试，不重放 mutation 或 restart。开发期成本是小范围诊断投影和虚拟时钟测试；上线日无新增依赖或费用；增长期仍是单用户有界窗口，无新锁定。实际用量 unknown。
+
+## Bootstrap method repair (LCB-BOOTSTRAP-FIX-19)
+
+Phase 1 复用仓库现有 runtime proof、verifyLive、remoteModels、原子备份和 attempt17 执行方法，收敛为可独立复核的 repo executor；没有新增服务或第三方依赖。官方 [Node child_process](https://nodejs.org/api/child_process.html#event-close) 的 close 事件提供子进程退出且 stdio 关闭的生命周期边界；配合既有 fs 独占目录、lstat 身份和 SHA-256，显式绑定 receipt，替代 parent fs instrumentation。适合当前单用户 macOS 精确服务场景；并非面向大型平台或同 UID 恶意进程隔离。开发期成本为生命周期收敛、隔离测试和冻结契约；上线日仍需正式授权的备份/执行窗口；增长期跟踪 Node/macOS 接口，无新供应商锁定。实际用量 unknown，Phase 1 结束。
