@@ -8,6 +8,7 @@ import {
   HISTORY_MCP_WRAPPER_ALLOWANCE_BYTES,
   MAX_HISTORY_MCP_BYTES,
 } from "../src/history.js";
+import { WINDOWS_PLATFORM_POLICY } from "../src/platform.js";
 import { RuntimeStore, sanitizeForTransport } from "../src/runtime.js";
 import { ControlSurface, TOOL_DEFINITIONS } from "../src/tools.js";
 
@@ -91,7 +92,7 @@ test("metadata/list remain distinct and native history pages preserve cursors, o
     }
     throw new Error("unexpected native method");
   });
-  const surface = new ControlSurface(manager);
+  const surface = new ControlSurface(manager, undefined, WINDOWS_PLATFORM_POLICY);
   assert.deepEqual(await surface.call("codex_threads", { thread_id: "thread-1", include_turns: false }),
     { source: "codex_app_server", mode: "read", thread: { id: "thread-1", historyMode: "paginated", turns: [] } });
   assert.deepEqual(manager.calls.at(-1), { method: "thread/read", params: { threadId: "thread-1", includeTurns: false } });
