@@ -24,3 +24,7 @@ Phase1已找到直接匹配方案，停止，不进入学术Phase2。成本实�
 ## Bootstrap method repair (LCB-BOOTSTRAP-FIX-19)
 
 Phase 1 复用仓库现有 runtime proof、verifyLive、remoteModels、原子备份和 attempt17 执行方法，收敛为可独立复核的 repo executor；没有新增服务或第三方依赖。官方 [Node child_process](https://nodejs.org/api/child_process.html#event-close) 的 close 事件提供子进程退出且 stdio 关闭的生命周期边界；配合既有 fs 独占目录、lstat 身份和 SHA-256，显式绑定 receipt，替代 parent fs instrumentation。适合当前单用户 macOS 精确服务场景；并非面向大型平台或同 UID 恶意进程隔离。开发期成本为生命周期收敛、隔离测试和冻结契约；上线日仍需正式授权的备份/执行窗口；增长期跟踪 Node/macOS 接口，无新供应商锁定。实际用量 unknown，Phase 1 结束。
+
+## Native scratch cleanup (LCB-SCRATCH-FIX-25)
+
+Phase 1 复用现有独占 scratch、RPC/close 和 bootstrap 门，不新增服务或第三方依赖。直接适用接口为 [Node fs](https://nodejs.org/api/fs.html#file-system-flags) 的 mkdtemp、O_EXCL/O_NOFOLLOW、lstat、opendir 和逐叶 unlink/rmdir，[child_process close](https://nodejs.org/api/child_process.html#event-close) 与 macOS ps PID/start，以及 [lsof 官方手册](https://raw.githubusercontent.com/lsof-org/lsof/master/Lsof.8) 的固定路径查询；不用无界 +D 或递归 rm。Node 没有提供 fd-relative openat/unlinkat；路径身份复查只能发现观察到的漂移，不能消除同 UID 最后一次检查与 syscall 之间的替换竞态，不能宣称 OS 隔离。进程每100ms采样跟踪可识别后代，无法保证捕获采样间隙内生成且立即脱离的同UID进程；退出后再对固定清单做 lsof 无打开者检查。对当前单用户修复有用，不引入大型平台。开发期为有界清单、安全拒绝和独立结果传播测试；上线日无新增费用，仍需独立复核并冻结新契约；增长期跟踪 Node/macOS 接口，无新增锁定。实际用量 unknown，Phase 1 结束。

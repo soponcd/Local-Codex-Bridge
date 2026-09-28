@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 const moduleURL = new URL('../../scripts/remote-model-probe.mjs', import.meta.url);
-for (const scenario of ['success', 'login missing', 'wrong origin', 'missing tool', 'tool error', 'invalid result', 'deadline', 'unknown scratch']) {
+for (const scenario of ['success', 'native tree', 'auth rotation', 'login missing', 'wrong origin', 'missing tool', 'tool error', 'invalid result', 'deadline', 'symlink scratch', 'partial cleanup']) {
   test(`native remote acceptance ${scenario} is verified or fails closed`, async () => {
     const { remoteModels } = await import(moduleURL.href);
     const root = fs.mkdtempSync('/private/tmp/lcb-native-test-');
@@ -19,7 +19,13 @@ for (const scenario of ['success', 'login missing', 'wrong origin', 'missing too
         if(q.method==='thread/start'){
           if(!q.params.ephemeral||q.params.approvalPolicy!=='never'||q.params.sandbox!=='read-only')process.exit(12);
           result={thread:{id:'private-test-context'}};
-          if(scenario==='unknown scratch')require('fs').writeFileSync(require('path').join(process.env.CODEX_HOME,'unknown'),'preserve');
+          const fs=require('fs'),path=require('path'),home=process.env.CODEX_HOME;
+          if(scenario==='symlink scratch')fs.symlinkSync('auth.json',path.join(home,'unknown'));
+          if(scenario==='native tree'||scenario==='partial cleanup'){
+            for(const name of ['state_5.sqlite','state_5.sqlite-wal','models_cache.json','a','b'])fs.writeFileSync(path.join(home,name),'fixture',{mode:0o600});
+            for(const dir of ['skills/.system/sample','plugins/cache/plugin/version']){fs.mkdirSync(path.join(home,dir),{recursive:true,mode:0o700});fs.writeFileSync(path.join(home,dir,'SKILL.md'),'fixture',{mode:0o600});}
+          }
+          if(scenario==='auth rotation'){fs.renameSync(path.join(home,'auth.json'),path.join(home,'old-auth.json'));fs.writeFileSync(path.join(home,'auth.json'),'rotated',{mode:0o600});}
         }
         if(q.method==='mcpServerStatus/list'){
           if(scenario==='deadline')return;
@@ -44,23 +50,33 @@ for (const scenario of ['success', 'login missing', 'wrong origin', 'missing too
       return spawn(process.execPath, ['-e', source], options);
     };
     try {
-      const options = { authPath, spawnImpl, cli: process.execPath, timeoutMs: scenario === 'deadline' ? 150 : 3000, env: { OPENAI_API_KEY: 'synthetic-api-key', LCB_VERIFY_OPENAI_API_KEY: 'synthetic-api-key', NODE_TLS_REJECT_UNAUTHORIZED: '0' } };
-      if (scenario === 'success') {
+      const records: any[] = [];
+      const options = { authPath, spawnImpl, cli: process.execPath, timeoutMs: scenario === 'deadline' ? 150 : 3000, record: (v: any) => records.push(v), scratchOptions: { scratchParent: root, ...(scenario === 'partial cleanup' ? { beforeDelete: (_item: any, removed: number) => { if (removed === 1) throw new Error('injected partial cleanup'); } } : {}) }, env: { OPENAI_API_KEY: 'synthetic-api-key', LCB_VERIFY_OPENAI_API_KEY: 'synthetic-api-key', NODE_TLS_REJECT_UNAUTHORIZED: '0' } };
+      if (['success', 'native tree', 'auth rotation'].includes(scenario)) {
         const result = await remoteModels(options);
         assert.equal(result.ok, true); assert.equal(result.count, 1);
         assert.equal(result.route, 'native app-server -> codex_apps -> local_codex_bridge.codex_models');
         assert.equal(result.api_key_requested, false); assert.equal(result.api_key_written, false);
         assert.equal(result.model_turn_started, false); assert.equal(result.body_recorded, false);
+        assert.equal(result.cleanup.ok, true); assert.equal(result.cleanup.open_files.holders, 0);
+        assert.ok(records.some(v => v.action === 'remote_scratch_child' && v.child.start));
+        assert.ok(!JSON.stringify(records).includes('synthetic-oauth'));
         assert.ok(!JSON.stringify(result).includes('synthetic-api-key'));
         const entry = fs.readFileSync(new URL('../../deploy.sh', import.meta.url), 'utf8');
         assert.ok(!/read -r -s|\/dev\/tty|API key|Responses/.test(entry));
         assert.ok(!fs.readFileSync(moduleURL, 'utf8').includes('api.openai.com'));
-      } else await assert.rejects(remoteModels(options), /login|connector|tool|result|deadline|scratch/i);
+      } else await assert.rejects(remoteModels(options), (error: any) => {
+        assert.match(error.message, /login|connector|tool|result|deadline|scratch/i);
+        if (['symlink scratch', 'partial cleanup'].includes(scenario)) { assert.equal(error.verification_result.ok, true); assert.equal(error.cleanup.ok, false); assert.equal(error.cleanup.partial, scenario === 'partial cleanup'); }
+        return true;
+      });
       assert.equal(spawned, scenario === 'login missing' ? 0 : 1);
-      if (privateHome && scenario === 'unknown scratch') {
-        assert.equal(fs.readFileSync(path.join(privateHome, 'unknown'), 'utf8'), 'preserve');
+      if (privateHome && scenario === 'symlink scratch') {
+        assert.equal(fs.readlinkSync(path.join(privateHome, 'unknown')), 'auth.json');
         assert.deepEqual(fs.readdirSync(privateHome).sort(), ['auth.json', 'unknown']);
         fs.unlinkSync(path.join(privateHome, 'unknown')); fs.unlinkSync(path.join(privateHome, 'auth.json')); fs.rmdirSync(privateHome);
+      } else if (privateHome && scenario === 'partial cleanup') {
+        assert.equal(fs.existsSync(privateHome), true); fs.rmSync(privateHome, { recursive: true }); // Exact isolated fixture only.
       } else if (privateHome) assert.equal(fs.existsSync(privateHome), false, 'owned OAuth scratch directory must be removed');
     } finally { fs.rmSync(root, { recursive: true, force: true }); }
   });

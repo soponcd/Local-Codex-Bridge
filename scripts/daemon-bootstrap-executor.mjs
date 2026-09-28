@@ -26,6 +26,7 @@ let backup, invocation, manifestDigest, manifest, ledger=[], mutated=false, repl
 let verifyLive,verifyDaemon,daemonConfig,remoteModels;
 const ownedProofPids=new Set();
 const retainedScratch=new Map();
+const pendingProofRecords=[];
 const proofRecord = record => {
   if(record.child?.pid)ownedProofPids.add(record.child.pid);
   const directory=typeof record.directory==='string'?record.directory:record.directory?.path;
@@ -33,7 +34,7 @@ const proofRecord = record => {
     const result=record.cleanup??record;
     if(result.ok)retainedScratch.delete(directory);else retainedScratch.set(directory,{path:directory,classification:'scratch_ownership_unknown',retained_paths:result.retained_paths});
   }
-  if(backup)append('owned-targets.jsonl',{invocation,...record});
+  if(backup)append('owned-targets.jsonl',{invocation,...record});else pendingProofRecords.push(record);
 };
 const remoteGate = options => remoteModels({...options,record:proofRecord});
 const tunnelOnly = (deadline=Date.now()+15000) => tunnelSnapshot(c.service_identity, (file,args) => run(file,args,deadline));
@@ -163,8 +164,12 @@ const preflight = async () => {
   baseline('old');const anchored=await frozenSources();const before=native('old');
   const health=await verifyLive({wrapper:true,deadline:Date.now()+90000});
   assert(health.ok&&health.control_plane.pid===before.tunnel.pid,'original service health/control/wrapper');
+  // Real native RPC + child close + owned scratch cleanup must succeed before
+  // creating backup evidence or touching any bootstrap target.
+  const native_preflight=await remoteGate({deadline:Date.now()+90000});
+  assert(native_preflight.ok && native_preflight.cleanup?.ok && retainedScratch.size===0,'native preflight RPC/scratch cleanup');
   const after=native('old');assert(canonical(before).equals(canonical(after)),'original service identity instability');
-  baseline('old');return {ok:true,anchor:anchored,health,identity:after,baseline_daemon_attestation:'unavailable',production_version:JSON.parse(fs.readFileSync(path.join(production,'package.json'))).version};
+  baseline('old');return {ok:true,anchor:anchored,health,native_preflight,identity:after,baseline_daemon_attestation:'unavailable',production_version:JSON.parse(fs.readFileSync(path.join(production,'package.json'))).version};
 };
 const prepare = async () => {
   await frozenSources();await loadGates();const pre=await preflight();
@@ -173,13 +178,16 @@ const prepare = async () => {
   const backupRoot=meta(c.backup.root);assert(sameMeta(backupRoot,c.backup.prestate) && fs.realpathSync(c.backup.root)===c.backup.root,'preserved backup root drift');backup=path.join(c.backup.root,invocation);const backupDir=mkdir(backup);
   exclusive(path.join(backup,'owned-targets.jsonl'),Buffer.alloc(0));exclusive(path.join(backup,'verification-attempts.jsonl'),Buffer.alloc(0));
   append('owned-targets.jsonl',{invocation,...backupRoot,action:'preserved_backup_root',created_by_this_invocation:false});record({...backupDir,action:'backup_invocation'});
+  // Preflight lifecycle evidence is outside CODEX_HOME and does not change the
+  // exactly-two-record prepared ownership ledger required by execute.
+  const preflightEvidence=exclusive(path.join(backup,'native-preflight.json'),canonical({records:pendingProofRecords,result:pre.native_preflight}));
   exclusive(path.join(backup,'contract.json'),contractBytes);exclusive(path.join(backup,'original-wrapper.bin'),fs.readFileSync(original.path));
   manifest={schema:3,invocation_id:invocation,contract_sha256:contractHash,candidate7_frozen_anchor:c.release_anchor,refreshed_at:new Date().toISOString(),execution_git_head:head,backup_invocation_directory_identity:backupDir,ownership_ledger_identity:meta(path.join(backup,'owned-targets.jsonl')),uid:502,gid:20,
     original_wrapper_bytes_sha256_length_mode_uid_gid_dev_ino:identify(original.path),backup_wrapper_sha256_and_length:identify(path.join(backup,'original-wrapper.bin')),
     all_target_prestates_including_absent_parent_run:c.targets.map(t=>t.prestate),backup_root_prestate_and_created_by_this_invocation:{prestate:c.backup.prestate,current:backupRoot,created_by_this_invocation:false},
     preserved_parent_directory_identity:c.live_prestate.parent_directories,production_dist_hashes:c.live_prestate.production_dist_sha256,production_git_head_index_sha256:{head:c.live_prestate.production_git_head,index_sha256:c.live_prestate.production_git_index_sha256},
     unchanged_host_code_hashes:c.live_prestate.unchanged_host_code_sha256,exact_launchagent_tunnel_direct_bridge_os_identity:pre.identity,install_source_hashes_lengths:c.targets.filter(t=>t.source).map(t=>({source:t.source,sha256:t.sha256,length:t.byte_length})),
-    proposed_wrapper_hash_length_mode_uid_gid:{sha256:wrapper.sha256,length:wrapper.byte_length,mode:wrapper.mode,uid:502,gid:20},preflight:pre,executor:{path:selfPath,sha256:hash(fs.readFileSync(selfPath))}};
+    proposed_wrapper_hash_length_mode_uid_gid:{sha256:wrapper.sha256,length:wrapper.byte_length,mode:wrapper.mode,uid:502,gid:20},preflight:pre,native_preflight_evidence:preflightEvidence,executor:{path:selfPath,sha256:hash(fs.readFileSync(selfPath))}};
   const bytes=canonical(manifest);exclusive(path.join(backup,'manifest.json'),bytes);manifestDigest=hash(bytes);exclusive(path.join(backup,'manifest.sha256'),Buffer.from(manifestDigest+'\n'));fsyncDir(backup);
   restoreGuard();baseline('old');for(const t of c.targets)if(t.prestate.state==='absent')assert(absent(t.target),'freeze target absence');
   return {status:'prepared',invocation,backup,contract_sha256:contractHash,manifest_sha256:manifestDigest,executor_sha256:manifest.executor.sha256,preflight:pre,target_mutations:0};
@@ -249,7 +257,9 @@ const execute = async () => {
   let before;
   try{
     for(const t of c.targets)if(t.prestate.state==='absent')assert(absent(t.target),'apply absence drift');baseline('old');await frozenSources();before=native('old');
-    const live=await verifyLive({wrapper:true,deadline:Date.now()+90000});assert(live.ok&&live.control_plane.pid===before.tunnel.pid,'apply original preflight');assert(canonical(native('old')).equals(canonical(before)),'apply old identity');receipt.preflight={ok:true,health:live,identity:before};restoreGuard();baseline('old');
+    const live=await verifyLive({wrapper:true,deadline:Date.now()+90000});assert(live.ok&&live.control_plane.pid===before.tunnel.pid,'apply original preflight');
+    const nativePreflight=await remoteGate({deadline:Date.now()+90000});assert(nativePreflight.ok&&nativePreflight.cleanup?.ok&&retainedScratch.size===0,'apply native preflight RPC/scratch cleanup');
+    assert(canonical(native('old')).equals(canonical(before)),'apply old identity');receipt.preflight={ok:true,health:live,native_preflight:nativePreflight,identity:before};restoreGuard();baseline('old');
     for(const t of c.targets)if(t.prestate.state==='absent')assert(absent(t.target),'first write absence');
     mutated=true;for(const t of c.targets.filter(t=>t.type==='directory'))mkdir(t.target,true);
     for(const t of c.targets.filter(t=>t.source))replace(t.target,fs.readFileSync(t.source),t.mode);
@@ -259,13 +269,13 @@ const execute = async () => {
     receipt.validation=await acceptNew(deadline,receipt.restart_before);receipt.status='bootstrapped';receipt.old_production_version=manifest.preflight.production_version;
     receipt.new_host_hashes=Object.fromEntries(c.targets.filter(t=>t.type==='file').map(t=>[t.target,identify(t.target)]));receipt.attestation=receipt.validation.daemon_loaded_runtime;receipt.remote_route=receipt.validation.remote_codex_models;
     receipt.rollback={attempted:false};receipt.next_action='independent bootstrap review, then reseal new candidate with new host hashes before authorized candidate deploy';
-  }catch(e){receipt.failure=errorClass(e);if(mutated){try{receipt.rollback=await rollback(before);receipt.status=receipt.rollback.rolled_back?'rolled_back':'blocked';}catch(re){receipt.rollback={attempted:true,error_classification:errorClass(re),manual_recovery_required:true};receipt.status='blocked';}}}
+  }catch(e){receipt.failure=errorClass(e);if(e.failure_domain==='scratch_cleanup')receipt.native_cleanup_failure={rpc:e.verification_result??null,cleanup:e.cleanup,rpc_error:e.rpc_error??null};if(mutated){try{receipt.rollback=await rollback(before);receipt.status=receipt.rollback.rolled_back?'rolled_back':'blocked';}catch(re){receipt.rollback={attempted:true,error_classification:errorClass(re),manual_recovery_required:true};receipt.status='blocked';}}}
   receipt.scratch_cleanup={ok:retainedScratch.size===0,retained:[...retainedScratch.values()]};
   receipt.mutations=ledger.filter(x=>typeof x.path==='string'&&!x.path.startsWith(c.backup.root)&&!x.action?.startsWith('scratch'));receipt.apply_restart_attempted=applyRestart;receipt.rollback_restart_attempted=rollbackRestart;receipt.completed_at=new Date().toISOString();
   exclusive(path.join(backup,'result.json'),canonical(receipt));return receipt;
 };
 try{if(phase==='prepare')return await prepare();if(phase==='execute')return await execute();throw new Error('explicit phase required');}
-catch(e){return {status:'blocked',error_classification:errorClass(e),backup:backup??null,host_target_mutations:mutated};}
+catch(e){return {status:'blocked',error_classification:errorClass(e),backup:backup??null,host_target_mutations:mutated,verification_result:e.verification_result??null,scratch_cleanup:{ok:retainedScratch.size===0,retained:[...retainedScratch.values()]},native_preflight_records:pendingProofRecords};}
 }
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   try {

@@ -1,7 +1,8 @@
 // Bootstrap execution primitives. No host effects occur on import.
 import fs from 'node:fs';
 import path from 'node:path';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
 import { createRuntimeProof } from './runtime-load-proof.mjs';
 
 export const sha256 = bytes => createHash('sha256').update(bytes).digest('hex');
@@ -14,6 +15,141 @@ export const metadata = file => {
 };
 export const sameIdentity = (a, b) => ['path', 'dev', 'ino', 'type', 'mode', 'uid', 'gid', 'length', 'sha256'].every(k => a[k] === b[k]);
 const exists = file => { try { fs.lstatSync(file); return true; } catch (e) { if (e.code === 'ENOENT') return false; throw e; } };
+
+// Node exposes O_NOFOLLOW for open, but no openat/unlinkat directory-fd API.
+// These path rechecks detect observed replacement; they cannot isolate a hostile
+// same-UID actor replacing an ancestor in the last check-to-syscall window.
+export const nativeScratchLimits = Object.freeze({ depth: 12, entries: 1024, bytes: 128 * 1024 * 1024, path_bytes: 128 * 1024, deadline_ms: 5000 });
+const scratchStat = file => {
+  const s = fs.lstatSync(file);
+  return { path: file, dev: s.dev, ino: s.ino, uid: s.uid, gid: s.gid, mode: s.mode & 0o7777,
+    type: s.isFile() ? 'file' : s.isDirectory() ? 'directory' : s.isSymbolicLink() ? 'symlink' : 'special',
+    nlink: s.nlink, size: s.size, mtime_ms: s.mtimeMs, ctime_ms: s.ctimeMs };
+};
+const sameScratch = (a, b) => ['path', 'dev', 'ino', 'uid', 'gid', 'mode', 'type', ...(b.type === 'file' ? ['nlink', 'size', 'mtime_ms', 'ctime_ms'] : [])].every(k => a[k] === b[k]);
+export function nativeProcessTable(deadline = Date.now() + 2000) {
+  const budget = Math.min(2000, deadline - Date.now()); requireThat(budget > 0, 'scratch process deadline');
+  const r = spawnSync('/bin/ps', ['-axo', 'pid=,ppid=,uid=,lstart='], { encoding: 'utf8', timeout: budget, killSignal: 'SIGKILL', maxBuffer: 1024 * 1024 });
+  requireThat(r.status === 0 && !r.error, 'scratch process inventory unavailable');
+  return r.stdout.trim().split('\n').filter(Boolean).map(line => {
+    const m = line.trim().match(/^(\d+)\s+(\d+)\s+(-?\d+)\s+(.+)$/); requireThat(m, 'scratch process inventory invalid');
+    return { pid: Number(m[1]), ppid: Number(m[2]), uid: Number(m[3]), start: m[4] };
+  });
+}
+export function nativeOpenFiles(paths, deadline) {
+  const budget = Math.min(2000, deadline - Date.now()); requireThat(budget > 0, 'scratch lsof deadline');
+  // Exact bounded inventory, never +D (which recursively walks an unbounded tree).
+  const r = spawnSync('/usr/sbin/lsof', ['-nP', '-F', 'pfn', '--', ...paths], { encoding: 'utf8', timeout: budget, killSignal: 'SIGKILL', maxBuffer: 1024 * 1024 });
+  requireThat(!r.error && r.status === 1 && !r.stdout && !r.stderr, 'scratch has open holders or lsof unavailable');
+  return { ok: true, exact_paths: paths.length, holders: 0 };
+}
+export function ownedNativeScratch({ record = () => {}, scratchParent = '/private/tmp', invocation = randomUUID(),
+  processTable = nativeProcessTable, openFiles = nativeOpenFiles, limits = nativeScratchLimits, beforeDelete = () => {} } = {}) {
+  for (const key of Object.keys(nativeScratchLimits)) requireThat(Number.isSafeInteger(limits[key]) && limits[key] > 0 && limits[key] <= nativeScratchLimits[key], 'scratch budget invalid');
+  limits = Object.freeze({ ...limits });
+  requireThat(typeof invocation === 'string' && /^[a-zA-Z0-9-]{1,100}$/.test(invocation), 'scratch invocation invalid');
+  requireThat(path.isAbsolute(scratchParent) && fs.realpathSync(scratchParent) === scratchParent, 'scratch parent alias');
+  const home = fs.mkdtempSync(path.join(scratchParent, 'lcb-remote-acceptance-'));
+  fs.chmodSync(home, 0o700); fs.chownSync(home, process.getuid(), process.getgid());
+  const root = scratchStat(home), ancestors = [];
+  for (let current = path.dirname(home); ; current = path.dirname(current)) {
+    const item = scratchStat(current); requireThat(item.type === 'directory' && fs.realpathSync(current) === current, 'scratch ancestor alias');
+    ancestors.push(item); if (current === '/') break;
+  }
+  requireThat(root.type === 'directory' && root.mode === 0o700 && root.uid === process.getuid() && root.gid === process.getgid() && fs.realpathSync(home) === home && fs.readdirSync(home).length === 0, 'scratch initial ownership/empty state');
+  const state = { invocation, root, ancestors, empty_before_auth: true, child: null, descendants: new Map(), process_error: null };
+  const checkParents = file => {
+    for (const item of ancestors) requireThat(sameScratch(scratchStat(item.path), item), 'scratch ancestor identity drift');
+    requireThat(sameScratch(scratchStat(home), root) && fs.realpathSync(home) === home, 'scratch root identity drift');
+    const parts = file === home ? [] : path.relative(home, path.dirname(file)).split(path.sep).filter(Boolean);
+    let current = home;
+    for (const part of parts) { current = path.join(current, part); const expected = inventory.find(x => x.path === current); requireThat(expected && sameScratch(scratchStat(current), expected), 'scratch nested ancestor identity drift'); }
+  };
+  let inventory = [], finished = false;
+  const observe = () => {
+    if (!state.child) return;
+    try {
+      const table = processTable(), child = table.find(p => p.pid === state.child.pid && p.start === state.child.start && p.uid === root.uid);
+      const known = new Map(state.descendants); if (child) known.set(child.pid, child);
+      let changed;
+      do {
+        changed = false;
+        for (const p of table) if (p.uid === root.uid && known.has(p.ppid) && !known.has(p.pid)) {
+          const parent = table.find(x => x.pid === p.ppid && x.start === known.get(p.ppid).start);
+          if (parent) { known.set(p.pid, p); state.descendants.set(p.pid, p); changed = true; }
+        }
+      } while (changed);
+    } catch (e) { state.process_error ??= e.message; }
+  };
+  record({ action: 'remote_scratch_created', invocation, directory: root, ancestors, empty_before_auth: true, limits, content_read: false, race_boundary: 'Node path identity rechecks; no fd-relative unlink; same-UID final syscall race remains' });
+  return {
+    home,
+    auth(bytes) {
+      checkParents(home);
+      requireThat(fs.readdirSync(home).length === 0, 'scratch spawn prestate not empty');
+      const file = path.join(home, 'auth.json'), fd = fs.openSync(file, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600);
+      try { fs.writeFileSync(fd, bytes); fs.fchmodSync(fd, 0o600); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+      const auth = scratchStat(file); requireThat(auth.type === 'file' && auth.mode === 0o600 && auth.nlink === 1 && auth.uid === root.uid && auth.gid === root.gid, 'scratch auth ownership');
+      checkParents(home); requireThat(fs.readdirSync(home).join('|') === 'auth.json', 'scratch spawn prestate changed');
+      record({ action: 'remote_scratch_auth', invocation, directory: root, auth, exclusive: true, content_read: false });
+    },
+    spawned(pid) {
+      requireThat(!state.child && Number.isSafeInteger(pid) && pid > 0, 'scratch child PID');
+      const child = processTable().find(p => p.pid === pid); requireThat(child && child.uid === root.uid && child.ppid === process.pid && child.start, 'scratch child PID/start unavailable');
+      state.child = child; observe(); record({ action: 'remote_scratch_child', invocation, directory: root, child });
+    },
+    observe,
+    finish(exit) {
+      requireThat(!finished, 'scratch cleanup already attempted'); finished = true;
+      const deadline = Date.now() + limits.deadline_ms;
+      const summary = { action: 'remote_scratch_cleanup', invocation, directory: root, child: state.child, child_exit: exit,
+        descendants: [...state.descendants.values()], ok: false, retained_paths: [home], deleted_paths: [], inventory: [], limits,
+        content_read: false, partial: false, race_boundary: 'Node path identity rechecks; no fd-relative unlink; same-UID final syscall race remains' };
+      const budget = () => requireThat(Date.now() < deadline, 'scratch cleanup deadline exceeded');
+      try {
+        requireThat(exit && (Number.isInteger(exit.code) || exit.signal || exit.spawn_error), 'scratch child exit unverified');
+        observe(); requireThat(!state.process_error, state.process_error);
+        const table = processTable(deadline), known = [state.child, ...state.descendants.values()].filter(Boolean);
+        requireThat(known.every(p => !table.some(x => x.pid === p.pid && x.start === p.start && x.uid === p.uid)), 'scratch child/descendant alive');
+        summary.descendants = [...state.descendants.values()];
+        let bytes = 0, pathBytes = 0;
+        const visit = (file, depth) => {
+          budget(); requireThat(depth <= limits.depth && inventory.length < limits.entries, 'scratch inventory depth/entries exceeded');
+          checkParents(file); const item = scratchStat(file);
+          requireThat(['file', 'directory'].includes(item.type) && item.dev === root.dev && item.uid === root.uid && item.gid === root.gid && !(item.mode & 0o022) && !(item.mode & 0o7000) && (item.type !== 'file' || item.nlink === 1), 'scratch unsafe type/device/owner/mode/link');
+          bytes += item.type === 'file' ? item.size : 0; pathBytes += Buffer.byteLength(file);
+          requireThat(bytes <= limits.bytes && pathBytes <= limits.path_bytes, 'scratch inventory bytes exceeded');
+          inventory.push(item);
+          if (item.type === 'directory') {
+            const dir = fs.opendirSync(file, { bufferSize: 1 });
+            try { let entry; while ((entry = dir.readSync())) { budget(); requireThat(sameScratch(scratchStat(file), item), 'scratch directory changed during inventory'); visit(path.join(file, entry.name), depth + 1); } }
+            finally { dir.closeSync(); }
+          }
+        };
+        visit(home, 0); summary.inventory = inventory; summary.total_bytes = bytes;
+        budget(); checkParents(home); summary.open_files = openFiles(inventory.map(x => x.path), deadline); requireThat(summary.open_files?.ok, 'scratch lsof verification failed');
+        // Verify the complete accepted inventory before the first destructive operation.
+        for (const item of inventory) { budget(); checkParents(item.path); requireThat(sameScratch(scratchStat(item.path), item), 'scratch entry identity changed'); }
+        const directories = inventory.filter(x => x.type === 'directory');
+        const children = dir => inventory.filter(x => path.dirname(x.path) === dir.path && x.path !== dir.path).map(x => path.basename(x.path)).sort();
+        for (const dir of directories) {
+          budget(); checkParents(dir.path); const actual = []; const handle = fs.opendirSync(dir.path, { bufferSize: 1 });
+          try { let entry; while ((entry = handle.readSync())) { budget(); requireThat(actual.length < limits.entries, 'scratch new content'); actual.push(entry.name); } } finally { handle.closeSync(); }
+          requireThat(JSON.stringify(actual.sort()) === JSON.stringify(children(dir)), 'scratch content changed after inventory');
+        }
+        for (const item of [...inventory].reverse()) {
+          budget(); beforeDelete(item, summary.deleted_paths.length); budget(); checkParents(item.path);
+          requireThat(sameScratch(scratchStat(item.path), item), 'scratch entry replaced before delete');
+          if (item.type === 'directory') { const handle = fs.opendirSync(item.path, { bufferSize: 1 }); try { requireThat(handle.readSync() === null, 'scratch directory not empty'); } finally { handle.closeSync(); } fs.rmdirSync(item.path); }
+          else fs.unlinkSync(item.path);
+          summary.deleted_paths.push(item.path);
+        }
+        summary.ok = true; summary.retained_paths = [];
+      } catch (e) { summary.error = e.message; summary.partial = summary.deleted_paths.length > 0; summary.inventory = inventory; }
+      record(summary); return summary;
+    }
+  };
+}
 
 // Bind the allocated directory/config and absent receipt before spawning, then
 // adopt only that child output after close. Never infer ownership from a prefix.
@@ -69,6 +205,7 @@ export async function gate(record, name, operation) {
   catch (e) {
     if (e.failure_domain === 'scratch_cleanup' && e.verification_result?.ok) {
       record.gates[name] = 'passed'; record.failure_domain = 'scratch_cleanup';
+      (record.verification_results ??= {})[name] = e.verification_result;
       (record.scratch_cleanup ??= []).push(e.cleanup);
     } else { record.gates[name] = 'failed'; record.failed_gate = name; }
     throw e;

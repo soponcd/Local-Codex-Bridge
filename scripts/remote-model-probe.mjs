@@ -4,34 +4,22 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { StringDecoder } from 'node:string_decoder';
 import { homedir } from 'node:os';
-import { metadata, sameIdentity } from './bootstrap-method.mjs';
+import { ownedNativeScratch } from './bootstrap-method.mjs';
 const tool = 'local_codex_bridge.codex_models';
-export async function remoteModels({ authPath = path.join(homedir(), '.codex/auth.json'), spawnImpl = spawn, timeoutMs = 20000, deadline = Infinity, env = process.env, cli = env.CODEX_EXE, record = () => {} } = {}) {
+export async function remoteModels({ authPath = path.join(homedir(), '.codex/auth.json'), spawnImpl = spawn, timeoutMs = 20000, deadline = Infinity, env = process.env, cli = env.CODEX_EXE, record = () => {}, scratchOptions = {} } = {}) {
   if (!cli) throw new Error('Explicit CODEX_EXE required for remote verification');
   let auth;
-  try { auth = JSON.parse(fs.readFileSync(authPath, 'utf8')); } catch { throw new Error('Existing ChatGPT connector login unavailable'); }
-  if (auth.auth_mode !== 'chatgpt' || !auth.tokens?.access_token) throw new Error('Existing ChatGPT connector login unavailable');
-  const home = fs.mkdtempSync('/private/tmp/lcb-remote-acceptance-');
-  const directoryIdentity = metadata(home);
-  let authIdentity, verificationResult;
-  const cleanup = () => {
-    const summary = { action: 'remote_scratch_cleanup', directory: directoryIdentity, child_pid: child?.pid ?? null, child_exit: exit ?? null, ok: false, retained_paths: [home] };
-    try {
-      if (child && !exit) throw new Error('Owned native connector exit unverified');
-      if (!sameIdentity(metadata(home), directoryIdentity) || fs.readdirSync(home).some(n => n !== 'auth.json')) throw new Error('Unknown native connector scratch content/identity');
-      const file = path.join(home, 'auth.json');
-      if (authIdentity) { if (!sameIdentity(metadata(file), authIdentity)) throw new Error('Native connector auth scratch identity changed'); fs.unlinkSync(file); }
-      if (fs.readdirSync(home).length) throw new Error('Unknown native connector scratch content');
-      fs.rmdirSync(home); summary.ok = true; summary.retained_paths = [];
-    } catch (error) { error.failure_domain = 'scratch_cleanup'; error.verification_result = verificationResult; error.cleanup = summary; throw error; }
-    finally { record(summary); }
-  };
-  let child, closed, exit, stderrBytes = 0;
   try {
-    fs.chmodSync(home, 0o700);
-    fs.writeFileSync(path.join(home, 'auth.json'), JSON.stringify({ auth_mode: 'chatgpt', tokens: auth.tokens, last_refresh: auth.last_refresh }), { mode: 0o600 });
-    authIdentity = metadata(path.join(home, 'auth.json'));
-    record({ action: 'remote_scratch_created', directory: directoryIdentity, auth: { ...authIdentity, sha256: undefined } });
+    const fd = fs.openSync(authPath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    try { const stat = fs.fstatSync(fd); if (!stat.isFile() || stat.uid !== process.getuid() || stat.size > 128 * 1024) throw new Error('auth ownership/budget'); auth = JSON.parse(fs.readFileSync(fd, 'utf8')); }
+    finally { fs.closeSync(fd); }
+  } catch { throw new Error('Existing ChatGPT connector login unavailable'); }
+  if (auth.auth_mode !== 'chatgpt' || !auth.tokens?.access_token) throw new Error('Existing ChatGPT connector login unavailable');
+  const scratch = ownedNativeScratch({ ...scratchOptions, record }), home = scratch.home;
+  let verificationResult, rpcError;
+  let child, closed, exit, observeTimer, stderrBytes = 0;
+  try {
+    scratch.auth(JSON.stringify({ auth_mode: 'chatgpt', tokens: auth.tokens, last_refresh: auth.last_refresh }));
     const childEnv = { ...env, CODEX_HOME: home };
     for (const name of ['OPENAI_API_KEY','LCB_VERIFY_OPENAI_API_KEY','OPENAI_ADMIN_KEY','CONTROL_PLANE_API_KEY','NODE_OPTIONS','NODE_TLS_REJECT_UNAUTHORIZED','NODE_EXTRA_CA_CERTS','SSL_CERT_FILE','SSL_CERT_DIR','CA_BUNDLE']) delete childEnv[name];
     child = spawnImpl(cli, ['app-server', '-c', 'features.apps=true', '-c', 'cli_auth_credentials_store="file"'], { env: childEnv, stdio: ['pipe','pipe','pipe'] });
@@ -46,6 +34,7 @@ export async function remoteModels({ authPath = path.join(homedir(), '.codex/aut
     child.on('error', () => fail(new Error('Native connector start failed')));
     child.stdin.on('error', () => fail(new Error('Native connector write failed')));
     closed = new Promise(resolve => child.once('close', (code, signal) => { exit = { code, signal }; fail(new Error('Native connector closed')); resolve(exit); }));
+    if (child.pid) { scratch.spawned(child.pid); observeTimer = setInterval(() => scratch.observe(), 100); }
     child.stdout.on('data', b => {
       if (fatal) return;
       if (Buffer.byteLength(buffer) + b.length > 10 * 1024 * 1024) { fail(new Error('Native connector response exceeded bounded limit')); return; }
@@ -96,15 +85,28 @@ export async function remoteModels({ authPath = path.join(homedir(), '.codex/aut
     if (result?.source !== 'codex_app_server_model_list' || !Array.isArray(result.data) || result.data.length !== 1) throw new Error('Remote codex_models result was not verified');
     if (fs.existsSync(path.join(home, 'sessions'))) throw new Error('Native connector unexpectedly persisted context');
     verificationResult = { ok: true, route: 'native app-server -> codex_apps -> local_codex_bridge.codex_models', remote_origin: apps.httpOrigin, server: 'codex_apps', tool, arguments: { limit: 1 }, count: 1, source: result.source, body_recorded: false, mutation_sent: false, api_key_requested: false, api_key_written: false, model_turn_started: false };
-    return verificationResult;
-  } finally {
+  } catch (e) { rpcError = e; }
+  finally {
+    let closeError;
     if (child && closed) {
+      scratch.observe();
       child.stdin.end();
       const terminate = setTimeout(() => { if (!exit) child.kill('SIGTERM'); }, 3000);
       const kill = setTimeout(() => { if (!exit) child.kill('SIGKILL'); }, 5000);
       let deadline;
       try { await Promise.race([closed, new Promise((_, reject) => { deadline = setTimeout(() => reject(new Error('Owned native connector cleanup deadline')), 6000); })]); }
-      finally { clearTimeout(terminate); clearTimeout(kill); clearTimeout(deadline); cleanup(); }
-    } else cleanup();
+      catch (e) { closeError = e; }
+      finally { clearTimeout(terminate); clearTimeout(kill); clearTimeout(deadline); }
+    }
+    clearInterval(observeTimer);
+    const cleanup = scratch.finish(child ? exit : { spawn_error: true });
+    if (!cleanup.ok || closeError) {
+      const error = new Error('Native connector scratch cleanup failed');
+      error.failure_domain = 'scratch_cleanup'; error.verification_result = verificationResult;
+      error.rpc_error = rpcError?.message ?? null; error.cleanup = cleanup; throw error;
+    }
+    if (rpcError) { rpcError.cleanup = cleanup; throw rpcError; }
+    verificationResult.cleanup = cleanup;
   }
+  return verificationResult;
 }

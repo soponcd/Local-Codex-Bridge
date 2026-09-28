@@ -27,7 +27,7 @@ function fixture() {
   const backupRoot = dir(path.join(root, 'backups')), run = path.join(root, 'run'), hooks = path.join(root, 'hooks');
   const hookSource = write(path.join(root, 'source.mjs'), 'frozen hook\n');
   const trust = write(path.join(root, 'trust.mjs'), 'export const verifyAnchoredPackage=()=>({ok:true,files:128,links:0});\n');
-  const gates = write(path.join(root, 'gates.mjs'), 'export const verifyLive=async()=>({ok:true,healthz:{ok:true},readyz:{ok:true},control_plane:{ok:true,pid:Number(process.env.LCB_FIXTURE_PID)},wrapper:{ok:true}});export const remoteModels=async()=>({ok:true});export const daemonConfig=()=>({});export const verifyDaemon=async()=>({pid:93,start:"new Bridge",instance_id:"fixture",tunnel_pid:Number(process.env.LCB_FIXTURE_PID)});\n');
+  const gates = write(path.join(root, 'gates.mjs'), 'export const verifyLive=async()=>({ok:true,healthz:{ok:true},readyz:{ok:true},control_plane:{ok:true,pid:Number(process.env.LCB_FIXTURE_PID)},wrapper:{ok:true}});export const remoteModels=async({record})=>{if(process.env.LCB_FIXTURE_CLEANUP_FAIL){const cleanup={action:"remote_scratch_cleanup",directory:{path:"/synthetic/retained"},ok:false,partial:true,retained_paths:["/synthetic/retained"]};record(cleanup);throw Object.assign(new Error("scratch cleanup failed"),{failure_domain:"scratch_cleanup",verification_result:{ok:true},cleanup});}return {ok:true,cleanup:{ok:true}};};export const daemonConfig=()=>({});export const verifyDaemon=async()=>({pid:93,start:"new Bridge",instance_id:"fixture",tunnel_pid:Number(process.env.LCB_FIXTURE_PID)});\n');
   const source = file => ({ source: file, sha256: sha256(fs.readFileSync(file)), byte_length: fs.statSync(file).size });
   const original = { ...metadata(wrapper), byte_length: 385, bytes: originalBytes.toString(), state: 'present' };
   const c = {
@@ -86,6 +86,49 @@ test('real runBootstrap execute reads frozen manifest and legal prepared ledger 
   const f = fixture();
   try { const result = await runBootstrap(f.args); assert.equal(result.status, 'bootstrapped', JSON.stringify(result)); assert.equal(f.kicks, 1); assert.equal(result.host_target_mutations, undefined); assert.equal(fs.readFileSync(f.wrapper, 'utf8'), 'proposed wrapper\n'); }
   finally { f.cleanup(); }
+});
+
+test('native preflight cleanup failure preserves RPC PASS and partial residual before any bootstrap target or restart', async () => {
+  const f = fixture();
+  try {
+    process.env.LCB_FIXTURE_CLEANUP_FAIL = '1';
+    const result = await runBootstrap(f.args);
+    assert.equal(result.status, 'blocked'); assert.equal(f.kicks, 0); assert.equal(result.mutations.length, 0);
+    assert.equal(result.scratch_cleanup.ok, false); assert.deepEqual(result.scratch_cleanup.retained[0].retained_paths, ['/synthetic/retained']);
+    assert.equal(result.native_cleanup_failure.rpc.ok, true); assert.equal(result.native_cleanup_failure.cleanup.partial, true);
+    assert.deepEqual(fs.readFileSync(f.wrapper), f.originalBytes);
+    for (const file of f.c.live_prestate.absent_paths) assert.equal(fs.existsSync(file), false);
+    const records = fs.readFileSync(f.ledgerPath, 'utf8').trim().split('\n').map(JSON.parse);
+    assert.equal(records.at(-1).partial, true); assert.equal(records.at(-1).ok, false);
+  } finally { f.cleanup(); }
+});
+
+test('prepare binds native preflight evidence outside scratch and retains exactly two initial ledger records', async () => {
+  const f = fixture();
+  try {
+    const result = await runBootstrap({ ...f.args, phase: 'prepare' });
+    assert.equal(result.status, 'prepared', JSON.stringify(result)); assert.equal(f.kicks, 0); assert.equal(result.target_mutations, 0);
+    const manifest = JSON.parse(fs.readFileSync(path.join(result.backup, 'manifest.json')));
+    const evidence = manifest.native_preflight_evidence;
+    assert.equal(path.dirname(evidence.path), result.backup); assert.equal(evidence.mode, '0600');
+    assert.equal(sha256(fs.readFileSync(evidence.path)), evidence.sha256);
+    assert.equal(manifest.preflight.native_preflight.cleanup.ok, true);
+    assert.equal(fs.readFileSync(path.join(result.backup, 'owned-targets.jsonl'), 'utf8').trim().split('\n').length, 2);
+    assert.deepEqual(fs.readFileSync(f.wrapper), f.originalBytes);
+  } finally { f.cleanup(); }
+});
+
+test('prepare fails closed on native preflight cleanup before creating invocation backup', async () => {
+  const f = fixture();
+  try {
+    process.env.LCB_FIXTURE_CLEANUP_FAIL = '1';
+    const before = fs.readdirSync(f.c.backup.root);
+    const result = await runBootstrap({ ...f.args, phase: 'prepare' });
+    assert.equal(result.status, 'blocked'); assert.equal(result.host_target_mutations, false); assert.equal(f.kicks, 0); assert.equal(result.backup, null);
+    assert.equal(result.verification_result.ok, true); assert.equal(result.scratch_cleanup.ok, false);
+    assert.deepEqual(fs.readdirSync(f.c.backup.root), before);
+    assert.deepEqual(fs.readFileSync(f.wrapper), f.originalBytes);
+  } finally { f.cleanup(); }
 });
 
 for (const scenario of ['external manifest digest', 'frozen directory identity', 'recreated directory with self-authorizing ledger', 'ledger self authorization', 'ledger file replacement']) test(`execute rejects ${scenario} before target mutation or service command`, async () => {

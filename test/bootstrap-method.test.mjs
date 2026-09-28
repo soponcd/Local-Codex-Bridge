@@ -4,7 +4,102 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { createServer } from 'node:http';
-import { ownedProofLifecycle, gate, tunnelSnapshot, restartForRollback, verifyRollbackAttempt, metadata, sha256, canonical } from '../scripts/bootstrap-method.mjs';
+import { ownedProofLifecycle, ownedNativeScratch, nativeScratchLimits, gate, tunnelSnapshot, restartForRollback, verifyRollbackAttempt, metadata, sha256, canonical } from '../scripts/bootstrap-method.mjs';
+import { createServer as createSocketServer } from 'node:net';
+
+// Cleanup is limited to this test's exclusive mkdtemp root and never follows links.
+function scratchFixture(options = {}) {
+  const root = fs.mkdtempSync('/private/tmp/lcb-owned-scratch-test-'), records = [];
+  const lifecycle = ownedNativeScratch({ scratchParent: root, record: v => records.push(v), processTable: () => [], openFiles: paths => ({ ok: true, exact_paths: paths.length, holders: 0 }), ...options });
+  lifecycle.auth('synthetic auth');
+  const remove = file => { const s = fs.lstatSync(file); if (s.isDirectory()) { for (const name of fs.readdirSync(file)) remove(path.join(file, name)); fs.rmdirSync(file); } else fs.unlinkSync(file); };
+  return { root, home: lifecycle.home, lifecycle, records, cleanup() { remove(root); } };
+}
+
+test('native scratch accepts rotated auth and generated DB/cache/skills/plugin trees without reading content', () => {
+  const f = scratchFixture(), read = fs.readFileSync;
+  try {
+    fs.renameSync(path.join(f.home, 'auth.json'), path.join(f.home, 'old-auth.json')); fs.writeFileSync(path.join(f.home, 'auth.json'), 'rotated', { mode: 0o600 });
+    for (const name of ['state.sqlite', 'state.sqlite-wal', 'cache.json']) fs.writeFileSync(path.join(f.home, name), 'fixture', { mode: 0o600 });
+    for (const rel of ['skills/.system/sample', 'plugins/cache/sample/version']) { fs.mkdirSync(path.join(f.home, rel), { recursive: true, mode: 0o700 }); fs.writeFileSync(path.join(f.home, rel, 'SKILL.md'), 'fixture', { mode: 0o600 }); }
+    fs.readFileSync = () => { throw new Error('content read forbidden'); };
+    const result = f.lifecycle.finish({ spawn_error: true });
+    assert.equal(result.ok, true, result.error); assert.ok(result.inventory.length > 10); assert.equal(result.content_read, false); assert.equal(fs.existsSync(f.home), false);
+    assert.ok(!JSON.stringify(f.records).includes('synthetic auth')); assert.match(result.race_boundary, /same-UID/);
+  } finally { fs.readFileSync = read; f.cleanup(); }
+});
+
+for (const attack of ['symlink', 'hardlink', 'writable', 'owner', 'group', 'device', 'root drift', 'ancestor drift', 'file replacement', 'ancestor replacement']) test(`native scratch rejects ${attack} and retains all before deletion`, () => {
+  let victim, replaced = false;
+  const f = scratchFixture({ beforeDelete: item => {
+    if (attack === 'file replacement' && !replaced && item.type === 'file') { replaced = true; fs.renameSync(item.path, item.path + '-old'); fs.writeFileSync(item.path, 'replacement', { mode: 0o600 }); }
+    if (attack === 'ancestor replacement' && !replaced) { replaced = true; fs.renameSync(f.home, f.home + '-old'); fs.mkdirSync(f.home, { mode: 0o700 }); fs.writeFileSync(path.join(f.home, 'foreign'), 'retain', { mode: 0o600 }); }
+  } });
+  const lstat = fs.lstatSync;
+  try {
+    victim = path.join(f.home, 'victim'); fs.writeFileSync(victim, 'retain', { mode: 0o600 });
+    if (attack === 'symlink') fs.symlinkSync('victim', path.join(f.home, 'link'));
+    if (attack === 'hardlink') fs.linkSync(victim, path.join(f.root, 'outside-link'));
+    if (attack === 'writable') fs.chmodSync(victim, 0o620);
+    if (['owner', 'group', 'device'].includes(attack)) fs.lstatSync = (...args) => { const stat = lstat(...args); if (args[0] !== victim) return stat; const key = { owner: 'uid', group: 'gid', device: 'dev' }[attack]; return new Proxy(stat, { get: (target, prop) => prop === key ? target[prop] + 1 : typeof target[prop] === 'function' ? target[prop].bind(target) : target[prop] }); };
+    if (attack === 'root drift') { fs.renameSync(f.home, f.home + '-old'); fs.mkdirSync(f.home, { mode: 0o700 }); }
+    if (attack === 'ancestor drift') fs.chmodSync(f.root, 0o710);
+    const result = f.lifecycle.finish({ spawn_error: true });
+    assert.equal(result.ok, false); assert.equal(result.deleted_paths.length, 0); assert.deepEqual(result.retained_paths, [f.home]);
+    assert.equal(fs.existsSync(f.home), true);
+  } finally { fs.lstatSync = lstat; f.cleanup(); }
+});
+
+test('native scratch socket rejects entire inventory and leaves socket untouched', async () => {
+  const f = scratchFixture(), socket = path.join(f.home, 'socket'), server = createSocketServer();
+  await new Promise(resolve => server.listen(socket, resolve));
+  try { const result = f.lifecycle.finish({ spawn_error: true }); assert.equal(result.ok, false); assert.equal(result.deleted_paths.length, 0); assert.equal(fs.lstatSync(socket).isSocket(), true); }
+  finally { await new Promise(resolve => server.close(resolve)); f.cleanup(); }
+});
+
+for (const limit of ['depth', 'entries', 'bytes', 'path_bytes', 'deadline_ms']) test(`native scratch bounded ${limit} inventory preserves entire tree`, () => {
+  const limits = { ...nativeScratchLimits, [limit]: 1 };
+  const f = scratchFixture({ limits, processTable: () => { if (limit === 'deadline_ms') { const stop = Date.now() + 3; while (Date.now() < stop) {} } return []; } });
+  try {
+    fs.mkdirSync(path.join(f.home, 'a')); fs.mkdirSync(path.join(f.home, 'a/b'));
+    const result = f.lifecycle.finish({ spawn_error: true }); assert.equal(result.ok, false); assert.equal(result.deleted_paths.length, 0); assert.equal(fs.existsSync(path.join(f.home, 'auth.json')), true);
+  } finally { f.cleanup(); }
+});
+
+for (const phase of ['child live', 'descendant live', 'closed', 'unknown exit', 'process failure']) test(`native scratch process lifecycle ${phase}`, () => {
+  const child = { pid: 777, ppid: process.pid, uid: process.getuid(), start: 'owned child' }, descendant = { pid: 778, ppid: 777, uid: process.getuid(), start: 'owned descendant' };
+  let table = [child, descendant], unavailable = false;
+  const f = scratchFixture({ processTable: () => { if (unavailable) throw new Error('process inventory unavailable'); return table; } });
+  try {
+    f.lifecycle.spawned(child.pid); f.lifecycle.observe();
+    table = phase === 'child live' ? [child] : phase === 'descendant live' ? [{ ...descendant, ppid: 1 }] : [];
+    if (phase === 'process failure') unavailable = true;
+    const result = f.lifecycle.finish(phase === 'unknown exit' ? null : { code: 0, signal: null });
+    assert.equal(result.ok, phase === 'closed'); assert.equal(result.child.start, child.start); assert.equal(result.descendants[0].start, descendant.start);
+    if (!result.ok) assert.equal(result.deleted_paths.length, 0);
+  } finally { f.cleanup(); }
+});
+
+test('actual lsof rejects an open file even when owned native child has exited', () => {
+  const f = scratchFixture({ openFiles: undefined }); const fd = fs.openSync(path.join(f.home, 'auth.json'), 'r');
+  try { const result = f.lifecycle.finish({ spawn_error: true }); assert.equal(result.ok, false); assert.match(result.error, /holders|lsof/); assert.equal(result.deleted_paths.length, 0); }
+  finally { fs.closeSync(fd); f.cleanup(); }
+});
+
+test('external same-UID process replaces an inventoried leaf; cleanup stops with partial residual', () => {
+  let replaced = false;
+  const f = scratchFixture({ beforeDelete: (item, removed) => {
+    if (!replaced && removed === 1 && item.type === 'file') {
+      replaced = true; const r = spawnSync(process.execPath, ['-e', 'const fs=require("fs");const p=process.argv[1];fs.renameSync(p,p+"-old");fs.writeFileSync(p,"foreign",{mode:0o600});', item.path]); assert.equal(r.status, 0);
+    }
+  } });
+  try {
+    for (const name of ['a', 'b']) fs.writeFileSync(path.join(f.home, name), 'owned', { mode: 0o600 });
+    const result = f.lifecycle.finish({ spawn_error: true });
+    assert.equal(replaced, true); assert.equal(result.ok, false); assert.equal(result.partial, true); assert.equal(result.deleted_paths.length, 1); assert.equal(fs.existsSync(f.home), true); assert.match(result.error, /replaced/);
+    assert.ok(fs.readdirSync(f.home).some(name => name.endsWith('-old')));
+  } finally { f.cleanup(); }
+});
 
 function fixture() {
   const root = fs.mkdtempSync('/private/tmp/lcb-bootstrap-method-test-');
