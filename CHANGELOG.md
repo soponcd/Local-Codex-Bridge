@@ -1,6 +1,20 @@
 # 更新日志
 
-版本章节记录公共仓库的工程变更；提交与 push 不等于已创建 tag、GitHub Release 或完成部署。当前公开版本为 **V2.1.3**；公共历史中没有单独的 V2.1.0 发布记录。
+版本章节记录公共仓库的工程变更；提交与 push 不等于已创建 tag、GitHub Release 或完成部署。当前公开版本为 **V2.3.0**；公共历史中没有单独的 V2.1.0 发布记录。
+
+## V2.3.0（2026-09-28）
+
+- 新增 `codex_history`、`codex_goal`、`codex_queue`、`codex_search`，公开 MCP 工具由 8 个扩展为 12 个。持久 History、Goal、Queue、Search 与执行生命周期仍由 native Codex 持有，Bridge 不创建平行存储、调度器或索引。
+- History 区分 paginated turn 索引 / items 分页与 legacy 完整 turn 分页，保留原生 cursor 与可交付的长文本。成功页须无损通过结构、脱敏与字节预算检查；失败不返回部分 data / cursor，也不自动 full-read。线程元数据读取不再加载 turns，恢复持久内容统一走 History，线程续接使用 `excludeTurns:true`。
+- 所有成功工具结果统一放在 `structuredContent`，text content 只保留简短标记。旧客户端需迁移成功结果解析；`codex_threads(include_turns:true)` 返回迁移提示，Bridge runtime 丢失后的 observe 明确返回 live 状态未知，不从 History 重建。
+- `codex_observe` 默认提供 compact typed supervision facts，并保留 raw 窄读；支持一次最长 120 秒的固定截止、事件驱动等待。compact 对保留的流式活动做有界计数，未知或不兼容事件保留为诊断事实；沿 `next_cursor` 续读，不自行判断 stalled。
+- 有界 runtime ring 分开保护监督事实与流式活动，并通过 `stream_lost` / `facts_lost` 标明丢失。pending requests 与 latest terminal 独立于 ring 保留；compact 在 live runtime 可用且 pending 集合为空时省略该字段，缺省不代表沿用旧列表。
+- Goal set 要求显式 `preserve` / `unlimited` / `fixed` 预算意图；Queue 映射原生 follow-up 的 list / add / update / delete / reorder；Search 返回原生线程或 occurrence locator，并可用同一 thread 的 `turnCursor` 窄读 History。这些调用不隐式 resume / start，不自动重试；原生 active Goal 仍可能执行，Goal clear 与 Queue delete 均不等于 turn interruption。
+- `codex_threads` 保留原生 capability / lineage 字段及其 null / 缺省语义，支持显式 parent / ancestor / source 筛选。spawned lineage 与 fork lineage 分开，筛选和 capability 不构成访问控制、writer lease 或 Bridge 接管权限。
+- 补齐命令审批的 session decision、exec-policy amendment 与 network-policy amendment 映射及冲突校验；保留原始 typed request ID 和准确 scope，校验失败不消费 pending request，未知 response contract 继续保持可观察。
+- 兼容 Tunnel 在同一 stdio 子进程内转发的独立 initialize：每次合法握手单独协商，保留已有 live state。回归覆盖 active observe 的取消 / 继续接收事件、pending request 保留与准确回答；不扩大为跨客户端多 writer 保证。
+- 增加 `interrupted + error` compatibility canary，锁定现有 status-first 终态语义：final 文本与 error 可同时存在，raw / compact 保持 interrupted，History 原样交付。该测试不将 upstream main / prerelease 的新形态升格为稳定依赖。
+- 增加当前安装版本的 compact notification shape / method / item 检查，容忍跨平台 CRLF，修正 History 测试的 cwd 平台夹具。更新人读 README 与 Agent 工程说明，并同步 V2.3.0 版本锚点；现有 `smoke:live` 标为尚未适配当前契约的历史辅助脚本。
 
 ## V2.1.3（2026-08-24）
 
