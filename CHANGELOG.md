@@ -1,8 +1,8 @@
 # 更新日志
 
-版本章节记录公共仓库的工程变更；提交与 push 不等于已创建 tag、GitHub Release 或完成部署。当前公开版本为 **V2.3.1**；公共历史中没有单独的 V2.1.0 发布记录。
+版本章节记录公共仓库的工程变更；提交与 push 不等于已创建 tag、GitHub Release 或完成部署。当前公开版本为 **V2.3.2**；公共历史中没有单独的 V2.1.0 发布记录。
 
-## 未发布
+## V2.3.2（2026-09-29）
 
 - 将 History / Goal / Queue / Search 的精确交付判定与 observe 有损投影预算解耦；History / Search 提供默认 protected 与单次显式 exact 内容选择。Goal / Queue 原值往返，并在 mutation 前检查已知回显的字节预算；保留 acknowledged-but-undeliverable 与 UNKNOWN 的区别。
 - 隔离可选 UX projection 的 I/O 失败，后续自然发布可恢复；不污染已接受 mutation、不触发 app-server fatal。
