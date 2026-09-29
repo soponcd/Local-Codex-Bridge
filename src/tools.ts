@@ -90,7 +90,7 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
     name: "codex_threads",
     title: "Codex Threads",
     description:
-      "List or search persistent native threads, or read one thread's metadata without loading turns. include_turns:true returns a migration error; use codex_history for persistent history. Native canAcceptDirectInput (boolean or null) and lineage fields remain native facts, not Bridge write authorization; an absent field stays absent. List filters can select direct children or spawned descendants; source_kinds must explicitly include subagents when needed because native defaults to interactive sources. No metadata read reconstructs live Bridge events.",
+      "List/search persistent native threads or read one thread's metadata. Use codex_history for turns; include_turns:true errors. Capability and lineage fields are native metadata, not writer authorization. Include subagent source_kinds explicitly; native defaults to interactive sources. Metadata cannot reconstruct live Bridge state.",
     inputSchema: {
       type: "object",
       properties: {
@@ -98,55 +98,55 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
           type: "string",
           minLength: 1,
           maxLength: 200,
-          description: "When supplied, read this exact Codex thread instead of listing threads.",
+          description: "Read this exact thread instead of listing.",
         },
         include_turns: {
           type: "boolean",
-          description: "Legacy parameter: false reads metadata; true returns a migration error directing callers to codex_history.",
+          description: "Legacy: true errors; use codex_history.",
         },
         cwd: {
           type: "string",
           maxLength: 1000,
-          description: "Optional exact absolute native cwd filter for thread/list.",
+          description: "Exact absolute native cwd filter.",
         },
         parent_thread_id: {
           type: ["string", "null"],
           minLength: 1,
           maxLength: 200,
           pattern: "\\S",
-          description: "List direct spawned children of this native parent. Mutually exclusive with a non-null ancestor_thread_id. Does not select forks or implicitly include subagent sources.",
+          description: "Direct spawned children, not forks; select subagent sources separately.",
         },
         ancestor_thread_id: {
           type: ["string", "null"],
           minLength: 1,
           maxLength: 200,
           pattern: "\\S",
-          description: "List spawned descendants at any depth, excluding the ancestor itself. Mutually exclusive with a non-null parent_thread_id. Native filtering only; no Bridge tree walk.",
+          description: "Spawned descendants at any depth, excluding the ancestor; not forks.",
         },
         source_kinds: {
           type: ["array", "null"],
           items: { type: "string", enum: THREAD_SOURCE_KINDS },
           maxItems: 100,
-          description: "Native source filter. Omitted, null, or [] retains native interactive-source defaults; use subAgentThreadSpawn explicitly for spawned threads. Order and duplicates are forwarded. At most 100 entries is a transport bound.",
+          description: "Omitted/null/[] keeps native interactive defaults; include subAgentThreadSpawn for spawned threads.",
         },
         search_term: {
           type: "string",
           minLength: 1,
           maxLength: 500,
-          description: "Optional Codex title substring filter for thread/list.",
+          description: "Codex title substring filter.",
         },
         cursor: {
           type: "string",
           minLength: 1,
           maxLength: 10000,
-          description: "Opaque cursor returned by a prior thread/list call.",
+          description: "Thread-list cursor only.",
         },
         limit: {
           type: "integer",
           minimum: 1,
           maximum: 100,
           default: 20,
-          description: "Maximum threads in the returned page.",
+          description: "Thread page size.",
         },
       },
       oneOf: [
@@ -171,17 +171,17 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
     name: "codex_history",
     title: "Codex History",
     description:
-      "Read one lossless native persisted history page, without attaching a writer or rebuilding Bridge live state. Paginated threads provide a turn index (turns) or items within a required turn_id (items). Legacy threads provide one full turn per page (turns, limit 1); item paging is unsupported. Keep opaque string cursors with the same thread, history mode, kind, turn scope, and sort direction; reverse cursors use the opposite direction. Only nextCursor:null means end. Size, content_policy or defensive structure failures reject the whole page without partial data; a single legacy turn may be undeliverable. No cache, full-thread fallback, or chunk cursor.",
+      "Read one lossless native persisted history page; this does not restore Bridge live state. Paginated mode supports turns or items within a turn; legacy mode supports one full turn, without item paging. Keep History cursors within the same thread/mode/kind/turn/sort scope; only nextCursor:null ends paging. Size, content-policy, or structure failure rejects the whole page without partial data or fallback.",
     inputSchema: {
       type: "object",
       properties: {
         thread_id: { type: "string", minLength: 1, maxLength: 200, pattern: "\\S" },
         kind: { type: "string", enum: ["turns", "items"] },
-        content_policy: { type: "string", enum: ["protected", "exact"], default: "protected", description: "protected rejects secret-shaped content. exact returns native text unchanged for this call and may expose sensitive content to the MCP caller. This is an explicit content choice, not an access-control or safety level; no automatic fallback." },
+        content_policy: { type: "string", enum: ["protected", "exact"], default: "protected", description: "protected rejects secret-shaped content; exact exposes unchanged native text for this call. No fallback; neither value is an access-control level." },
         turn_id: { type: "string", minLength: 1, maxLength: 200, pattern: "\\S" },
-        cursor: { type: "string", minLength: 1, maxLength: 10_000, pattern: "\\S", description: "Native history cursor; separate from thread/list and numeric live observe cursors." },
-        limit: { type: "integer", minimum: 1, maximum: HISTORY_TURN_LIMIT, description: "Paginated turns: default 20, max 50. Paginated items: default 10, max 20. Legacy turns: default and max 1, checked after metadata read." },
-        sort_direction: { type: "string", enum: ["asc", "desc"], description: "Defaults to desc for turns and asc for items." },
+        cursor: { type: "string", minLength: 1, maxLength: 10_000, pattern: "\\S", description: "Native History cursor, not a thread-list, Search, or live Observe cursor." },
+        limit: { type: "integer", minimum: 1, maximum: HISTORY_TURN_LIMIT, description: "Paginated turns default 20; items default 10/max 20; legacy turns require 1." },
+        sort_direction: { type: "string", enum: ["asc", "desc"], description: "Turns default desc; items default asc. Use the opposite direction with a reverse cursor." },
       },
       required: ["thread_id", "kind"],
       oneOf: [
@@ -202,20 +202,20 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
     name: "codex_search",
     title: "Search Native Codex History",
     description:
-      "Read one native search page without resuming threads, loading full histories or rebuilding Bridge live state. kind=threads maps thread/search for native substring/full-text thread discovery with snippets, distinct from the codex_threads title filter. Native search has no cwd/parent/ancestor filter: it searches native-visible threads selected only by source_kinds and archived, never an implied workspace or ACL. kind=occurrences maps thread/searchOccurrences within one required paginated thread: case-insensitive literal substring matches in visible user and final assistant messages, in chronological message order, not every tool/reasoning item. Native owns indexing, matching and ordering; Bridge has no index, relevance scoring, traversal or fallback. Preserve the exact query and filters on continuation; only nextCursor:null means end, not an empty page. Thread-search backwardsCursor is used with the opposite sort_direction; occurrence turnCursor is an inclusive native history anchor for codex_history(kind=turns, same thread), not a search continuation. snippetMatchRange uses UTF-16 code units, end exclusive. Eligible pages and future fields are unchanged; content_policy, defensive structure, invalid fields or the 256 KiB result-body bound produce search_result_not_deliverable with no partial data/cursor. Native errors, including unsupported history modes, propagate without retry. Search results are locators, not a complete history audit or a snapshot guarantee.",
+      "Search native threads or locate message occurrences within one paginated thread; use codex_history to read content. Thread search differs from the codex_threads title filter and does not infer a workspace or ACL. Occurrences are case-insensitive literal matches in visible user and final assistant messages, not every item. Preserve query/scope/filters across Search pages; only nextCursor:null ends paging. An occurrence turnCursor anchors same-thread History, not Search continuation. Content-policy, size, or structure failure rejects the whole page without partial data/cursor. Results are locators, not a full history audit.",
     inputSchema: {
       type: "object",
       properties: {
         kind: { type: "string", enum: ["threads", "occurrences"] },
-        content_policy: { type: "string", enum: ["protected", "exact"], default: "protected", description: "protected rejects secret-shaped content. exact returns native text unchanged for this call and may expose sensitive content to the MCP caller. This is an explicit content choice, not an access-control or safety level; no automatic fallback." },
-        search_term: { type: "string", minLength: 1, maxLength: 500, pattern: "\\S", description: "Native query, forwarded unchanged. Length bound is for transport; Bridge does not tokenize, trim or interpret it." },
-        thread_id: { type: "string", minLength: 1, maxLength: 200, pattern: "\\S", description: "Required only for occurrences. Exact native paginated thread." },
-        cursor: { type: "string", minLength: 1, maxLength: 10_000, pattern: "\\S", description: "Opaque search continuation for the same kind, query, scope and filters. Never substitute an occurrence's turnCursor here." },
+        content_policy: { type: "string", enum: ["protected", "exact"], default: "protected", description: "protected rejects secret-shaped content; exact exposes unchanged native text for this call. No fallback; neither value is an access-control level." },
+        search_term: { type: "string", minLength: 1, maxLength: 500, pattern: "\\S", description: "Native query, forwarded unchanged." },
+        thread_id: { type: "string", minLength: 1, maxLength: 200, pattern: "\\S", description: "Occurrences: exact native paginated thread." },
+        cursor: { type: "string", minLength: 1, maxLength: 10_000, pattern: "\\S", description: "Search continuation for the same query/scope/filters; never use occurrence turnCursor." },
         limit: { type: "integer", minimum: 1, maximum: SEARCH_PAGE_LIMIT, default: 20 },
-        sort_key: { type: ["string", "null"], enum: ["created_at", "updated_at", "recency_at", null], description: "Threads only. Omission/null retains native created_at default." },
-        sort_direction: { type: ["string", "null"], enum: ["asc", "desc", null], description: "Threads only. Omission/null retains native descending default. Occurrences have native chronological order." },
-        source_kinds: { type: ["array", "null"], items: { type: "string", enum: THREAD_SOURCE_KINDS }, maxItems: 100, description: "Threads only. Omitted/null/[] keeps native interactive-source defaults; select subagents explicitly. No deduplication or expansion." },
-        archived: { type: ["boolean", "null"], description: "Threads only. true searches archived threads; false/null/omission searches non-archived threads." },
+        sort_key: { type: ["string", "null"], enum: ["created_at", "updated_at", "recency_at", null], description: "Threads only; omission/null uses native created_at." },
+        sort_direction: { type: ["string", "null"], enum: ["asc", "desc", null], description: "Threads only; omission/null uses native descending order. Use the opposite direction with backwardsCursor." },
+        source_kinds: { type: ["array", "null"], items: { type: "string", enum: THREAD_SOURCE_KINDS }, maxItems: 100, description: "Threads only; omitted/null/[] keeps native interactive defaults. Select subagents explicitly." },
+        archived: { type: ["boolean", "null"], description: "Threads only; true selects archived threads." },
       },
       required: ["kind", "search_term"],
       oneOf: [
@@ -230,7 +230,7 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
     name: "codex_models",
     title: "Codex Models",
     description:
-      "Read one current model/list page directly from Codex app-server. Results are bounded and sanitized, cursors are opaque, hidden models are omitted unless include_hidden is true, and the Bridge keeps no model catalog cache or current-model registry.",
+      "Read one current native model/list page. The Bridge keeps no model catalog or current-model registry.",
     inputSchema: {
       type: "object",
       properties: {
@@ -267,7 +267,7 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
     name: "codex_goal",
     title: "Manage Native Codex Goal",
     description:
-      "Get, set, or clear the native persisted goal of an exact thread. Each call maps one thread/goal method without implicit resume, turn/start, retries, a goal cache, or checkpoint writes. Active goals may cause native execution; clear is not turn interrupt. Set requires explicit budget_mode with no default: preserve omits native tokenBudget, unlimited sends null, fixed sends the required positive safe-integer token_budget. A budget is an optional native Goal resource ceiling: ordinarily choose unlimited for a long-running goal, fixed only when a hard cap is intended, and preserve when editing an existing goal without changing its budget. The budget gate does not apply to ordinary turns, Queue or Steer. Native Codex validates objectives and owns status transitions and usage accounting. Success returns native content unchanged without secret-shape filtering; known oversized echoed input is rejected before mutation. goal_result_not_deliverable means native returned success but its result could not be delivered losslessly, including an acknowledged mutation for set/clear. An already-sent mutating acknowledgement timeout instead means UNKNOWN / possibly accepted. Read native goal state before deciding on another mutation; do not directly retry.",
+      "Get/set/clear one native persisted thread Goal; this does not start a turn or write a checkpoint. Active goals may cause native execution; clear does not interrupt a turn. Set requires budget_mode: preserve omits tokenBudget, unlimited sends null, fixed sends token_budget. goal_result_not_deliverable means acknowledged success without lossless delivery. A sent mutation timeout is UNKNOWN / possibly accepted: read native Goal state before deciding on another write; do not retry automatically.",
     inputSchema: {
       type: "object",
       properties: {
@@ -275,13 +275,13 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
         thread_id: { type: "string", minLength: 1, maxLength: 200, pattern: "\\S" },
         objective: {
           type: ["string", "null"],
-          description: "Set only. Native Codex enforces its non-empty, 4,000-character objective contract; Bridge forwards the string unchanged and does not count or truncate it. Omission/null preserves the existing objective.",
+          description: "Set: forwarded unchanged; omission/null preserves the objective. Native enforces its text limit.",
         },
-        status: { type: ["string", "null"], enum: [...GOAL_STATUSES, null], description: "Set only. Native status; omission/null preserves the existing status." },
-        budget_mode: { type: "string", enum: ["preserve", "unlimited", "fixed"], description: "Required for set, with no default. preserve omits native tokenBudget; unlimited sends null; fixed requires token_budget. Only fixed accepts an amount." },
+        status: { type: ["string", "null"], enum: [...GOAL_STATUSES, null], description: "Set: omission/null preserves native status." },
+        budget_mode: { type: "string", enum: ["preserve", "unlimited", "fixed"], description: "preserve omits native tokenBudget; unlimited sends null; fixed uses token_budget." },
         token_budget: {
           type: "integer", minimum: 1, maximum: Number.MAX_SAFE_INTEGER,
-          description: "Required only for budget_mode=fixed. A positive native Goal resource ceiling. The maximum is a JavaScript lossless transport bound, not a goal business rule. No default budget; do not send this field for preserve/unlimited.",
+          description: "Native Goal resource ceiling for fixed mode. Maximum is a JavaScript lossless transport bound.",
         },
       },
       required: ["action", "thread_id"],
@@ -306,18 +306,18 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
     name: "codex_queue",
     title: "Codex Native Queue",
     description:
-      "List, add, update, delete or reorder native queued follow-up text for an existing active workflow. Native Codex owns ordering and automatic execution after the current turn; an enqueue acknowledgement is not execution or completion. This differs from codex_steer, which redirects the current turn. Each call forwards one native queue operation, with no implicit resume, turn-start, queue-start, traversal, retry, scheduler or Bridge queue store. Use caller-supplied client_user_message_id for add and native queuedSubmission.id for update/delete/reorder; do not assume an idempotency guarantee. An already-sent mutation timeout is UNKNOWN; read queue and execution state before deciding on another write. queue_result_not_deliverable means native returned success but its result could not be delivered losslessly; for mutations the acknowledgement is retained. No retry or compensation is performed. Queue entries may be consumed while inspecting or editing them. Successful reads and responses preserve native content without secret-shape filtering. This surface supports text only; update replaces the entire native input array with one text item.",
+      "List/add/update/delete/reorder native queued follow-up text. Queue runs after active work; codex_steer redirects the current turn. Enqueue acknowledgement is not execution or completion. Native may consume entries while you inspect them. queue_result_not_deliverable means acknowledged success without lossless delivery. A sent mutation timeout is UNKNOWN / possibly accepted: inspect queue and execution state before another write; do not retry automatically.",
     inputSchema: {
       type: "object",
       properties: {
         action: { type: "string", enum: QUEUE_ACTIONS },
         thread_id: { type: "string", minLength: 1, maxLength: 200, pattern: "\\S" },
-        text: { type: "string", minLength: 1, maxLength: 200_000, pattern: "\\S", description: "Follow-up text for add or full input replacement for update. Input transport bound; a serialized UTF-8 preflight also reserves response overhead before writing. Unpredictable native fields can still make an acknowledged result undeliverable." },
-        client_user_message_id: { type: "string", minLength: 1, maxLength: 200, pattern: "\\S", description: "Required caller-provided native clientUserMessageId for add; Bridge never generates or retries it." },
-        queued_submission_id: { type: "string", minLength: 1, maxLength: 200, pattern: "\\S", description: "Exact native queuedSubmission.id for update/delete; not a turn id or client message id." },
-        queued_submission_ids: { type: "array", maxItems: QUEUE_PAGE_LIMIT, items: { type: "string", minLength: 1, maxLength: 200, pattern: "\\S" }, description: "Native pending submission IDs in the requested order. Pass the full intended ordering; native validates membership/permutation. No read/merge/deduplication or retry. The array bound is not native queue capacity." },
-        cursor: { type: "string", minLength: 1, maxLength: 10_000, pattern: "\\S", description: "Opaque native queue-list cursor; not a history or observe cursor." },
-        limit: { type: "integer", minimum: 1, maximum: QUEUE_PAGE_LIMIT, default: 20, description: "Maximum entries requested in this single native queue page." },
+        text: { type: "string", minLength: 1, maxLength: 200_000, pattern: "\\S", description: "Add text or full input replacement for update." },
+        client_user_message_id: { type: "string", minLength: 1, maxLength: 200, pattern: "\\S", description: "Caller-provided native clientUserMessageId for add; Bridge never generates it." },
+        queued_submission_id: { type: "string", minLength: 1, maxLength: 200, pattern: "\\S", description: "Native queuedSubmission.id, not a turn or client message id." },
+        queued_submission_ids: { type: "array", maxItems: QUEUE_PAGE_LIMIT, items: { type: "string", minLength: 1, maxLength: 200, pattern: "\\S" }, description: "Full intended order of native pending submission IDs; no Bridge merge or deduplication." },
+        cursor: { type: "string", minLength: 1, maxLength: 10_000, pattern: "\\S", description: "Native Queue-list cursor only." },
+        limit: { type: "integer", minimum: 1, maximum: QUEUE_PAGE_LIMIT, default: 20, description: "Queue page size." },
       },
       required: ["action", "thread_id"],
       oneOf: [
@@ -338,7 +338,7 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
     name: "codex_turn",
     title: "Start or Continue Codex Turn",
     description:
-      "Start a persistent Codex thread and turn, or resume an existing thread and start a turn. Prefer continuing the same native thread when its context remains useful, but a fresh thread is allowed; thread_id is not a permanent task identity. Explicit model or effort overrides are validated against a fresh model/list catalog without caching. Effort alone is checked only against efforts advertised somewhere in that catalog; the Bridge does not infer the current thread model, so app-server remains authoritative for current-model compatibility. Returns as soon as turn/start is accepted; observe separately for events and completion. If an already-sent mutating acknowledgement times out, the outcome is UNKNOWN and the request was possibly accepted; observe/read before any retry, and never directly retry it.",
+      "Start a native persistent thread and turn, or resume a thread and start a turn. Acceptance is not completion; use codex_observe. A thread_id is not a permanent task identity. Model/effort overrides use a fresh native catalog; Codex decides current-model compatibility. A sent mutation timeout is UNKNOWN / possibly accepted: observe/read before another write; do not retry automatically.",
     inputSchema: {
       type: "object",
       properties: {
@@ -363,13 +363,13 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
           type: "string",
           minLength: 1,
           maxLength: 100,
-          description: "Optional model/list id or model identifier, validated on demand and passed through unchanged.",
+          description: "Native model/list id or identifier; validated on demand.",
         },
         effort: {
           type: "string",
           minLength: 1,
           maxLength: 32,
-          description: "Optional reasoning effort. With no model, only catalog-wide token existence is checked; current-model compatibility remains native-authoritative.",
+          description: "Without model, only catalog-wide availability is checked; Codex decides compatibility.",
         },
         sandbox: sandboxSchema,
         approval_policy: approvalPolicySchema,
@@ -390,22 +390,22 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
     name: "codex_observe",
     title: "Observe Codex Turn",
     description:
-      "Read bounded incremental sanitized Bridge runtime events, pending requests, and terminal output for a thread. Default compact view projects supervision facts and counts only scanned retained activity. Raw returns individual retained sanitized events with original runtime cursors, without aggregation; internal cursor gaps are possible, so it is not a complete native stream. stream_lost reports evicted allowlisted, valid streaming deltas; facts_lost reports eviction of other events; cursor_lost summarizes either. Loss covers the unscanned cursor-to-head range checked during the read, not only the returned page. cursor_floor locates the oldest retained event boundary, not a continuous suffix or an instruction to skip records. Always reuse next_cursor to consume remaining retained events. Compact drains silent retained events across chunks and wakes on supervision facts or facts_lost; stream_lost alone is diagnostic metadata, does not wake compact early, and does not require raw replay. Optional wait_ms performs one bounded event-driven wait with a fixed per-call deadline (maximum 120 seconds); 0 returns immediately. A true-silence deadline returns only runtime_available, runtime_status, active_turn_id, next_cursor, and no_change: true; activity or loss is not silence. Use view=raw with a chosen runtime cursor and wait_ms=0 for retained-event replay. Pending requests and latest terminal output remain separately available even after their ring events are evicted. terminal.final_result_pending means follow next_cursor for final content; completeness metadata appears at its delivery boundary. final_result_meta.complete is false for truncated or partial source text; raw also has a 48k live text cap. Use narrow codex_history for this thread/terminal turn or native inspection when more content is needed. When runtime_available is true, pending_requests is the complete current pending set, not an incremental patch. Compact omits it when empty; an absent field means no pending requests, so clear any previously observed list. When runtime_available is false, pending state is unknown, even if the field is absent or an empty array. After Bridge process loss, metadata-only thread/read cannot reconstruct live events, pending requests, cursor, active turn, or terminal; page persistent history through codex_history if needed. A long interval with no new command or output can still mean Codex is actively reasoning; absence of new command activity alone is not evidence of a stall. When actively supervising an in-progress turn, use repeated bounded-wait observe calls until terminal unless the user explicitly pauses or stops; do not end supervision merely because one snapshot is inProgress. After every wake or deadline return, inspect the newly available events/state and decide whether steer, respond, or interruption is needed before starting the next bounded wait.",
+      "Read bounded live Bridge events, pending requests, and terminal output; persistent content belongs to codex_history. Continue with next_cursor, never substitute cursor_floor after loss. stream_lost means evicted streaming deltas; facts_lost means evicted other supervision events; cursor_lost summarizes either. Raw shows retained events, not a complete native stream. When runtime_available:true, pending_requests is a full snapshot and absence in compact means empty; when runtime_available:false, pending state is unknown. Judge terminals by terminal.status, not final_result or error presence. terminal.final_result_pending means continue via next_cursor for final content; incomplete final_result_meta needs History/native inspection. wait_ms is one bounded wait. No command output alone does not mean stalled. While inProgress, continue repeated bounded observe calls; after each wake/deadline inspect new state before choosing steer, respond, or interrupt.",
     inputSchema: {
       type: "object",
       properties: {
-        thread_id: { type: "string", minLength: 1, maxLength: 200, description: "Codex thread to observe." },
+        thread_id: { type: "string", minLength: 1, maxLength: 200, description: "Thread with live Bridge state." },
         cursor: {
           type: "integer",
           minimum: 0,
-          description: "Continue from next_cursor; deliberate older values replay retained events. Original per-event runtime cursors may have internal gaps. Never replace next_cursor with cursor_floor after loss.",
+          description: "Live numeric cursor; continue from next_cursor. Older values replay retained events; cursor_floor is not continuation.",
         },
         limit: {
           type: "integer",
           minimum: 1,
           maximum: 100,
           default: 50,
-          description: "Maximum compact facts or retained raw events to return; compact may scan more silent retained events internally. Loss metadata can cover events beyond this page.",
+          description: "Returned fact/event page size; loss may cover more than this page.",
         },
         wait_ms: {
           type: "integer",
@@ -413,13 +413,13 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
           maximum: MAX_OBSERVE_WAIT_MS,
           default: 0,
           description:
-            "Optional fixed per-call wait for a supervision wake, facts loss, or deadline in compact view; stream loss alone does not wake compact early. Raw waits for retained events/state. 0 reads currently available events immediately. This is not stall detection.",
+            "One bounded wait; 0 reads immediately. Compact wakes for supervision facts or facts_lost, not stream_lost alone; waiting is not stall detection.",
         },
         view: {
           type: "string",
           enum: ["compact", "raw"],
           default: "compact",
-          description: "Compact facts by default; raw returns retained individual sanitized event envelopes with original runtime cursors and possible internal gaps. Neither view restores evicted events; use next_cursor for pagination.",
+          description: "Raw shows retained sanitized events with possible cursor gaps; neither view restores evicted events.",
         },
       },
       required: ["thread_id"],
@@ -437,7 +437,7 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
     name: "codex_steer",
     title: "Steer Active Codex Turn",
     description:
-      "Append text to the same active Codex turn using turn/steer with an expected turn-id precondition. This does not create a new turn. Do not steer merely because reasoning is taking a long time or no new command has appeared; steer only for a semantic redirect or correction based on new evidence or changed user intent. If an already-sent mutating acknowledgement times out, the outcome is UNKNOWN and the request was possibly accepted; observe/read before any retry, and never directly retry it.",
+      "Redirect or correct the exact active turn; this does not start a new turn. Do not steer for silence or elapsed time alone. A sent mutation timeout is UNKNOWN / possibly accepted: observe/read before another write; do not retry automatically.",
     inputSchema: {
       type: "object",
       properties: {
@@ -465,7 +465,7 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
     name: "codex_respond",
     title: "Respond to Codex Request",
     description:
-      "Answer one currently pending app-server server request by its original raw JSON-RPC id and exact thread/method scope. Supports stable item/commandExecution/requestApproval, item/fileChange/requestApproval, item/permissions/requestApproval, and item/tool/requestUserInput contracts, plus existing legacy execCommandApproval/applyPatchApproval compatibility. Unsupported or unknown methods fail locally and remain pending; do not guess a future response contract.",
+      "Answer one pending native request using its original typed request id and exact method, thread, and turn scope when applicable. Supported approval and user-input methods use their native response shapes. Unsupported methods fail locally and remain pending; do not guess a response shape.",
     inputSchema: {
       type: "object",
       properties: {
@@ -495,7 +495,7 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
           },
           required: ["host", "action"],
           additionalProperties: false,
-          description: "Native network policy amendment for future requests; valid only for item/commandExecution/requestApproval. Provide exactly one of decision, execpolicy_amendment, network_policy_amendment, answers, permissions, or response.",
+          description: "Future network policy amendment for item/commandExecution/requestApproval only; use one response field per call.",
         },
         answers: {
           type: "object",
@@ -522,7 +522,7 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
         response: {
           type: "object",
           additionalProperties: true,
-          description: "Exact generic result object for item/tool/requestUserInput; unsupported or future methods remain pending and are rejected locally.",
+          description: "Exact result object for item/tool/requestUserInput; unsupported methods remain pending.",
         },
       },
       required: ["request_id", "thread_id", "method"],
@@ -548,7 +548,7 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
     name: "codex_interrupt",
     title: "Interrupt Codex Turn",
     description:
-      "Directly request turn/interrupt for the specified active Codex thread and turn. It does not stop or restart the Bridge or Codex app-server processes. If an already-sent mutating acknowledgement times out, the outcome is UNKNOWN and the request was possibly accepted; observe/read before any retry, and never directly retry it.",
+      "Interrupt the exact active native turn, without stopping Bridge or app-server. A sent mutation timeout is UNKNOWN / possibly accepted: observe/read before another write; do not retry automatically.",
     inputSchema: {
       type: "object",
       properties: {
@@ -570,7 +570,7 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
     name: "codex_checkpoint",
     title: "Checkpoint Codex Supervision",
     description:
-      "Optional, bounded supervisor cognition memory keyed to one native Codex thread_id; the key is not a permanent task identity and does not require future work to remain on that thread. Use it to protect the original goal, constraints, and acceptance plus concise supervisor state during long or complex supervision when context dilution or goal drift makes an external anchor worthwhile. Initialization is not tied to crossing a ChatGPT window or round, starting another Codex turn, or switching native threads; initialize early when a task is already expected to be sufficiently long or complex for that protection. Do not use for one-shot work, and do not turn duration into a hard threshold: elapsed time, observe/poll count, token count, or mere silence are not automatic triggers. Later updates remain semantic-event driven and require a material change in understanding or root cause, constraint or scope interpretation, steering decision, user-authorized amendment or effective goal, or acceptance judgment or an explicit decision not to accept yet. Before final acceptance of a checkpointed task, read it once to re-anchor the original goal, constraints, acceptance, and current supervisor frame. This tool is optional and uncoupled from all other tools. Store concise supervisor summaries only; never prompts, transcripts, raw events, command output, final answers, or raw event streams. Updates preserve only immutable original plus bounded previous/current supervisor state.",
+      "Optional bounded supervisor anchor keyed to a native thread; it is not a task identity or native Goal. Create early for long/complex supervision with expected context dilution or goal drift; skip one-shot work. Window changes, elapsed time, poll count, and silence are not mechanical triggers. Preserve original goal, constraints, and acceptance unchanged; update concise supervisor state only on material decisions. Do not store transcripts, raw events, or command output. Before final acceptance of a checkpointed task, read it once.",
     inputSchema: {
       type: "object",
       properties: {
@@ -578,41 +578,41 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
           type: "string",
           enum: ["read", "update"],
           description:
-            "Read the checkpoint, or initialize/update it at a material supervisor decision point.",
+            "Read or initialize/update at a material supervisor decision.",
         },
         thread_id: {
           type: "string",
           minLength: 1,
           maxLength: CHECKPOINT_THREAD_ID_LIMIT,
-          description: "Native Codex thread id; no second task identifier is created.",
+          description: "Native thread id; not a separate task identity.",
         },
         original_goal: {
           type: "string",
           minLength: 1,
           maxLength: CHECKPOINT_TEXT_LIMIT,
           description:
-            "Concise original user goal. Required only on initialization and immutable thereafter.",
+            "Original user goal; required on initialization, immutable afterward.",
         },
         original_constraints: {
           type: "string",
           minLength: 1,
           maxLength: CHECKPOINT_TEXT_LIMIT,
           description:
-            "Concise original constraints. Required only on initialization and immutable thereafter.",
+            "Original constraints; required on initialization, immutable afterward.",
         },
         original_acceptance: {
           type: "string",
           minLength: 1,
           maxLength: CHECKPOINT_TEXT_LIMIT,
           description:
-            "Concise original acceptance criteria. Required only on initialization and immutable thereafter.",
+            "Original acceptance criteria; required on initialization, immutable afterward.",
         },
         effective_goal: {
           type: "string",
           minLength: 1,
           maxLength: CHECKPOINT_TEXT_LIMIT,
           description:
-            "Current effective goal after legitimate user amendments; defaults to original_goal on initialization.",
+            "Effective goal after user amendments; initially original_goal.",
         },
         current_amendment: {
           oneOf: [
@@ -620,7 +620,7 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
             { type: "null" },
           ],
           description:
-            "Latest concise user-authorized requirement amendment, or null to clear it, without changing the immutable original.",
+            "Latest user-authorized amendment; null clears it without changing the original.",
         },
         current_understanding: {
           type: "string",
@@ -639,7 +639,7 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
           minLength: 1,
           maxLength: CHECKPOINT_TEXT_LIMIT,
           description:
-            "Concise acceptance assessment, not a task lifecycle or job status.",
+            "Acceptance assessment, not a task lifecycle status.",
         },
         next_step: {
           type: "string",

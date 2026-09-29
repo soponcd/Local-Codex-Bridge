@@ -995,23 +995,19 @@ test("observe wait schema and validation preserve bounded optional semantics", a
     maximum: 120_000,
     default: 0,
   });
-  assert.match(String(waitDescription), /facts loss/);
-  assert.match(String(waitDescription), /stream loss alone does not wake compact early/);
+  assert.match(String(waitDescription), /One bounded wait; 0 reads immediately/);
+  assert.match(String(waitDescription), /facts_lost, not stream_lost alone/);
   assert.match(String(waitDescription), /not stall detection/);
-  assert.match(observeTool?.description ?? "", /Optional wait_ms performs one bounded event-driven wait/);
-  assert.match(observeTool?.description ?? "", /fixed per-call deadline/);
-  assert.match(observeTool?.description ?? "", /absence of new command activity alone is not evidence of a stall/);
-  assert.match(observeTool?.description ?? "", /repeated bounded-wait observe calls until terminal.*one snapshot is inProgress/);
-  assert.match(observeTool?.description ?? "", /After every wake or deadline return, inspect the newly available events\/state.*before starting the next bounded wait/);
+  assert.match(observeTool?.description ?? "", /wait_ms is one bounded wait/);
+  assert.match(observeTool?.description ?? "", /No command output alone does not mean stalled/);
   const { description: viewDescription, ...viewSchema } = properties.view as Record<string, unknown>;
   assert.deepEqual(viewSchema, {
     type: "string",
     enum: ["compact", "raw"],
     default: "compact",
   });
-  assert.match(String(viewDescription), /retained individual sanitized event/);
-  assert.match(String(viewDescription), /original runtime cursors.*internal gaps/);
-  assert.match(String(viewDescription), /next_cursor/);
+  assert.match(String(viewDescription), /Raw shows retained sanitized events with possible cursor gaps/);
+  assert.match(String(viewDescription), /neither view restores evicted events/);
 
   const runtime = new RuntimeStore();
   runtime.ensureThread("thread-validation");

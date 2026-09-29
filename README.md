@@ -1,10 +1,12 @@
 # Local Codex Bridge
 
+[English](README.md) · [简体中文](README.zh-CN.md)
+
 *A thin supervisory MCP bridge between external AI supervisors and native Codex.*
 
 **Current release: V2.3.3**
 
-Local Codex Bridge 是一个面向 Windows 与 macOS 的轻量 MCP stdio 适配器：
+Local Codex Bridge is a lightweight MCP stdio adapter for Windows and macOS:
 
 ```text
 ChatGPT / external AI supervisor
@@ -16,121 +18,120 @@ ChatGPT / external AI supervisor
    native Codex threads / turns
 ```
 
-它解决的不是“再造一个 Codex”，而是让擅长对话、规划与持续监督的 AI，可以直接监督本机原生 Codex 完成真实工程任务。
+It lets an AI that is good at conversation, planning, and sustained supervision oversee real engineering work performed by local native Codex. It does not recreate Codex.
 
-**监督者负责目标、资源、边界、风险、审批与验收；Codex 保留原生的编码与执行自主性。**
+**The supervisor owns the goal, resources, boundaries, risks, approvals, and acceptance. Codex retains its native autonomy for coding and execution.**
 
-Bridge 始终保持薄层：
+The Bridge stays thin:
 
-- 不创建第二套 job / task 系统；
-- 不复制 Codex 对话历史；
-- 不维护平行线程数据库；
-- 不缓存“当前模型”状态；
-- 不重建 Goal、Queue 或 Search；
-- 不替代 Codex 自己的 session / thread / turn 语义。
+- It creates no second job or task system.
+- It does not copy Codex conversation history.
+- It keeps no parallel thread database.
+- It does not cache the “current model.”
+- It does not rebuild Goal, Queue, or Search.
+- It does not replace Codex session, thread, or turn semantics.
 
-**原生 Codex thread/session 始终是执行事实源。**
+**The native Codex thread/session remains the source of truth for execution.**
 
-[版本历史](CHANGELOG.md) · [协议与兼容假设](PROTOCOL-ASSUMPTIONS.md)
-
----
-
-## V2.3.0 有什么
-
-V2.3.0 把 Bridge 的公开监督面扩展为 **12 个 MCP 工具**，同时继续保持“只暴露监督真正需要的 native surface”这一边界。
-
-本版主要增加和完善：
-
-- 独立的原生持久 History 分页；
-- Native Goal：读取、设置与清除持久目标；
-- Native Queue：管理 active workflow 后续待执行输入；
-- Native Search：跨线程搜索与线程内 occurrence locator；
-- capability / lineage metadata 的按需读取；
-- compact observation 的 typed projection、drainage 与 loss 语义；
-- 单次最长 120 秒的事件驱动 observe wait；
-- 所有成功工具结果统一通过 `structuredContent` 交付；
-- Windows / macOS 共用同一核心 Bridge，只在平台原生边界保留差异。
-
-V2.3.0 不把这些能力重新实现一遍：History、Goal、Queue、Search 与 thread lifecycle 仍由 native Codex 持有，Bridge 只做受限映射与监督。
+[Changelog](CHANGELOG.md) · [Protocol and compatibility assumptions](PROTOCOL-ASSUMPTIONS.md)
 
 ---
 
-## 谁负责什么
+## What V2.3.0 introduced
+
+V2.3.0 expanded the public supervisory surface to **12 MCP tools** while retaining the boundary of exposing only the native surface needed for supervision.
+
+The release added or refined:
+
+- Independent paging of native persistent History.
+- Native Goal: read, set, and clear a persistent objective.
+- Native Queue: manage follow-up input for an active workflow.
+- Native Search: search across threads and locate occurrences within a thread.
+- On-demand capability and lineage metadata.
+- Typed compact observation, drainage, and loss semantics.
+- A single event-driven observe wait of up to 120 seconds.
+- Delivery of every successful tool result through `structuredContent`.
+- One shared Bridge core for Windows and macOS, with differences confined to native platform boundaries.
+
+Bridge does not reimplement these capabilities. Native Codex still owns History, Goal, Queue, Search, and the thread lifecycle; Bridge provides bounded mappings and supervision.
+
+---
+
+## Responsibilities
 
 ### External supervisor / ChatGPT
 
-适合负责：
+The supervisor is suited to:
 
-- 理解用户目标；
-- 拆解任务；
-- 决定工作范围、资源与风险边界；
-- 选择何时继续观察、纠正、审批或中断；
-- 判断结果是否满足验收条件；
-- 在 Codex 无法自行安全决定时提供监督。
+- Understand the user's goal.
+- Break down the work.
+- Set scope, resources, and risk boundaries.
+- Decide when to keep observing, correct, approve, or interrupt.
+- Judge whether the result meets acceptance criteria.
+- Provide oversight when Codex cannot safely decide on its own.
 
 ### Native Codex
 
-继续负责：
+Native Codex continues to own:
 
-- 原生 thread / turn 生命周期；
-- 工作区文件与命令执行；
-- Codex 自己的上下文与持久历史；
-- sandbox 与 approval-policy 行为；
-- 模型和 reasoning effort 的真实运行状态；
-- 持久化的执行结果；
-- 原生 Goal、Queue、Search 与 lineage。
+- Thread and turn lifecycles.
+- Workspace files and command execution.
+- Its context and persistent history.
+- Sandbox and approval-policy behavior.
+- The actual model and reasoning effort in use.
+- Persisted execution results.
+- Native Goal, Queue, Search, and lineage.
 
 ### Local Codex Bridge
 
-只负责把两者接起来：
+Bridge connects the two:
 
-- MCP stdio ↔ Codex app-server JSONL；
-- 有界地暴露监督所需状态；
-- 转发明确的控制意图；
-- 对高风险、歧义或协议边界 fail closed；
-- 不把自己升级成第二个 orchestration runtime。
+- MCP stdio ↔ Codex app-server JSONL.
+- Bounded exposure of state needed for supervision.
+- Forwarding explicit control intent.
+- Failing closed at high-risk, ambiguous, or protocol boundaries.
+- No second orchestration runtime.
 
 ---
 
-## 12 个 MCP 工具
+## The 12 MCP tools
 
-| Tool | 用途 | 主要边界 |
+| Tool | Purpose | Main boundary |
 | --- | --- | --- |
-| `codex_threads` | 列出、筛选、读取原生持久线程元数据 | metadata only；筛选不是 ACL |
-| `codex_history` | 分页读取原生持久历史 | 不建 Bridge history store；不自动 full-read |
-| `codex_search` | 原生跨线程搜索与线程内 occurrence 定位 | 返回 locator；不建索引或 relevance 层 |
-| `codex_models` | 按需读取一页原生 `model/list` | 不缓存 catalog，不维护 current-model registry |
-| `codex_goal` | 读取、设置或清除原生 thread goal | 不隐式 resume / turn-start；不等同 checkpoint |
-| `codex_queue` | 管理原生 queued follow-up | 不建 Bridge scheduler；入队不等于执行完成 |
-| `codex_turn` | 创建或恢复 thread，并启动一个 turn | accepted 不等于 completed |
-| `codex_observe` | 有界读取 live events、pending、terminal 与 cursor | live state 丢失后不重建历史 |
-| `codex_steer` | 对当前 active turn 追加语义纠正 | 不是 timer、polling 或 retry |
-| `codex_respond` | 回答真实 pending approval / user-input / permission request | 必须匹配原始 request id 与准确 scope |
-| `codex_interrupt` | 中断准确的 active thread / turn | 不是进程控制 |
-| `codex_checkpoint` | 保存可选、精简、有界的 supervisor anchor | 不是 transcript、job id 或 Codex history |
+| `codex_threads` | List, filter, and read native persistent thread metadata | Metadata only; filters are not ACLs |
+| `codex_history` | Page native persistent history | No Bridge history store or automatic full read |
+| `codex_search` | Search native threads and locate within-thread occurrences | Returns locators; no Bridge index or relevance layer |
+| `codex_models` | Read one native `model/list` page on demand | No cached catalog or current-model registry |
+| `codex_goal` | Read, set, or clear a native thread goal | No implicit resume or turn start; distinct from checkpoint |
+| `codex_queue` | Manage native queued follow-ups | No Bridge scheduler; enqueue does not mean execution or completion |
+| `codex_turn` | Create or resume a thread and start a turn | Accepted does not mean completed |
+| `codex_observe` | Read bounded live events, pending requests, terminal state, and cursor | Does not reconstruct live state after runtime loss |
+| `codex_steer` | Add a semantic correction to the current active turn | Not a timer, poll, or retry |
+| `codex_respond` | Answer a real pending approval, user-input, or permission request | Must match the original request ID and exact scope |
+| `codex_interrupt` | Interrupt the exact active thread and turn | Not process control |
+| `codex_checkpoint` | Keep an optional, concise, bounded supervisor anchor | Not a transcript, job ID, or Codex history |
 
-完整 schema 与运行时校验以 [`src/tools.ts`](src/tools.ts) 为准。
+See [`src/tools.ts`](src/tools.ts) for the full schemas and runtime validation.
 
-### 内容交付与读取选择
+### Content delivery and read policy
 
-History / Search 默认使用 `content_policy:"protected"`：秘密形状检测可能拒绝整页，包括误匹配普通代码。调用方可显式使用 `content_policy:"exact"` 将本次 native 原文交给 MCP caller；它可能暴露敏感内容，不会保存为会话偏好，也没有自动回退。protected 提供默认检测与显式选择记录，不是阻止监督者最终取得原文的权限边界。
+History and Search default to `content_policy:"protected"`. Secret-shaped content detection may reject an entire page, including ordinary code that matches the detector. A caller may explicitly choose `content_policy:"exact"` to deliver unchanged native text to the MCP caller for that call. This may expose sensitive content; it is not saved as a session preference and has no automatic fallback. Protected mode provides default detection and an explicit choice point, not an access boundary that prevents the supervisor from obtaining the original content.
 
-Goal / Queue 的成功读取和响应直接保留 native 原值，不做正文秘密形状过滤。已知回显内容过大时在写入前拒绝；native 后加字段等仍可能造成“已确认接受，但响应无法交付”，不能据此重发 mutation。多项页超限可以缩小 limit；单项仍超限时应从 native 侧检查，不能靠反复调用同一个 Bridge 读取恢复。错误与运行诊断继续脱敏。
+Successful Goal and Queue reads and responses preserve native values without secret-shape filtering of their bodies. Known oversized echoed input is rejected before a write; native-added fields can still produce an acknowledged mutation whose result cannot be delivered. Do not resubmit the mutation for that reason. For an oversized multi-item page, a smaller limit may help. If one item remains oversized, inspect it on the native side; repeatedly making the same Bridge read cannot recover it. Errors and operational diagnostics remain redacted.
 
-这些精确响应不继承 observe 的短文本、内部数组和字段数量预算，仍受真实字节限制、必要字段校验及防御性序列化检查约束；失败不返回部分页或伪造 cursor。具体边界见 [协议说明](PROTOCOL-ASSUMPTIONS.md#exact-content-delivery)。
+These exact responses do not inherit Observe's short-text, internal-array, or field-count budgets. They remain subject to actual byte limits, required-field checks, and defensive serialization checks. Failure never returns a partial page or fabricated cursor. See the [protocol details](PROTOCOL-ASSUMPTIONS.md#exact-content-delivery).
 
-compact 的 `terminal.final_result_pending: true` 表示最终文本尚待后续页交付，此时省略 `final_result_meta`；即使 status 已是终态，也要继续沿 `next_cursor` 读取。正文交付到位后再检查 `final_result_meta.complete`：false 表示源文本未完整收到或 live 保留发生裁剪。raw 和 terminal 同样有 48k 上限，需要更多内容时按该 thread / terminal turn 窄读 History，或从 native 侧检查；普通 compact 事件的预算保持不变。
-
+In compact view, `terminal.final_result_pending: true` means final text awaits a later page, and `final_result_meta` is omitted until then. Follow `next_cursor` even if the status is terminal. Once the text arrives, inspect `final_result_meta.complete`: `false` means source text was not fully received or live retention clipped it. Raw and terminal text also have a 48k cap. If more content is needed, read narrow History for that thread and terminal turn, or inspect native Codex. Ordinary compact-event budgets remain unchanged.
 
 ---
 
-## 典型监督方式
+## Typical supervision workflow
 
-### 1. 启动或继续一个 turn
+### 1. Start or continue a turn
 
-`codex_turn` 的成功返回只表示 native `turn/start` 已被接受，不代表任务已经完成。
+A successful `codex_turn` response only means native `turn/start` was accepted. It does not mean the task is complete.
 
-长任务通常应继续通过 `codex_observe` 监督。
+Long-running work should usually continue under `codex_observe` supervision.
 
 ```text
 codex_turn
@@ -146,104 +147,104 @@ codex_observe
 terminal state / acceptance
 ```
 
-几个原则：
+Key rules:
 
-- 长时间没有新命令输出，不足以证明 Codex 卡住；
-- `codex_steer` 应代表新的语义信息或纠正，而不是定时催促；
-- `codex_respond` 只能回答真实存在的 pending request；
-- `codex_interrupt` 只在确实需要停止当前 turn 时使用；
-- `thread_id` 是 native Codex thread identity，不是 Bridge 发明的永久 task ID。
+- A long interval without new command output does not prove Codex is stalled.
+- Use `codex_steer` for new semantic information or a correction, not a timed nudge.
+- `codex_respond` can answer only a real pending request.
+- Use `codex_interrupt` when the current turn actually needs to stop.
+- `thread_id` is a native Codex thread identity, not a permanent task ID invented by Bridge.
 
-### 2. Live 与持久历史分开
+### 2. Keep live state separate from persistent history
 
-`codex_observe` 面向当前 live supervision；`codex_history` 面向 native 已持久化的 turns / items。
+`codex_observe` serves current live supervision; `codex_history` reads native persisted turns and items.
 
-Bridge 重启、runtime ring 丢失或 live cursor 不再可用时，不会从历史里伪造一份“看起来还活着”的 runtime。需要恢复持久内容时，直接读 `codex_history`。
+After Bridge restarts, loses its runtime ring, or no longer has a live cursor, it does not manufacture a seemingly active runtime from history. Read `codex_history` to recover persistent content.
 
-`codex_search` 负责定位，History 负责读取内容。Occurrence 返回的 `turnCursor` 可以用于同一 thread 的窄 History 读取，但 Search 不替代 History。
+`codex_search` locates content; History reads it. An occurrence's `turnCursor` can anchor a narrow History read in the same thread, but Search does not replace History.
 
-### 3. Goal、Queue 与 Steer 不同
+### 3. Keep Goal, Queue, and Steer distinct
 
-- **Goal**：原生 thread 的持续目标；
-- **Queue**：当前 active workflow 之后由 native 执行的 follow-up；
-- **Steer**：对当前 active turn 的即时语义纠正。
+- **Goal:** the persistent objective of a native thread.
+- **Queue:** follow-up input that native Codex executes after the current active workflow.
+- **Steer:** an immediate semantic correction to the current active turn.
 
-它们不是三种写法不同的“下一条 prompt”，也不由 Bridge 合并成自己的任务模型。
+These are not three spellings of a “next prompt,” and Bridge does not combine them into its own task model.
 
-`codex_goal(action:"set")` 必须显式选择预算意图：
+`codex_goal(action:"set")` requires an explicit budget intent:
 
-| `budget_mode` | native `tokenBudget` | 参数要求 |
+| `budget_mode` | Native `tokenBudget` | Argument requirement |
 | --- | --- | --- |
-| `preserve` | 省略，保留既有预算 | 不得传 `token_budget` |
-| `unlimited` | `null`，移除预算上限 | 不得传 `token_budget` |
-| `fixed` | 指定额度 | 必须传正的 safe-integer `token_budget` |
+| `preserve` | Omitted, preserving the existing budget | Do not pass `token_budget` |
+| `unlimited` | `null`, removing the budget ceiling | Do not pass `token_budget` |
+| `fixed` | Specified amount | Pass a positive safe-integer `token_budget` |
 
-Bridge 本身不会因为 Goal set / get / clear 额外发送 resume 或 turn-start；但 **active Goal 仍可能由 native Codex 自主继续执行**。Goal clear 不等于 interrupt，也不是已经排定执行的 barrier。需要停止当前 turn 时仍应使用准确的 `codex_interrupt`。
+Bridge sends no extra resume or turn-start request for Goal set, get, or clear. **An active Goal may still cause native Codex to continue execution.** Goal clear is not an interrupt or a barrier against work already scheduled. Use the exact `codex_interrupt` when the current turn must stop.
 
-Queue delete 同样不会中断已经开始的 turn。
+Queue delete likewise does not interrupt a turn that has already begun.
 
 ---
 
 ## `codex_observe`
 
-默认 `view:"compact"` 交付有界的 typed supervision facts；`view:"raw"` 用于需要核验原生保留事件时的窄下钻。
+The default `view:"compact"` delivers bounded, typed supervision facts. Use `view:"raw"` for a narrow inspection of retained native events.
 
-可选 `wait_ms` 是一次固定截止的 event-driven wait，最大 `120000` ms。Bridge 不做后台 polling，也不自行判断 stalled。
+Optional `wait_ms` performs one event-driven wait with a fixed deadline, up to `120000` ms. Bridge does not poll in the background or decide on its own that Codex is stalled.
 
-需要记住：
+Keep these distinctions in mind:
 
-- 两种 view 都沿 `next_cursor` 继续；
-- `stream_lost` 表示流式 delta 有淘汰；
-- `facts_lost` 表示其他监督事实有淘汰；
-- `cursor_lost` 只是两者的总括，不意味着应跳到 `cursor_floor`；
-- `runtime_available:false` 时，live pending / terminal / cursor 等字段可能只是 unavailable placeholder，不能据此推断“没有发生”。
+- Continue either view with `next_cursor`.
+- `stream_lost` reports evicted streaming deltas.
+- `facts_lost` reports evicted other supervision facts.
+- `cursor_lost` summarizes either kind of loss; it does not tell you to jump to `cursor_floor`.
+- With `runtime_available:false`, live pending, terminal, and cursor fields may only be unavailable placeholders. Do not infer that nothing happened.
 
-当 `runtime_available:true` 时，compact 的 `pending_requests` 是当前完整 snapshot；集合为空时字段会省略，缺省表示当前没有 pending request，而不是“这一页没更新”。
+When `runtime_available:true`, compact `pending_requests` is a complete current snapshot. Compact omits it when empty; absence means there are currently no pending requests, not that this page contains no update.
 
-compact 的 `terminal.final_result` 还受 final item / terminal cursor 的投递窗口约束：final 文本可能已经作为 message fact 交付，因此某一页的 compact terminal 可以只有 `status` / `error` 而省略 `final_result`。**字段缺席不表示 raw terminal snapshot 或 persisted History 中不存在最终文本。** 不要为了让三个字段始终同页出现而跳过 `next_cursor` 或反推终态。
-
----
-
-## Terminal：以 `status` 为准
-
-**终态判断始终以 native `terminal.status` 为准。**
-
-不要从其他字段反推终态：
-
-- 有 `final_result` 不代表 turn 成功完成；
-- 有 `terminal.error` 也不等价于 `status:"failed"`；
-- `status:"interrupted"` 的 turn 也可能携带结构化 error；
-- Bridge 不依赖额外的独立 error notification 才识别终态原因。
-
-消费者应先看 `terminal.status`，再把 `final_result` 与 `error` 作为该终态下的附加事实解释。
+Compact `terminal.final_result` is also subject to the delivery window of the final item and terminal cursor. Final text may already have arrived as a message fact, so a compact terminal on one page may contain only `status` and `error`, without `final_result`. **An absent field does not mean the raw terminal snapshot or persisted History lacks final text.** Do not skip `next_cursor` or infer status just to force these fields onto one page.
 
 ---
 
-## 成功结果使用 `structuredContent`
+## Terminal state: use `status`
 
-V2.3.0 中，所有成功 `tools/call` 的完整结果都位于：
+**Always classify a terminal by native `terminal.status` first.**
+
+Do not infer terminal status from other fields:
+
+- `final_result` does not mean the turn succeeded.
+- `terminal.error` does not necessarily mean `status:"failed"`.
+- A turn with `status:"interrupted"` may carry a structured error.
+- Bridge does not need a separate error notification to learn the terminal reason.
+
+Read `terminal.status` first, then interpret `final_result` and `error` as separate facts about that terminal.
+
+---
+
+## Successful results use `structuredContent`
+
+In V2.3.0, the complete result of every successful `tools/call` is in:
 
 ```text
 result.structuredContent
 ```
 
-`result.content` 只保留 tiny text marker，不再承载可解析的成功 JSON。
+`result.content` contains only a tiny text marker, not parseable success JSON.
 
-旧 client 如果仍从 text content 解析成功结果，需要迁移到 `structuredContent`。
+Older clients that parse successful results from text content need to migrate to `structuredContent`.
 
-错误仍使用显式 `isError` / text error 路径，不伪装成成功结果。
+Errors still use explicit `isError` and text-error paths; they are not disguised as successful results.
 
 ---
 
-## 不要因 timeout 直接重试写操作
+## Do not retry a write just because it timed out
 
-以下原生 mutating request 如果已经写入 app-server、但 acknowledgement 超时，Bridge 会把结果视为：
+If a native mutating request was written to app-server but its acknowledgement timed out, Bridge reports the outcome as:
 
 **UNKNOWN / possibly accepted**
 
-这不等于失败。
+This is not a confirmed failure.
 
-典型请求包括：
+Affected requests include:
 
 - `thread/start`
 - `thread/resume`
@@ -253,96 +254,96 @@ result.structuredContent
 - `thread/goal/set` / `thread/goal/clear`
 - `thread/queue/add` / `update` / `delete` / `reorder`
 
-此时应先观察或读取 native state，再决定后续动作。
+Observe or read native state first, then decide on any further action.
 
-**不要因为 timeout 直接重发 mutating request。**
+**Do not resubmit a mutating request solely because its acknowledgement timed out.**
 
-Bridge 不自动 retry、补偿或猜测结果。
-
----
-
-## History 与 Search
-
-`codex_history` 按 native history mode 读取：
-
-- paginated thread：可分页读取 turn 索引，再窄读指定 turn 的 items；
-- legacy thread：按完整 turn 分页。
-
-Bridge 不创建自己的 item/chunk cursor，也不在失败时偷偷 full-read 整段历史。
-
-History 成功页要求无损交付；如果页面超出传输字节边界、触发当前内容策略或无法通过防御性 JSON 序列化检查，会整页失败，而不是返回部分 data + cursor。
-
-`codex_search` 只映射 native Search：
-
-- `kind:"threads"`：跨线程 locator；
-- `kind:"occurrences"`：指定 paginated thread 内的 occurrence locator。
-
-Search 不建 Bridge semantic index、不做 relevance scoring、不隐式限制 workspace，也不以完整 History 读取兜底。
-
-精确分页、cursor 与 transport contract 见 [`PROTOCOL-ASSUMPTIONS.md`](PROTOCOL-ASSUMPTIONS.md)。
+Bridge does not automatically retry, compensate, or guess the result.
 
 ---
 
-## Capability 与 lineage
+## History and Search
 
-`codex_threads` 可以按需保留 native capability / lineage metadata，例如：
+`codex_history` follows the native history mode:
+
+- **Paginated thread:** page the turn index, then read items in a specified turn.
+- **Legacy thread:** page complete turns.
+
+Bridge creates no item/chunk cursors of its own and does not silently read a full history after a paging failure.
+
+A successful History page must be delivered losslessly. A page that exceeds the transport byte boundary, triggers the selected content policy, or fails defensive JSON serialization is rejected in full. Bridge does not return partial data with a cursor.
+
+`codex_search` maps native Search only:
+
+- `kind:"threads"`: locators across threads.
+- `kind:"occurrences"`: occurrence locators inside a specified paginated thread.
+
+Search does not build a Bridge semantic index, score relevance, infer a workspace restriction, or fall back to reading complete History.
+
+See [`PROTOCOL-ASSUMPTIONS.md`](PROTOCOL-ASSUMPTIONS.md) for exact paging, cursor, and transport contracts.
+
+---
+
+## Capability and lineage
+
+`codex_threads` can expose native capability and lineage metadata on demand, including:
 
 - `canAcceptDirectInput`
 - `sessionId`
 - `forkedFromId`
 - `parentThreadId`
-- source information
+- Source information
 
-这些字段是 native metadata，不是 Bridge 自己的 writer lease、权限模型或生命周期数据库。
+These are native metadata, not a Bridge writer lease, permission model, or lifecycle database.
 
-`parent_thread_id` / `ancestor_thread_id` 可用于筛选 spawned descendants；它们与 fork lineage 是不同概念。Bridge 不递归构建关系图，也不通过 lineage 自动 resume 或接管 thread。
-
----
-
-## Model 与 reasoning effort
-
-Bridge 不接管 Codex 的“当前模型状态”。
-
-如果 `codex_turn` 不显式传 `model` / `effort`：
-
-- Bridge 不调用 `model/list`；
-- 不推断当前模型；
-- 不发送新的 model / effort override。
-
-如果 supervisor 显式指定 model，Bridge 会用当前原生 catalog 做一次有界验证，但不会缓存 catalog 或形成 current-model registry。
-
-当 upstream 没有足够 metadata 证明某个 model + effort 组合不兼容时，Bridge 不猜测，最终决定留给 native Codex。
+`parent_thread_id` and `ancestor_thread_id` can filter spawned descendants. Spawn lineage and fork lineage are different concepts. Bridge does not recursively build a relationship graph or automatically resume or take over a thread from lineage.
 
 ---
 
-## Elicitation 当前不受支持
+## Model and reasoning effort
 
-`mcpServer/elicitation/request` 目前不在 `codex_respond` 的 supported response surface。
+Bridge does not take ownership of Codex's “current model” state.
 
-如果 native Codex 发出这类 request：
+If `codex_turn` omits `model` and `effort`, Bridge:
 
-- Bridge 会保留并暴露它；
-- 不会静默吞掉；
-- 不会猜测 response schema；
-- 不会构造一个泛化回答。
+- Does not call `model/list`.
+- Does not infer the current model.
+- Does not send a new model or effort override.
 
-只有未来存在明确、稳定并经过验证的上游 contract 时，才会考虑加入。
+If the supervisor specifies a model, Bridge performs bounded validation against the current native catalog. It does not cache the catalog or create a current-model registry.
+
+Where upstream metadata cannot establish that a model and effort combination is incompatible, Bridge does not guess. Native Codex makes the final decision.
 
 ---
 
-## 快速开始
+## Elicitation is currently unsupported
 
-### 环境要求
+`mcpServer/elicitation/request` is not currently part of the response surface supported by `codex_respond`.
 
-- Windows 或 macOS
+If native Codex emits such a request, Bridge:
+
+- Retains and exposes it.
+- Does not silently discard it.
+- Does not guess its response schema.
+- Does not fabricate a generic answer.
+
+Support would require an explicit, stable, validated upstream contract.
+
+---
+
+## Quick start
+
+### Requirements
+
+- Windows or macOS
 - Node.js 24+
-- 官方 Codex executable
-  - 可直接通过 `codex` 找到；
-  - 或使用 `CODEX_EXE` 显式指定。
+- Official Codex executable:
+  - Available as `codex` on `PATH`, or
+  - Specified explicitly with `CODEX_EXE`.
 
-本项目不捆绑、也不依赖 `@openai/codex` npm package。
+This project does not bundle or depend on the `@openai/codex` npm package.
 
-### Clone、构建与测试
+### Clone, build, and test
 
 ```bash
 git clone https://github.com/zoeynine/Local-Codex-Bridge.git
@@ -353,26 +354,26 @@ npm run build
 npm test
 ```
 
-### 直接启动
+### Start directly
 
-Windows PowerShell：
+Windows PowerShell:
 
 ```powershell
-$env:CODEX_EXE = 'C:\path\to\codex.exe' # codex 已在 PATH 时可省略
+$env:CODEX_EXE = 'C:\path\to\codex.exe' # Omit if codex is on PATH
 npm start
 ```
 
-macOS / POSIX shell：
+macOS / POSIX shell:
 
 ```bash
 CODEX_EXE=/path/to/codex npm start
 ```
 
-如果 `codex` 已在 `PATH`，`CODEX_EXE` 可以省略。
+You may omit `CODEX_EXE` if `codex` is already on `PATH`.
 
-### 配置 MCP client
+### Configure an MCP client
 
-严格的 MCP stdio client 应直接启动构建后的 Node entry：
+A strict MCP stdio client should launch the built Node entry directly:
 
 ```text
 command: node
@@ -380,21 +381,21 @@ args:    <absolute-path-to-repository>/dist/src/index.js
 env:     CODEX_EXE=<optional-path-to-codex>
 ```
 
-不同 MCP client 的配置格式可能不同，但最终应直接运行：
+Client configuration formats vary, but the final command should run directly:
 
 ```text
 node <repository>/dist/src/index.js
 ```
 
-**不要**在 Secure MCP Tunnel 或其他严格 JSON-RPC stdio transport 后使用 `npm start`，因为 npm lifecycle output 可能污染 stdout 协议流。
+**Do not** put `npm start` behind Secure MCP Tunnel or another strict JSON-RPC stdio transport. npm lifecycle output can contaminate protocol stdout.
 
-Bridge tool set 发生变化后，已经连接的 MCP client 通常需要重新连接或重启，才能刷新自己的 tool catalog。
+After the Bridge tool set changes, an already connected MCP client usually needs to reconnect or restart to refresh its tool catalog.
 
 ---
 
-## 可选：Secure MCP Tunnel
+## Optional: Secure MCP Tunnel
 
-远程 MCP 场景可以在 Bridge 前面使用 Secure MCP Tunnel：
+Remote MCP use can place Secure MCP Tunnel in front of Bridge:
 
 ```text
 remote MCP client
@@ -406,171 +407,167 @@ node <repository>/dist/src/index.js
 native Codex
 ```
 
-Tunnel 的认证、profile、port、ready endpoint 与进程生命周期属于外部配置。
+Tunnel authentication, profile, port, readiness endpoint, and process lifecycle are external configuration.
 
-本仓库：
+This repository:
 
-- 不创建 Tunnel profile；
-- 不保存生产凭据；
-- 不内置生产端口；
-- 不把 Tunnel control plane 变成 Bridge 自己的 HTTP API。
+- Does not create a Tunnel profile.
+- Does not store production credentials.
+- Does not hard-code a production port.
+- Does not turn the Tunnel control plane into a Bridge HTTP API.
 
 ---
 
 ## Windows
 
-`windows/` 中的 Optional Tray 是已安装 Tunnel client 的轻量启动与状态层，不是 Bridge 核心运行时的必需组件。
+The optional Tray in `windows/` is a lightweight launch and status layer for an installed Tunnel client. It is not required for the Bridge core.
 
-Canonical launcher 为 `LocalCodexBridgeTray.*`。
+The canonical launcher is `LocalCodexBridgeTray.*`.
 
-Local settings 模板：
+Local settings template:
 
 [`windows/local-settings.example.json`](windows/local-settings.example.json)
 
-实际 `windows/local-settings.json` 保持 ignored，不进入 Git。
+The actual `windows/local-settings.json` remains ignored and is not committed.
 
-配置优先级：
+Configuration precedence:
 
-1. 显式命令行参数；
-2. `LOCAL_CODEX_BRIDGE_*` 环境变量；
-3. legacy `LUMEN_CODEX_V2_*` 环境变量；
-4. ignored local settings。
+1. Explicit command-line arguments.
+2. `LOCAL_CODEX_BRIDGE_*` environment variables.
+3. Legacy `LUMEN_CODEX_V2_*` environment variables.
+4. Ignored local settings.
 
-Tray 不自动重启 Tunnel，并且只会在 process identity、profile、PID 等信息重新核验一致后，停止由当前 Tray 实例启动的进程。
+The Tray does not restart Tunnel automatically. It stops a process started by the current Tray instance only after rechecking that process identity, profile, PID, and related information still match.
 
 ---
 
 ## macOS
 
-`Start Mac Codex Bridge.app`、`launcher/` 与 `bin/start-production-tunnel` 提供 macOS Finder / Tunnel 平台集成。
+`Start Mac Codex Bridge.app`, `launcher/`, and `bin/start-production-tunnel` provide macOS Finder and Tunnel integration.
 
-它们只是平台外层；真正的 Bridge 仍然运行同一个：
+They are platform layers. The Bridge still runs the same entry:
 
 ```text
 dist/src/index.js
 ```
 
-修改 launcher 或 Finder bundle 后，应在 macOS 12+ 上重新构建并验证：
+After changing the launcher or Finder bundle, rebuild and validate on macOS 12+:
 
 ```bash
 launcher/build-launcher.sh
 npm run test:macos
 ```
 
-Windows 与 macOS 是同一 Bridge 的两个平台入口，不是两套独立实现。
+Windows and macOS are two platform entry points to one Bridge, not separate implementations.
 
 ---
 
-## 安全与信任边界
+## Security and trust boundaries
 
-Local Codex Bridge **不会创建新的操作系统 sandbox**。
+Local Codex Bridge **does not create a new operating-system sandbox**.
 
-真正的文件、命令、网络与进程能力仍由 native Codex 的配置，以及每个 turn 的：
+Actual file, command, network, and process capabilities still depend on native Codex configuration and each turn's:
 
 - `sandbox`
 - `approval_policy`
 
-决定。
+For example:
 
-例如：
+- `danger-full-access` broadens the file, command, and process access allowed by the sandbox.
+- `approval_policy=never` does not expand the OS sandbox by itself, but removes the interactive approval layer.
 
-- `danger-full-access` 会扩大 sandbox 允许的文件、命令和进程访问范围；
-- `approval_policy=never` 不会自行扩大 OS sandbox，但会移除交互式审批这一确认层。
+These are separate risk dimensions.
 
-两者是不同的风险维度。
+Also keep in mind:
 
-还需要注意：
+- Natural-language instructions sent through `codex_turn` or `codex_steer` may lead Codex to use its existing file and command capabilities.
+- The absence of a generic shell MCP tool in Bridge does not mean native Codex cannot execute commands.
+- `codex_threads` can see persistent threads visible to the same OS user and Codex runtime. Filters do not provide access isolation.
+- Bridge inherits its environment when starting app-server, except that it removes the Tunnel `CONTROL_PLANE_API_KEY`.
+- Other environment variables remain part of the trusted launch boundary; avoid unnecessary secrets there.
+- Bridge has transport sanitization and bounded projection, but is not a hostile multi-tenant gateway.
+- Keep checkpoints short; do not store full prompts, transcripts, raw events, command output, or final answers.
 
-- `codex_turn` / `codex_steer` 的自然语言指令可能促使 Codex 使用它已有的文件与命令能力；
-- “Bridge 没有 generic shell MCP tool”不意味着 native Codex 不会执行命令；
-- `codex_threads` 可以看到同一 OS user / Codex runtime 可见的持久线程，筛选条件不能充当访问隔离；
-- Bridge 启动 app-server 时会继承自己的环境，但会移除 Tunnel 使用的 `CONTROL_PLANE_API_KEY`；
-- 其他环境变量仍属于可信启动边界，不应放入不必要的 secrets；
-- Bridge 有 transport sanitization 与有界 projection，但不是 hostile multi-tenant gateway；
-- checkpoint 应保持短小，不保存完整 prompt、transcript、原始事件、命令输出或最终回答。
-
-远程使用时，应由经过认证并正确配置的 Tunnel 提供连接边界。
+For remote use, an authenticated and correctly configured Tunnel must provide the connection boundary.
 
 ---
 
-## 持久化
+## Persistence
 
-Native Codex 负责持久化：
+Native Codex persists:
 
-- threads；
-- turns；
-- conversation history；
-- native execution results；
-- thread goals；
-- queued follow-ups。
+- Threads.
+- Turns.
+- Conversation history.
+- Native execution results.
+- Thread goals.
+- Queued follow-ups.
 
-Bridge 的 live event ring、active-turn runtime state 与 pending requests 主要存在于内存中，而且保持有界。
+Bridge's live event ring, active-turn runtime state, and pending requests are primarily bounded in-memory state.
 
-ring 丢失时，Bridge 不从 History 重建一份伪 live state。`stream_lost` / `facts_lost` / `cursor_lost` 用于明确表达 live supervision evidence 的缺失。
+After ring loss, Bridge does not reconstruct fake live state from History. `stream_lost`, `facts_lost`, and `cursor_lost` explicitly report missing live supervision evidence.
 
 ### Checkpoint
 
-`codex_checkpoint` 是唯一刻意保存的 Bridge-side supervisory state，而且保持精简、有界。
+`codex_checkpoint` is the one intentionally persisted piece of Bridge-side supervisory state, and it remains concise and bounded.
 
-Windows 默认：
+Windows default:
 
 ```text
 %LOCALAPPDATA%\LocalCodexBridge\checkpoints\<sha256(thread_id)>.json
 ```
 
-macOS 默认：
+macOS default:
 
 ```text
 ~/Library/Application Support/LocalCodexBridge/checkpoints/<sha256(thread_id)>.json
 ```
 
-可以通过：
+Override with:
 
 ```text
 LOCAL_CODEX_BRIDGE_CHECKPOINT_DIR
 ```
 
-覆盖。
-
-legacy `LUMEN_CODEX_V2_CHECKPOINT_DIR` 目前仍保留兼容；Bridge 不自动迁移旧 checkpoint。
+The legacy `LUMEN_CODEX_V2_CHECKPOINT_DIR` is still supported for compatibility. Bridge does not automatically migrate old checkpoints.
 
 ---
 
 ## Deliberate non-goals
 
-Local Codex Bridge 当前刻意不做：
+Local Codex Bridge deliberately does not provide:
 
-- browser UI；
-- HTTP control plane / HTTP MCP server；
-- 第二套 task queue 或 job database；
-- transcript duplication；
-- semantic index；
-- model cache / current-model registry；
-- queued-message facade；
-- automatic mutating-request retry；
-- automatic app-server restart；
-- generic shell / `command/exec` MCP surface；
-- 自动暴露每个存在于 app-server 的 experimental API。
+- A browser UI.
+- An HTTP control plane or HTTP MCP server.
+- A second task queue or job database.
+- Transcript duplication.
+- A semantic index.
+- A model cache or current-model registry.
+- A queued-message facade.
+- Automatic retries of mutating requests.
+- Automatic app-server restart.
+- A generic shell or `command/exec` MCP surface.
+- Automatic exposure of every experimental app-server API.
 
-Bridge 的目标不是把 Codex app-server 全量搬进 MCP，而是只暴露监督真正需要、且经过验证的最小 surface。
+The aim is not to copy all of Codex app-server into MCP, but to expose the smallest validated surface needed for supervision.
 
 ---
 
 ## Upgrading Codex
 
-Bridge 必然依赖少量 native app-server protocol assumptions。
+Bridge necessarily depends on a small set of native app-server protocol assumptions.
 
-当前依赖、验证状态、对应代码位置，以及 upstream 改变后需要重新检查的内容，都集中记录在：
+Current dependencies, validation status, corresponding code locations, and checks needed after upstream changes are collected in:
 
 [`PROTOCOL-ASSUMPTIONS.md`](PROTOCOL-ASSUMPTIONS.md)
 
-升级 Codex runtime、修改 protocol-facing behavior，或者相关 regression test 开始失败时，应优先重新核对这份 checklist，而不是凭旧实现经验直接修改 Bridge。
+When upgrading the Codex runtime, changing protocol-facing behavior, or investigating a related regression, check that list first. Do not change Bridge solely on the basis of an older implementation assumption.
 
 ---
 
-## 开发与测试
+## Development and testing
 
-常用检查：
+Common checks:
 
 ```bash
 npm run typecheck
@@ -578,36 +575,36 @@ npm run build
 npm test
 ```
 
-`npm test` 会运行共享 runtime / compact / History / Goal / Queue / Search / app-server / MCP / checkpoint / platform / shutdown / UX 等测试，并继续执行当前平台对应的测试。
+`npm test` runs shared runtime, compact, History, Goal, Queue, Search, app-server, MCP, checkpoint, platform, shutdown, UX, and related tests, then the tests for the current platform.
 
-协议 / compact schema 检查需要显式把 `CODEX_EXE` 指向要核验的官方 Codex executable；这个脚本不会使用 Bridge 正常启动路径中的 PATH fallback。
+The protocol/compact-schema check requires `CODEX_EXE` to explicitly identify the official Codex executable under test. This script does not use the `PATH` fallback of the normal Bridge startup path.
 
-Windows PowerShell：
+Windows PowerShell:
 
 ```powershell
 $env:CODEX_EXE = 'C:\path\to\codex.exe'
 npm run check:compact-schema
 ```
 
-macOS / POSIX shell：
+macOS / POSIX shell:
 
 ```bash
 CODEX_EXE=/path/to/codex npm run check:compact-schema
 ```
 
-仓库仍保留 `npm run smoke:live` 历史辅助入口，但**当前脚本尚未适配 V2.3.0 的 `structuredContent`、独立 History 与 runtime-loss contract，不能作为本版有效 smoke 或跨平台验收命令**。不要为了发布验收直接运行它；如果未来需要恢复 live smoke，应先单独更新脚本并重新审查其持久 thread 副作用。
+The repository retains the historical `npm run smoke:live` helper, but **the current script has not been adapted to V2.3.0 `structuredContent`, independent History, or the runtime-loss contract. It is not a valid smoke or cross-platform acceptance command for this release.** Do not run it merely to qualify a release. If a live smoke test is needed later, update the script separately and review its persistent-thread side effects first.
 
-主要实现位置：
+Main implementation locations:
 
 - `src/mcp.ts` — MCP stdio / JSON-RPC boundary
 - `src/app-server.ts` — native Codex app-server process / protocol adapter
-- `src/tools.ts` — 12 tools、schema 与 supervisory semantics
+- `src/tools.ts` — 12 tools, schemas, and supervisory semantics
 - `src/runtime.ts` — bounded live runtime / events / pending requests
 - `src/observe-compact.ts` — compact typed supervision projection
 - `src/history.ts` — lossless History delivery checks
-- `src/goal.ts` — Native Goal validation / delivery
-- `src/queue.ts` — Native Queue validation / delivery
-- `src/search.ts` — Native Search validation / delivery
+- `src/goal.ts` — native Goal validation / delivery
+- `src/queue.ts` — native Queue validation / delivery
+- `src/search.ts` — native Search validation / delivery
 - `src/checkpoint.ts` — optional supervisory checkpoint
 - `src/platform.ts` — Windows / macOS platform boundary
 - `src/version.ts` — canonical Bridge version
@@ -620,10 +617,10 @@ CODEX_EXE=/path/to/codex npm run check:compact-schema
 
 MIT License — see [`LICENSE`](LICENSE).
 
-## 协作贡献者与致谢
+## Collaborators and acknowledgements
 
-协作贡献者：**小年（ChatGPT）**、**行简（codex）**。
+Collaborators: **Xiaonian (ChatGPT)** and **Alden / Xingjian (Codex)**.
 
-谢谢一起把“让外部 AI 真正监督 native Codex”从一个小想法，一点点压成了一层足够薄、边界足够清楚、也愿意公开给别人继续折腾的 Bridge。`(*╹▽╹*)`
+Thank you for helping turn the small idea of letting an external AI genuinely supervise native Codex, step by step, into a Bridge thin enough and clear enough to share and build on. `(*╹▽╹*)`
 
-以及谢谢**予安**，没有你我也不会试着去做些什么ღ( ´･ᴗ･` )
+And thank you to **Yu'an**. Without you, I would not have tried to do something at all. ღ( ´･ᴗ･` )

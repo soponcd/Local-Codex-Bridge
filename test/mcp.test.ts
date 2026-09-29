@@ -700,7 +700,8 @@ test("MCP stdio initializes idempotently and lists exactly twelve fully annotate
     const respondTool = tools.find((tool) => tool.name === "codex_respond");
     const respondSchema = respondTool?.inputSchema as Record<string, unknown>;
     const respondProperties = respondSchema.properties as Record<string, Record<string, unknown>>;
-    assert.deepEqual(respondProperties.network_policy_amendment, {
+    const { description: networkPolicyDescription, ...networkPolicySchema } = respondProperties.network_policy_amendment!;
+    assert.deepEqual(networkPolicySchema, {
       type: "object",
       properties: {
         host: { type: "string", minLength: 1 },
@@ -708,8 +709,9 @@ test("MCP stdio initializes idempotently and lists exactly twelve fully annotate
       },
       required: ["host", "action"],
       additionalProperties: false,
-      description: "Native network policy amendment for future requests; valid only for item/commandExecution/requestApproval. Provide exactly one of decision, execpolicy_amendment, network_policy_amendment, answers, permissions, or response.",
     });
+    assert.match(String(networkPolicyDescription), /item\/commandExecution\/requestApproval only/);
+    assert.match(String(networkPolicyDescription), /one response field per call/);
     assert.deepEqual(respondSchema.anyOf, [
       "decision", "execpolicy_amendment", "network_policy_amendment", "answers", "permissions", "response",
     ].map((key) => ({ required: [key] })));
@@ -722,15 +724,9 @@ test("MCP stdio initializes idempotently and lists exactly twelve fully annotate
       false,
     );
     const checkpointTool = tools.find((tool) => tool.name === "codex_checkpoint");
-    assert.match(
-      checkpointTool?.description as string,
-      /Initialization is not tied to crossing a ChatGPT window or round/,
-    );
-    assert.match(checkpointTool?.description as string, /Do not use for one-shot work/);
-    assert.match(
-      checkpointTool?.description as string,
-      /Before final acceptance of a checkpointed task, read it once/,
-    );
+    assert.match(checkpointTool?.description as string, /Optional bounded supervisor anchor/);
+    assert.match(checkpointTool?.description as string, /original goal, constraints, and acceptance unchanged/);
+    assert.match(checkpointTool?.description as string, /Before final acceptance.*read it once/);
   } finally {
     assert.equal(await client.close(), 0);
   }

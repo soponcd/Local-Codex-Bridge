@@ -828,11 +828,11 @@ test("unsupported elicitation requests remain observable and are never answered"
 
 test("codex_respond metadata does not advertise generic future-method responses", () => {
   const respondTool = TOOL_DEFINITIONS.find((tool) => tool.name === "codex_respond");
-  assert.match(respondTool?.description ?? "", /Unsupported or unknown methods fail locally and remain pending/);
-  assert.match(respondTool?.description ?? "", /item\/permissions\/requestApproval/);
+  assert.match(respondTool?.description ?? "", /original typed request id and exact method, thread, and turn scope when applicable/);
+  assert.match(respondTool?.description ?? "", /Unsupported methods fail locally and remain pending/);
   assert.doesNotMatch(respondTool?.description ?? "", /elicitation/i);
   const response = (respondTool?.inputSchema.properties as Record<string, unknown>).response as Record<string, unknown>;
-  assert.match(response.description as string, /unsupported or future methods remain pending/);
+  assert.match(response.description as string, /unsupported methods remain pending/);
 });
 
 test("serialized app-server writes preserve order and wait for drain", async () => {
