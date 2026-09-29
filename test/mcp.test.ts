@@ -700,6 +700,12 @@ test("MCP stdio initializes idempotently and lists exactly twelve fully annotate
     const respondTool = tools.find((tool) => tool.name === "codex_respond");
     const respondSchema = respondTool?.inputSchema as Record<string, unknown>;
     const respondProperties = respondSchema.properties as Record<string, Record<string, unknown>>;
+    const respondMethods = String(respondProperties.method?.description);
+    for (const method of [
+      "item/commandExecution/requestApproval", "item/fileChange/requestApproval",
+      "item/permissions/requestApproval", "item/tool/requestUserInput",
+      "execCommandApproval", "applyPatchApproval",
+    ]) assert.ok(respondMethods.includes(method), `tools/list must name supported respond method ${method}`);
     const { description: networkPolicyDescription, ...networkPolicySchema } = respondProperties.network_policy_amendment!;
     assert.deepEqual(networkPolicySchema, {
       type: "object",
