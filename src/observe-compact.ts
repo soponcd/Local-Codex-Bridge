@@ -431,17 +431,23 @@ export class CompactAccumulator {
     const terminal = snapshot.terminal;
     const terminalFact: Record<string, unknown> | null = terminal ? { turn_id: terminal.turn_id, status: terminal.status } : null;
     if (terminal && terminalFact && terminal.error != null) assignClipped(terminalFact, "error", JSON.stringify(terminal.error), 2_000);
-    if (terminal?.final_result_meta && terminalFact) terminalFact.final_result_meta = { ...terminal.final_result_meta };
     // Complete retained finals are delivered at their own cursor. An evicted final uses
     // that same cursor as its fallback boundary; a final without an item cursor
     // uses terminal completion. Neither loss nor floor may jump that boundary.
-    if (terminal && terminalFact && terminal.final_result != null && final?.terminalCursor != null &&
-        (final.itemCursor == null || final.itemComplete === false
-          ? this.requestedCursor < final.terminalCursor && this.nextCursor >= final.terminalCursor
-          : final.itemEvicted === true && this.requestedCursor < final.itemCursor && this.nextCursor >= final.itemCursor)) {
-      // This is the existing bounded terminal snapshot, outside ordinary event
-      // budgets. Incomplete previews need completion at the terminal cursor.
-      terminalFact.final_result = terminal.final_result;
+    if (terminal && terminalFact && terminal.final_result != null && final?.terminalCursor != null) {
+      const completeItem = final.itemCursor != null && final.itemComplete !== false;
+      const deliveryCursor = completeItem ? final.itemCursor! : final.terminalCursor;
+      if (this.nextCursor < deliveryCursor) {
+        // Status is current, but metadata must not describe content still ahead
+        // of this page as if it had already been delivered.
+        terminalFact.final_result_pending = true;
+      } else {
+        if (terminal.final_result_meta) terminalFact.final_result_meta = { ...terminal.final_result_meta };
+        if (this.requestedCursor < deliveryCursor && (!completeItem || final.itemEvicted === true)) {
+          // Existing bounded snapshot, outside ordinary event budgets.
+          terminalFact.final_result = terminal.final_result;
+        }
+      }
     }
     return {
       runtime_available: true,
