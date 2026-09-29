@@ -416,6 +416,40 @@ test("streamed agent text stays unchanged under its bound and retains the tail o
   );
 });
 
+test("terminal text tracks truncation once, partial source, message identity and exit redaction", () => {
+  for (const length of [48_000, 48_001, 60_024]) {
+    const runtime = new RuntimeStore(); runtime.markTurnAccepted("t", "u");
+    const text = "x".repeat(length);
+    runtime.recordNotification("item/completed", { threadId: "t", turnId: "u", completedAtMs: 1,
+      item: { id: "f", type: "agentMessage", phase: "final_answer", text } });
+    runtime.recordNotification("turn/completed", { threadId: "t", turn: { id: "u", status: "completed", items: [] } });
+    const terminal = runtime.observe("t", 0, 50)!.terminal!;
+    assert.equal(terminal.final_result, text.slice(0, 48_000));
+    assert.equal(terminal.final_result_meta!.observed_chars, length);
+    assert.equal(terminal.final_result_meta!.truncated, length > 48_000);
+    assert.equal(terminal.final_result_meta!.complete, length <= 48_000);
+  }
+  for (const startedItem of [false, true]) {
+    const runtime = new RuntimeStore(); runtime.markTurnAccepted("t", "u");
+    runtime.recordNotification("item/completed", { threadId: "t", turnId: "u", completedAtMs: 1,
+      item: { id: "comment", type: "agentMessage", phase: "commentary", text: "Running the migration now." } });
+    if (startedItem) runtime.recordNotification("item/started", { threadId: "t", turnId: "u", startedAtMs: 2,
+      item: { id: "f", type: "agentMessage", phase: "final_answer", text: "" } });
+    runtime.recordNotification("item/agentMessage/delta", { threadId: "t", turnId: "u", itemId: "f", delta: "Final: partial" });
+    runtime.recordNotification("turn/completed", { threadId: "t", turn: { id: "u", status: "interrupted", items: [] } });
+    const terminal = runtime.observe("t", 0, 50)!.terminal!;
+    assert.equal(terminal.final_result, "Final: partial");
+    assert.equal(terminal.final_result_meta!.source_complete, false);
+    assert.equal(terminal.final_result_meta!.truncated, false);
+    assert.equal(terminal.final_result_meta!.complete, false);
+    runtime.markTurnAccepted("t", "v");
+    runtime.recordNotification("item/agentMessage/delta", { threadId: "t", turnId: "v", itemId: "g", delta: "Bearer synthetic-fixture-only" });
+    runtime.markAppServerExited("fixture exit");
+    assert.equal(runtime.observe("t", 0, 50)!.terminal!.final_result, "Bearer [REDACTED]");
+    assert.equal(runtime.observe("t", 0, 50)!.terminal!.final_result_meta!.observed_chars, 29);
+  }
+});
+
 test("pending app-server request ids preserve typed identity and cannot be replaced while responding", () => {
   const runtime = new RuntimeStore();
   runtime.markTurnAccepted("thread-original", "turn-original");

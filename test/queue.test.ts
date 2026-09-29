@@ -99,10 +99,10 @@ test("native owns queue membership, order and duplicate client IDs without Bridg
   }
 });
 
-test("queue malformed, redacted or oversized success is acknowledged and never retried or partially returned", async () => {
+test("queue malformed or oversized success is acknowledged and never retried or partially returned", async () => {
   const addFields = { text, client_user_message_id: "caller-b" };
   const cases = [
-    ...[null, [], {}, { queuedSubmission: null }, { queuedSubmission: item({ clientUserMessageId: "wrong-client" }) }, { queuedSubmission: item({ id: "" }) }, { queuedSubmission: item({ input: "not-an-array" }) }, { queuedSubmission: item({ futureSecret: "synthetic-only" }) }, { queuedSubmission: item({ input: [{ type: "text", text: "password=synthetic-only", text_elements: [] }] }) }, { queuedSubmission: item({ future: "x".repeat(12001) }) }, { queuedSubmission: item({ future: Array.from({ length: 8 }, () => "\u0001".repeat(10000)) }) }].map(response => ({ action: "add", fields: addFields, response })),
+    ...[null, [], {}, { queuedSubmission: null }, { queuedSubmission: item({ clientUserMessageId: "wrong-client" }) }, { queuedSubmission: item({ id: "" }) }, { queuedSubmission: item({ input: "not-an-array" }) }, { queuedSubmission: item({ future: Array.from({ length: 8 }, () => "\u0001".repeat(10000)) }) }].map(response => ({ action: "add", fields: addFields, response })),
     { action: "update", fields: { text, queued_submission_id: "queued-b" }, response: { queuedSubmission: item({ id: "wrong-submission" }) } },
     { action: "delete", fields: { queued_submission_id: "queued-b" }, response: { deleted: "yes" } },
     { action: "reorder", fields: { queued_submission_ids: [] }, response: [] },

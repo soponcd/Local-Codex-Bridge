@@ -1,3 +1,4 @@
+import { preflightEcho } from "./exact-json.js";
 import { AppServerManager } from "./app-server.js";
 import {
   CHECKPOINT_TEXT_LIMIT,
@@ -11,8 +12,8 @@ import {
 } from "./runtime.js";
 import { platformPolicyFor, type PlatformPolicy } from "./platform.js";
 import { exactHistoryResponse, validateHistoryPage } from "./history.js";
-import { exactGoalResponse, GOAL_STATUSES } from "./goal.js";
-import { exactQueueResponse, QUEUE_ACTIONS, QUEUE_PAGE_LIMIT } from "./queue.js";
+import { exactGoalResponse, MAX_GOAL_RESULT_BYTES, GOAL_STATUSES } from "./goal.js";
+import { exactQueueResponse, MAX_QUEUE_RESULT_BYTES, QUEUE_ACTIONS, QUEUE_PAGE_LIMIT } from "./queue.js";
 import { exactSearchResponse, SEARCH_PAGE_LIMIT } from "./search.js";
 
 export interface ToolDefinition {
@@ -170,12 +171,13 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
     name: "codex_history",
     title: "Codex History",
     description:
-      "Read one lossless native persisted history page, without attaching a writer or rebuilding Bridge live state. Paginated threads provide a turn index (turns) or items within a required turn_id (items). Legacy threads provide one full turn per page (turns, limit 1); item paging is unsupported. Keep opaque string cursors with the same thread, history mode, kind, turn scope, and sort direction; reverse cursors use the opposite direction. Only nextCursor:null means end. Oversized or sanitizer-altered pages fail without partial data; a single legacy turn may be undeliverable. No cache, full-thread fallback, or chunk cursor.",
+      "Read one lossless native persisted history page, without attaching a writer or rebuilding Bridge live state. Paginated threads provide a turn index (turns) or items within a required turn_id (items). Legacy threads provide one full turn per page (turns, limit 1); item paging is unsupported. Keep opaque string cursors with the same thread, history mode, kind, turn scope, and sort direction; reverse cursors use the opposite direction. Only nextCursor:null means end. Size, content_policy or defensive structure failures reject the whole page without partial data; a single legacy turn may be undeliverable. No cache, full-thread fallback, or chunk cursor.",
     inputSchema: {
       type: "object",
       properties: {
         thread_id: { type: "string", minLength: 1, maxLength: 200, pattern: "\\S" },
         kind: { type: "string", enum: ["turns", "items"] },
+        content_policy: { type: "string", enum: ["protected", "exact"], default: "protected", description: "protected rejects secret-shaped content. exact returns native text unchanged for this call and may expose sensitive content to the MCP caller. This is an explicit content choice, not an access-control or safety level; no automatic fallback." },
         turn_id: { type: "string", minLength: 1, maxLength: 200, pattern: "\\S" },
         cursor: { type: "string", minLength: 1, maxLength: 10_000, pattern: "\\S", description: "Native history cursor; separate from thread/list and numeric live observe cursors." },
         limit: { type: "integer", minimum: 1, maximum: HISTORY_TURN_LIMIT, description: "Paginated turns: default 20, max 50. Paginated items: default 10, max 20. Legacy turns: default and max 1, checked after metadata read." },
@@ -200,11 +202,12 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
     name: "codex_search",
     title: "Search Native Codex History",
     description:
-      "Read one native search page without resuming threads, loading full histories or rebuilding Bridge live state. kind=threads maps thread/search for native substring/full-text thread discovery with snippets, distinct from the codex_threads title filter. Native search has no cwd/parent/ancestor filter: it searches native-visible threads selected only by source_kinds and archived, never an implied workspace or ACL. kind=occurrences maps thread/searchOccurrences within one required paginated thread: case-insensitive literal substring matches in visible user and final assistant messages, in chronological message order, not every tool/reasoning item. Native owns indexing, matching and ordering; Bridge has no index, relevance scoring, traversal or fallback. Preserve the exact query and filters on continuation; only nextCursor:null means end, not an empty page. Thread-search backwardsCursor is used with the opposite sort_direction; occurrence turnCursor is an inclusive native history anchor for codex_history(kind=turns, same thread), not a search continuation. snippetMatchRange uses UTF-16 code units, end exclusive. Eligible pages and future fields are unchanged; redaction, truncation, invalid fields or the 256 KiB result-body bound produce search_result_not_deliverable with no partial data/cursor. Native errors, including unsupported history modes, propagate without retry. Search results are locators, not a complete history audit or a snapshot guarantee.",
+      "Read one native search page without resuming threads, loading full histories or rebuilding Bridge live state. kind=threads maps thread/search for native substring/full-text thread discovery with snippets, distinct from the codex_threads title filter. Native search has no cwd/parent/ancestor filter: it searches native-visible threads selected only by source_kinds and archived, never an implied workspace or ACL. kind=occurrences maps thread/searchOccurrences within one required paginated thread: case-insensitive literal substring matches in visible user and final assistant messages, in chronological message order, not every tool/reasoning item. Native owns indexing, matching and ordering; Bridge has no index, relevance scoring, traversal or fallback. Preserve the exact query and filters on continuation; only nextCursor:null means end, not an empty page. Thread-search backwardsCursor is used with the opposite sort_direction; occurrence turnCursor is an inclusive native history anchor for codex_history(kind=turns, same thread), not a search continuation. snippetMatchRange uses UTF-16 code units, end exclusive. Eligible pages and future fields are unchanged; content_policy, defensive structure, invalid fields or the 256 KiB result-body bound produce search_result_not_deliverable with no partial data/cursor. Native errors, including unsupported history modes, propagate without retry. Search results are locators, not a complete history audit or a snapshot guarantee.",
     inputSchema: {
       type: "object",
       properties: {
         kind: { type: "string", enum: ["threads", "occurrences"] },
+        content_policy: { type: "string", enum: ["protected", "exact"], default: "protected", description: "protected rejects secret-shaped content. exact returns native text unchanged for this call and may expose sensitive content to the MCP caller. This is an explicit content choice, not an access-control or safety level; no automatic fallback." },
         search_term: { type: "string", minLength: 1, maxLength: 500, pattern: "\\S", description: "Native query, forwarded unchanged. Length bound is for transport; Bridge does not tokenize, trim or interpret it." },
         thread_id: { type: "string", minLength: 1, maxLength: 200, pattern: "\\S", description: "Required only for occurrences. Exact native paginated thread." },
         cursor: { type: "string", minLength: 1, maxLength: 10_000, pattern: "\\S", description: "Opaque search continuation for the same kind, query, scope and filters. Never substitute an occurrence's turnCursor here." },
@@ -264,7 +267,7 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
     name: "codex_goal",
     title: "Manage Native Codex Goal",
     description:
-      "Get, set, or clear the native persisted goal of an exact thread. Each call maps one thread/goal method without implicit resume, turn/start, retries, a goal cache, or checkpoint writes. Active goals may cause native execution; clear is not turn interrupt. Set requires explicit budget_mode with no default: preserve omits native tokenBudget, unlimited sends null, fixed sends the required positive safe-integer token_budget. A budget is an optional native Goal resource ceiling: ordinarily choose unlimited for a long-running goal, fixed only when a hard cap is intended, and preserve when editing an existing goal without changing its budget. The budget gate does not apply to ordinary turns, Queue or Steer. Native Codex validates objectives and owns status transitions and usage accounting. Success returns the unchanged native response; goal_result_not_deliverable means native returned success but its result could not be delivered losslessly, including an acknowledged mutation for set/clear. An already-sent mutating acknowledgement timeout instead means UNKNOWN / possibly accepted. Read native goal state before deciding on another mutation; do not directly retry.",
+      "Get, set, or clear the native persisted goal of an exact thread. Each call maps one thread/goal method without implicit resume, turn/start, retries, a goal cache, or checkpoint writes. Active goals may cause native execution; clear is not turn interrupt. Set requires explicit budget_mode with no default: preserve omits native tokenBudget, unlimited sends null, fixed sends the required positive safe-integer token_budget. A budget is an optional native Goal resource ceiling: ordinarily choose unlimited for a long-running goal, fixed only when a hard cap is intended, and preserve when editing an existing goal without changing its budget. The budget gate does not apply to ordinary turns, Queue or Steer. Native Codex validates objectives and owns status transitions and usage accounting. Success returns native content unchanged without secret-shape filtering; known oversized echoed input is rejected before mutation. goal_result_not_deliverable means native returned success but its result could not be delivered losslessly, including an acknowledged mutation for set/clear. An already-sent mutating acknowledgement timeout instead means UNKNOWN / possibly accepted. Read native goal state before deciding on another mutation; do not directly retry.",
     inputSchema: {
       type: "object",
       properties: {
@@ -303,13 +306,13 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
     name: "codex_queue",
     title: "Codex Native Queue",
     description:
-      "List, add, update, delete or reorder native queued follow-up text for an existing active workflow. Native Codex owns ordering and automatic execution after the current turn; an enqueue acknowledgement is not execution or completion. This differs from codex_steer, which redirects the current turn. Each call forwards one native queue operation, with no implicit resume, turn-start, queue-start, traversal, retry, scheduler or Bridge queue store. Use caller-supplied client_user_message_id for add and native queuedSubmission.id for update/delete/reorder; do not assume an idempotency guarantee. An already-sent mutation timeout is UNKNOWN; read queue and execution state before deciding on another write. queue_result_not_deliverable means native returned success but its result could not be delivered losslessly; for mutations the acknowledgement is retained. No retry or compensation is performed. Queue entries may be consumed while inspecting or editing them. This surface supports text only; update replaces the entire native input array with one text item.",
+      "List, add, update, delete or reorder native queued follow-up text for an existing active workflow. Native Codex owns ordering and automatic execution after the current turn; an enqueue acknowledgement is not execution or completion. This differs from codex_steer, which redirects the current turn. Each call forwards one native queue operation, with no implicit resume, turn-start, queue-start, traversal, retry, scheduler or Bridge queue store. Use caller-supplied client_user_message_id for add and native queuedSubmission.id for update/delete/reorder; do not assume an idempotency guarantee. An already-sent mutation timeout is UNKNOWN; read queue and execution state before deciding on another write. queue_result_not_deliverable means native returned success but its result could not be delivered losslessly; for mutations the acknowledgement is retained. No retry or compensation is performed. Queue entries may be consumed while inspecting or editing them. Successful reads and responses preserve native content without secret-shape filtering. This surface supports text only; update replaces the entire native input array with one text item.",
     inputSchema: {
       type: "object",
       properties: {
         action: { type: "string", enum: QUEUE_ACTIONS },
         thread_id: { type: "string", minLength: 1, maxLength: 200, pattern: "\\S" },
-        text: { type: "string", minLength: 1, maxLength: 200_000, pattern: "\\S", description: "Follow-up text for add or full input replacement for update. Input transport bound; long or redaction-sensitive native results may be undeliverable even after the mutation succeeds." },
+        text: { type: "string", minLength: 1, maxLength: 200_000, pattern: "\\S", description: "Follow-up text for add or full input replacement for update. Input transport bound; a serialized UTF-8 preflight also reserves response overhead before writing. Unpredictable native fields can still make an acknowledged result undeliverable." },
         client_user_message_id: { type: "string", minLength: 1, maxLength: 200, pattern: "\\S", description: "Required caller-provided native clientUserMessageId for add; Bridge never generates or retries it." },
         queued_submission_id: { type: "string", minLength: 1, maxLength: 200, pattern: "\\S", description: "Exact native queuedSubmission.id for update/delete; not a turn id or client message id." },
         queued_submission_ids: { type: "array", maxItems: QUEUE_PAGE_LIMIT, items: { type: "string", minLength: 1, maxLength: 200, pattern: "\\S" }, description: "Native pending submission IDs in the requested order. Pass the full intended ordering; native validates membership/permutation. No read/merge/deduplication or retry. The array bound is not native queue capacity." },
@@ -387,7 +390,7 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
     name: "codex_observe",
     title: "Observe Codex Turn",
     description:
-      "Read bounded incremental sanitized Bridge runtime events, pending requests, and terminal output for a thread. Default compact view projects supervision facts and counts only scanned retained activity. Raw returns individual retained sanitized events with original runtime cursors, without aggregation; internal cursor gaps are possible, so it is not a complete native stream. stream_lost reports evicted allowlisted, valid streaming deltas; facts_lost reports eviction of other events; cursor_lost summarizes either. Loss covers the unscanned cursor-to-head range checked during the read, not only the returned page. cursor_floor locates the oldest retained event boundary, not a continuous suffix or an instruction to skip records. Always reuse next_cursor to consume remaining retained events. Compact drains silent retained events across chunks and wakes on supervision facts or facts_lost; stream_lost alone is diagnostic metadata, does not wake compact early, and does not require raw replay. Optional wait_ms performs one bounded event-driven wait with a fixed per-call deadline (maximum 120 seconds); 0 returns immediately. A true-silence deadline returns only runtime_available, runtime_status, active_turn_id, next_cursor, and no_change: true; activity or loss is not silence. Use view=raw with a chosen runtime cursor and wait_ms=0 for retained-event replay. Pending requests and latest terminal output remain separately available even after their ring events are evicted. When runtime_available is true, pending_requests is the complete current pending set, not an incremental patch. Compact omits it when empty; an absent field means no pending requests, so clear any previously observed list. When runtime_available is false, pending state is unknown, even if the field is absent or an empty array. After Bridge process loss, metadata-only thread/read cannot reconstruct live events, pending requests, cursor, active turn, or terminal; page persistent history through codex_history if needed. A long interval with no new command or output can still mean Codex is actively reasoning; absence of new command activity alone is not evidence of a stall. When actively supervising an in-progress turn, use repeated bounded-wait observe calls until terminal unless the user explicitly pauses or stops; do not end supervision merely because one snapshot is inProgress. After every wake or deadline return, inspect the newly available events/state and decide whether steer, respond, or interruption is needed before starting the next bounded wait.",
+      "Read bounded incremental sanitized Bridge runtime events, pending requests, and terminal output for a thread. Default compact view projects supervision facts and counts only scanned retained activity. Raw returns individual retained sanitized events with original runtime cursors, without aggregation; internal cursor gaps are possible, so it is not a complete native stream. stream_lost reports evicted allowlisted, valid streaming deltas; facts_lost reports eviction of other events; cursor_lost summarizes either. Loss covers the unscanned cursor-to-head range checked during the read, not only the returned page. cursor_floor locates the oldest retained event boundary, not a continuous suffix or an instruction to skip records. Always reuse next_cursor to consume remaining retained events. Compact drains silent retained events across chunks and wakes on supervision facts or facts_lost; stream_lost alone is diagnostic metadata, does not wake compact early, and does not require raw replay. Optional wait_ms performs one bounded event-driven wait with a fixed per-call deadline (maximum 120 seconds); 0 returns immediately. A true-silence deadline returns only runtime_available, runtime_status, active_turn_id, next_cursor, and no_change: true; activity or loss is not silence. Use view=raw with a chosen runtime cursor and wait_ms=0 for retained-event replay. Pending requests and latest terminal output remain separately available even after their ring events are evicted. If compact cannot deliver a final completely, follow next_cursor through terminal completion for the bounded final_result. final_result_meta.complete is false for truncated or partial source text; raw also has a 48k live text cap. Use narrow codex_history for this thread/terminal turn or native inspection when more content is needed. When runtime_available is true, pending_requests is the complete current pending set, not an incremental patch. Compact omits it when empty; an absent field means no pending requests, so clear any previously observed list. When runtime_available is false, pending state is unknown, even if the field is absent or an empty array. After Bridge process loss, metadata-only thread/read cannot reconstruct live events, pending requests, cursor, active turn, or terminal; page persistent history through codex_history if needed. A long interval with no new command or output can still mean Codex is actively reasoning; absence of new command activity alone is not evidence of a stall. When actively supervising an in-progress turn, use repeated bounded-wait observe calls until terminal unless the user explicitly pauses or stops; do not end supervision merely because one snapshot is inProgress. After every wake or deadline return, inspect the newly available events/state and decide whether steer, respond, or interruption is needed before starting the next bounded wait.",
     inputSchema: {
       type: "object",
       properties: {
@@ -1016,7 +1019,8 @@ export class ControlSurface {
   }
 
   async #history(args: Record<string, unknown>): Promise<unknown> {
-    onlyKeys(args, ["thread_id", "kind", "turn_id", "cursor", "limit", "sort_direction"]);
+    onlyKeys(args, ["thread_id", "kind", "turn_id", "cursor", "limit", "sort_direction", "content_policy"]);
+    const policy = enumValue(args, "content_policy", ["protected", "exact"] as const) ?? "protected";
     const threadId = requiredString(args, "thread_id", 200);
     const kind = enumValue(args, "kind", ["turns", "items"]);
     if (kind === undefined) throw new Error("kind is required");
@@ -1070,13 +1074,14 @@ export class ControlSurface {
       data: page.data,
       nextCursor: page.nextCursor,
       backwardsCursor: page.backwardsCursor,
-    });
+    }, policy);
   }
 
   async #search(args: Record<string, unknown>): Promise<unknown> {
     const kind = enumValue(args, "kind", ["threads", "occurrences"] as const);
     if (!kind) throw new Error("kind is required");
-    onlyKeys(args, ["kind", "search_term", "cursor", "limit", ...(kind === "threads"
+    const policy = enumValue(args, "content_policy", ["protected", "exact"] as const) ?? "protected";
+    onlyKeys(args, ["kind", "search_term", "cursor", "limit", "content_policy", ...(kind === "threads"
       ? ["sort_key", "sort_direction", "source_kinds", "archived"] : ["thread_id"])]);
     const limit = optionalInteger(args, "limit", 1, SEARCH_PAGE_LIMIT) ?? 20;
     const params: Record<string, unknown> = { searchTerm: requiredString(args, "search_term", 500), limit };
@@ -1099,7 +1104,7 @@ export class ControlSurface {
       if (sourceKinds !== undefined) params.sourceKinds = sourceKinds;
     }
     const method = kind === "threads" ? "thread/search" : "thread/searchOccurrences";
-    return exactSearchResponse(await this.appServer.request(method, params), kind, limit);
+    return exactSearchResponse(await this.appServer.request(method, params), kind, limit, policy);
   }
 
   async #threads(args: Record<string, unknown>): Promise<unknown> {
@@ -1296,6 +1301,9 @@ export class ControlSurface {
         params.status = args.status === null ? null : enumValue(args, "status", GOAL_STATUSES);
       }
     }
+    if (action === "set" && typeof params.objective === "string") {
+      preflightEcho({ goal: { threadId, objective: params.objective } }, MAX_GOAL_RESULT_BYTES, "goal");
+    }
     const response = await this.appServer.request(`thread/goal/${action}`, params);
     return exactGoalResponse(response, action, threadId);
   }
@@ -1334,6 +1342,11 @@ export class ControlSurface {
         throw new Error("queued_submission_ids must be an array of at most 100 non-empty native IDs, each at most 200 characters");
       }
       params.queuedSubmissionIds = ids;
+    }
+    if (action === "add" || action === "update") {
+      const item = { id: expected.submissionId ?? "", input: params.input, clientUserMessageId: expected.clientUserMessageId ?? "" };
+      // A one-item list must fit too; reserve covers currently unknown fields.
+      preflightEcho({ data: [item], nextCursor: null }, MAX_QUEUE_RESULT_BYTES, "queue");
     }
     const response = await this.appServer.request("thread/queue/" + action, params);
     return exactQueueResponse(response, action, expected);
@@ -1445,7 +1458,7 @@ export class ControlSurface {
       has_more: false,
       pending_requests: [],
       terminal: null,
-      unavailable_live_fields: ["events", "next_cursor", "current_cursor", "cursor_floor", "cursor_lost", "stream_lost", "facts_lost", "has_more", "pending_requests"],
+      unavailable_live_fields: ["active_turn_id", "terminal", "events", "next_cursor", "current_cursor", "cursor_floor", "cursor_lost", "stream_lost", "facts_lost", "has_more", "pending_requests"],
       stored_thread: { ...storedThread, turns: [] },
       source: "codex_app_server_thread_read_metadata",
     });

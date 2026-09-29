@@ -32,8 +32,10 @@ test("history response above 10 MiB remains a fatal app-server inbound limitatio
       }),
       /app-server JSONL line exceeded 10 MiB/,
     );
+    // Let the fixture exit after protocol failure; it must not replace the cause.
+    await delay(100);
     await assert.rejects(manager.request("thread/read", { threadId: "thread-big", includeTurns: false }),
-      /unavailable and will not be auto-restarted/);
+      /unavailable and will not be auto-restarted: app-server JSONL line exceeded 10 MiB/);
   } finally {
     await manager.close();
   }

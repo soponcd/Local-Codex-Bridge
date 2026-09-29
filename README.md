@@ -2,7 +2,7 @@
 
 *A thin supervisory MCP bridge between external AI supervisors and native Codex.*
 
-**Current release: V2.3.0**
+**Current release: V2.3.2**
 
 Local Codex Bridge 是一个面向 Windows 与 macOS 的轻量 MCP stdio 适配器：
 
@@ -110,6 +110,17 @@ V2.3.0 不把这些能力重新实现一遍：History、Goal、Queue、Search �
 | `codex_checkpoint` | 保存可选、精简、有界的 supervisor anchor | 不是 transcript、job id 或 Codex history |
 
 完整 schema 与运行时校验以 [`src/tools.ts`](src/tools.ts) 为准。
+
+### 内容交付与读取选择
+
+History / Search 默认使用 `content_policy:"protected"`：秘密形状检测可能拒绝整页，包括误匹配普通代码。调用方可显式使用 `content_policy:"exact"` 将本次 native 原文交给 MCP caller；它可能暴露敏感内容，不会保存为会话偏好，也没有自动回退。protected 提供默认检测与显式选择记录，不是阻止监督者最终取得原文的权限边界。
+
+Goal / Queue 的成功读取和响应直接保留 native 原值，不做正文秘密形状过滤。已知回显内容过大时在写入前拒绝；native 后加字段等仍可能造成“已确认接受，但响应无法交付”，不能据此重发 mutation。多项页超限可以缩小 limit；单项仍超限时应从 native 侧检查，不能靠反复调用同一个 Bridge 读取恢复。错误与运行诊断继续脱敏。
+
+这些精确响应不继承 observe 的短文本、内部数组和字段数量预算，仍受真实字节限制、必要字段校验及防御性序列化检查约束；失败不返回部分页或伪造 cursor。具体边界见 [协议说明](PROTOCOL-ASSUMPTIONS.md#exact-content-delivery)。
+
+compact 的最终答复若未完整交付，继续沿 `next_cursor` 读到终态会得到现有的有界 `terminal.final_result`。检查 `final_result_meta.complete`：false 表示源文本未完整收到或 live 保留发生裁剪。raw 和 terminal 同样有 48k 上限，需要更多内容时按该 thread / terminal turn 窄读 History，或从 native 侧检查；普通 compact 事件的预算保持不变。
+
 
 ---
 
@@ -259,7 +270,7 @@ Bridge 不自动 retry、补偿或猜测结果。
 
 Bridge 不创建自己的 item/chunk cursor，也不在失败时偷偷 full-read 整段历史。
 
-History 成功页要求无损交付；如果页面因为 transport / sanitizer 边界无法保持原样，会整页失败，而不是返回部分 data + cursor。
+History 成功页要求无损交付；如果页面超出传输字节边界、触发当前内容策略或无法通过防御性 JSON 序列化检查，会整页失败，而不是返回部分 data + cursor。
 
 `codex_search` 只映射 native Search：
 
