@@ -11,7 +11,7 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "npm run build && npm run test:shared && npm run test:platform",
-    "test:shared": "node --test dist/test/runtime.test.js dist/test/observe-compact.test.js dist/test/history.test.js dist/test/goal.test.js dist/test/lineage.test.js dist/test/queue.test.js dist/test/search.test.js dist/test/app-server.test.js dist/test/tools.test.js dist/test/mcp.test.js dist/test/checkpoint.test.js dist/test/platform.test.js dist/test/shutdown.test.js dist/test/ux-projection.test.js dist/test/version.test.js",
+    "test:shared": "node --test dist/test/exact-json.test.js dist/test/runtime.test.js dist/test/observe-compact.test.js dist/test/history.test.js dist/test/goal.test.js dist/test/lineage.test.js dist/test/queue.test.js dist/test/search.test.js dist/test/app-server.test.js dist/test/tools.test.js dist/test/mcp.test.js dist/test/checkpoint.test.js dist/test/platform.test.js dist/test/shutdown.test.js dist/test/ux-projection.test.js dist/test/version.test.js",
     "check:compact-schema": "node scripts/check-compact-schema.mjs",
     "test:platform": "node scripts/test-platform.mjs",
     "test:tray": "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File windows\\test-tray.ps1",

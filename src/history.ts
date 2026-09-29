@@ -1,4 +1,4 @@
-import { sanitizeForTransport } from "./runtime.js";
+import { encodeExactJson, ExactJsonError, type ContentPolicy } from "./exact-json.js";
 
 // Count the actual success envelope: one structured result and a tiny text marker.
 // Reserve framing/request-id headroom before the final MCP check with the real id.
@@ -21,10 +21,6 @@ export interface HistoryPage {
   data: unknown[];
   nextCursor: string | null;
   backwardsCursor: string | null;
-}
-
-function jsonEqual(left: unknown, right: unknown): boolean {
-  return JSON.stringify(left) === JSON.stringify(right);
 }
 
 export function validateHistoryPage(value: unknown, limit: number, kind: "turns" | "items"): HistoryPage {
@@ -57,39 +53,13 @@ export function validateHistoryPage(value: unknown, limit: number, kind: "turns"
   return page as unknown as HistoryPage;
 }
 
-export function exactHistoryResponse(response: Record<string, unknown>): Record<string, unknown> {
-  // Check redaction before size so a secret cannot be mislabeled as a page
-  // that can necessarily be recovered by reducing limit.
-  let policyProjection: unknown;
-  try {
-    policyProjection = sanitizeForTransport(response, {
-      maxStringChars: Number.MAX_SAFE_INTEGER,
-      maxDepth: 128,
-      maxArrayItems: Number.MAX_SAFE_INTEGER,
-      maxObjectKeys: Number.MAX_SAFE_INTEGER,
-      totalCharBudget: Number.MAX_SAFE_INTEGER,
-    });
-  } catch {
-    throw new Error("history_page_not_lossless: sanitizer cannot project the page");
+export function exactHistoryResponse(response: Record<string, unknown>, policy: ContentPolicy = "protected"): Record<string, unknown> {
+  try { encodeExactJson(response, policy); }
+  catch (error) {
+    throw new Error("history_page_not_lossless: " + (error instanceof ExactJsonError ? error.message : "structure: unrepresentable response"));
   }
-  if (!jsonEqual(response, policyProjection)) {
-    throw new Error("history_page_not_lossless: redaction or sanitizer policy would alter the page");
-  }
-
   if (historyMcpBytes(response, "") + HISTORY_MCP_WRAPPER_ALLOWANCE_BYTES > MAX_HISTORY_MCP_BYTES) {
     throw new Error("history_page_too_large: received page exceeds the lossless MCP byte budget; paginated pages may retry the same cursor with a smaller limit; a legacy turn at limit:1 cannot be made smaller");
-  }
-
-  // Let History strings fit the MCP byte cap while retaining all other
-  // transport limits. Return the original only when the projection is exact.
-  let transportProjection: unknown;
-  try {
-    transportProjection = sanitizeForTransport(response, { maxStringChars: MAX_HISTORY_MCP_BYTES });
-  } catch {
-    throw new Error("history_page_not_lossless: sanitizer cannot project the page");
-  }
-  if (!jsonEqual(response, transportProjection)) {
-    throw new Error("history_page_not_lossless: transport sanitizer would alter the page");
   }
   return response;
 }

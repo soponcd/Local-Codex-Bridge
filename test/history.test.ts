@@ -194,14 +194,10 @@ test("history permits long strings without changing global sanitizer defaults or
   assert.strictEqual(exactHistoryResponse(response), response);
 });
 
-test("history exactness rejects sanitizer mutation, including redaction, without partial pages", async () => {
+test("protected history rejects secret-shaped content without partial pages", async () => {
   const values = [
     { api_key: "secret" },
     { text: "Bearer abcdefghijklmnop" },
-    { nested: { a: { b: { c: { d: { e: { f: { g: { h: "deep" } } } } } } } } },
-    { many: Array.from({ length: 51 }, (_, i) => i) },
-    { many: Object.fromEntries(Array.from({ length: 61 }, (_, i) => [`field${i}`, i])) },
-    { many: Array.from({ length: 30 }, () => "x".repeat(6_000)) },
   ];
   for (const item of values) {
     const manager = new StubAppServer(() => page([{ turnId: "turn-1", item }]));
@@ -258,6 +254,7 @@ test("runtime-missing observe returns metadata placeholders in compact/raw/wait 
     assert.equal(observed.runtime_available, false);
     assert.equal(observed.terminal, null);
     assert.equal(observed.active_turn_id, null);
+    for (const field of ["active_turn_id", "terminal"]) assert.ok((observed.unavailable_live_fields as string[]).includes(field));
     for (const field of ["stream_lost", "facts_lost"]) {
       assert.equal(observed[field], false);
       assert.ok((observed.unavailable_live_fields as string[]).includes(field));

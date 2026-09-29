@@ -47,6 +47,14 @@ export interface UxProjectionSink {
   close(): void;
 }
 
+export interface UxProjectionIO {
+  mkdirSync: typeof mkdirSync;
+  writeFileSync: typeof writeFileSync;
+  renameSync: typeof renameSync;
+  rmSync: typeof rmSync;
+}
+const DEFAULT_IO: UxProjectionIO = { mkdirSync, writeFileSync, renameSync, rmSync };
+
 export class AtomicUxProjection implements UxProjectionSink {
   readonly #generation = {
     id: randomUUID(),
@@ -59,6 +67,7 @@ export class AtomicUxProjection implements UxProjectionSink {
   constructor(
     readonly filePath: string,
     private readonly signalLimit = 32,
+    private readonly io: UxProjectionIO = DEFAULT_IO,
   ) {
     if (!isAbsolute(filePath)) {
       throw new Error(`${UX_PROJECTION_ENV} must be an absolute path`);
@@ -91,18 +100,19 @@ export class AtomicUxProjection implements UxProjectionSink {
   }
 
   close(): void {
-    rmSync(this.filePath, { force: true });
+    this.io.rmSync(this.filePath, { force: true });
   }
 
   #writeAtomic(content: string): void {
     const directory = dirname(this.filePath);
-    mkdirSync(directory, { recursive: true });
+    this.io.mkdirSync(directory, { recursive: true });
     const temporary = `${this.filePath}.${process.pid}.${randomUUID()}.tmp`;
     try {
-      writeFileSync(temporary, content, { encoding: "utf8", flag: "wx" });
-      renameSync(temporary, this.filePath);
+      this.io.writeFileSync(temporary, content, { encoding: "utf8", flag: "wx" });
+      this.io.renameSync(temporary, this.filePath);
     } finally {
-      rmSync(temporary, { force: true });
+      // Cleanup is best-effort and must not replace a write/rename failure.
+      try { this.io.rmSync(temporary, { force: true }); } catch { /* optional temporary file */ }
     }
   }
 }

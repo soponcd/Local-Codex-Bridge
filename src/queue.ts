@@ -1,4 +1,4 @@
-import { sanitizeForTransport } from "./runtime.js";
+import { encodeExactJson, ExactJsonError } from "./exact-json.js";
 
 export const QUEUE_ACTIONS = ["list", "add", "update", "delete", "reorder"] as const;
 export type QueueAction = typeof QUEUE_ACTIONS[number];
@@ -29,7 +29,7 @@ export function exactQueueResponse(
       ? "native thread/queue/list returned success"
       : `native thread/queue/${action} returned success; the mutation was acknowledged`;
     throw new Error(
-      `queue_result_not_deliverable: ${acknowledgement}, but its result cannot be delivered losslessly (${reason}). No retry or compensation was performed. Read native queue and execution state before deciding on another mutation.`,
+      `queue_result_not_deliverable: ${acknowledgement}, but its result cannot be delivered losslessly (${reason}). No retry or compensation was performed. Inspect native queue and execution state before another mutation. For size failures try a smaller list limit; if one item remains undeliverable, use the native interface.`,
     );
   };
   const response = record(value);
@@ -51,14 +51,10 @@ export function exactQueueResponse(
   }
 
   let encoded: string;
-  let projected: string;
-  try {
-    encoded = JSON.stringify(response);
-    projected = JSON.stringify(sanitizeForTransport(response, { maxArrayItems: QUEUE_PAGE_LIMIT }));
-  } catch { return fail("unrepresentable response"); }
-  if (encoded !== projected) return fail("redaction or transport truncation required");
+  try { encoded = encodeExactJson(response); }
+  catch (error) { return fail(error instanceof ExactJsonError ? error.message : "structure: unrepresentable response"); }
   if (Buffer.byteLength(encoded, "utf8") > MAX_QUEUE_RESULT_BYTES) {
-    return fail("result exceeds the transport byte bound");
+    return fail("size: result exceeds the transport byte bound");
   }
   return response;
 }

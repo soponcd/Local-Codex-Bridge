@@ -1,4 +1,4 @@
-import { sanitizeForTransport, type RuntimeEvent, type RuntimeObservation } from "./runtime.js";
+import { sanitizeForTransport, stringHead, stringTail, type RuntimeEvent, type RuntimeObservation } from "./runtime.js";
 import { ITEM_POLICIES, NOTIFICATION_POLICIES, type CompactPolicy } from "./compact-schema.js";
 import { NOTIFICATION_SHAPES } from "./compact-descriptors.js";
 import { matchesCompactShape } from "./compact-shape.js";
@@ -18,6 +18,7 @@ export interface CompactFinalIdentity {
   terminalCursor: number | null;
   turnId: string | null;
   itemEvicted?: boolean;
+  itemComplete?: boolean;
 }
 
 function record(value: unknown): Record<string, unknown> | null {
@@ -27,9 +28,9 @@ function record(value: unknown): Record<string, unknown> | null {
 
 function clipped(value: string, max = FIELD_CHARS): { value: string; truncated?: { original_chars: number; head_chars: number; tail_chars: number } } {
   if (value.length <= max) return { value };
-  const head = Math.floor(max / 2);
-  const tail = max - head;
-  return { value: value.slice(0, head) + value.slice(-tail), truncated: { original_chars: value.length, head_chars: head, tail_chars: tail } };
+  const head = stringHead(value, Math.floor(max / 2));
+  const tail = stringTail(value, max - Math.floor(max / 2));
+  return { value: head + tail, truncated: { original_chars: value.length, head_chars: head.length, tail_chars: tail.length } };
 }
 
 function assignClipped(fact: Record<string, unknown>, key: string, value: string, max = FIELD_CHARS): void {
@@ -430,14 +431,17 @@ export class CompactAccumulator {
     const terminal = snapshot.terminal;
     const terminalFact: Record<string, unknown> | null = terminal ? { turn_id: terminal.turn_id, status: terminal.status } : null;
     if (terminal && terminalFact && terminal.error != null) assignClipped(terminalFact, "error", JSON.stringify(terminal.error), 2_000);
-    // Retained finals are delivered at their own cursor. An evicted final uses
+    if (terminal?.final_result_meta && terminalFact) terminalFact.final_result_meta = { ...terminal.final_result_meta };
+    // Complete retained finals are delivered at their own cursor. An evicted final uses
     // that same cursor as its fallback boundary; a final without an item cursor
     // uses terminal completion. Neither loss nor floor may jump that boundary.
     if (terminal && terminalFact && terminal.final_result != null && final?.terminalCursor != null &&
-        (final.itemCursor == null
+        (final.itemCursor == null || final.itemComplete === false
           ? this.requestedCursor < final.terminalCursor && this.nextCursor >= final.terminalCursor
           : final.itemEvicted === true && this.requestedCursor < final.itemCursor && this.nextCursor >= final.itemCursor)) {
-      assignClipped(terminalFact, "final_result", terminal.final_result);
+      // This is the existing bounded terminal snapshot, outside ordinary event
+      // budgets. Incomplete previews need completion at the terminal cursor.
+      terminalFact.final_result = terminal.final_result;
     }
     return {
       runtime_available: true,

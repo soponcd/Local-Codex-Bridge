@@ -1,3 +1,5 @@
+import { redactText, isSecretKey } from "./redaction.js";
+export { redactText } from "./redaction.js";
 export type RpcId = string | number;
 
 export const MAX_OBSERVE_WAIT_MS = 120_000;
@@ -84,11 +86,33 @@ export interface LateMutationError {
   error: unknown;
 }
 
+export interface FinalResultMetadata {
+  complete: boolean;
+  source_complete: boolean;
+  truncated: boolean;
+  observed_chars: number;
+  retained_chars: number;
+  retained: "head" | "tail";
+}
+interface AgentTextMetadata {
+  itemId: string | null;
+  sourceComplete: boolean;
+  truncated: boolean;
+  observedChars: number;
+  retained: "head" | "tail";
+}
+function emptyAgentTextMetadata(itemId: string | null = null): AgentTextMetadata {
+  return { itemId, sourceComplete: false, truncated: false, observedChars: 0, retained: "head" };
+}
+interface MessageDelivery { cursor: number; complete: boolean; digest: string }
+function textDigest(text: string): string { return createHash("sha256").update(text).digest("hex"); }
+
 export interface TerminalSnapshot {
   turn_id: string;
   status: string;
   completed_at: string;
   final_result: string | null;
+  final_result_meta?: FinalResultMetadata;
   error: unknown | null;
   turn: unknown;
 }
@@ -104,11 +128,12 @@ interface ThreadRuntime {
   lastDroppedFact: number;
   terminal: TerminalSnapshot | null;
   agentText: string;
+  agentTextMetadata: AgentTextMetadata;
   compactPlanSignature: string | null;
   compactSettingsSignature: string | null;
   compactBoundarySignature: string | null;
-  agentMessageCursors: Map<string, number>;
-  finalMessageCursor: number | null;
+  agentMessageCursors: Map<string, MessageDelivery>;
+  finalMessageDelivery: MessageDelivery | null;
   finalMessageItemId: string | null;
   terminalCursor: number | null;
 }
@@ -171,60 +196,21 @@ const STREAM_DELTA_METHODS = new Set([
   "command/exec/outputDelta", "process/outputDelta",
 ]);
 
-const TEXT_SECRET_PATTERNS: ReadonlyArray<[RegExp, string]> = [
-  [/\bBearer\s+[A-Za-z0-9._~+\/-]{8,}={0,2}/gi, "Bearer [REDACTED]"],
-  [/\bsk-[A-Za-z0-9_-]{12,}\b/g, "sk-[REDACTED]"],
-  [
-    /\b(api[_-]?key|access[_-]?token|refresh[_-]?token|password|passwd|client[_-]?secret)\s*[:=]\s*([^\s,;]+)/gi,
-    "$1=[REDACTED]",
-  ],
-  [
-    /\b([A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)*_(?:API_KEY|TOKEN|PASSWORD|PASSWD|SECRET))\s*=\s*([^\s,;]+)/gi,
-    "$1=[REDACTED]",
-  ],
-];
-
-function isSecretKey(key: string): boolean {
-  const normalized = key.replace(/[\s_-]/g, "").toLowerCase();
-  return [
-    "apikey",
-    "token",
-    "accesstoken",
-    "refreshtoken",
-    "authorization",
-    "password",
-    "passwd",
-    "secret",
-    "clientsecret",
-    "secretaccesskey",
-    "cookie",
-    "setcookie",
-    "credential",
-    "privatekey",
-  ].some((suffix) => normalized === suffix || normalized.endsWith(suffix));
-}
-
-export function redactText(value: string): string {
-  let redacted = value;
-  for (const [pattern, replacement] of TEXT_SECRET_PATTERNS) {
-    redacted = redacted.replace(pattern, replacement);
-  }
-  return redacted;
+export function stringHead(value: string, maxChars: number): string {
+  if (value.length <= maxChars) return value;
+  let end = maxChars;
+  const last = value.charCodeAt(end - 1);
+  if (last >= 0xd800 && last <= 0xdbff) end -= 1;
+  return value.slice(0, end);
 }
 
 function truncateString(value: string, maxChars: number): string {
-  if (value.length <= maxChars) {
-    return value;
-  }
-  let prefix = value.slice(0, maxChars);
-  const last = prefix.charCodeAt(prefix.length - 1);
-  if (last >= 0xd800 && last <= 0xdbff) {
-    prefix = prefix.slice(0, -1);
-  }
-  return `${prefix}\u2026 [truncated ${value.length - prefix.length} chars]`;
+  if (value.length <= maxChars) return value;
+  const prefix = stringHead(value, maxChars);
+  return `${prefix}… [truncated ${value.length - prefix.length} chars]`;
 }
 
-function stringTail(value: string, maxChars: number): string {
+export function stringTail(value: string, maxChars: number): string {
   if (value.length <= maxChars) {
     return value;
   }
@@ -245,6 +231,25 @@ function appendStreamedAgentTextTail(current: string, delta: string): string {
     MAX_STREAMED_AGENT_TEXT_CHARS - delta.length,
   );
   return retainedCurrent + delta;
+}
+
+function captureCompletedAgentText(runtime: ThreadRuntime, text: string, itemId: string | null): void {
+  const redacted = redactText(text);
+  runtime.agentText = stringHead(redacted, MAX_STREAMED_AGENT_TEXT_CHARS);
+  runtime.agentTextMetadata = { itemId, sourceComplete: true, truncated: runtime.agentText.length < redacted.length,
+    observedChars: text.length, retained: "head" };
+}
+
+function finalTextSnapshot(runtime: ThreadRuntime): Pick<TerminalSnapshot, "final_result" | "final_result_meta"> {
+  const meta = runtime.agentTextMetadata;
+  if (!runtime.agentText && !meta.sourceComplete && meta.observedChars === 0) return { final_result: null };
+  const redacted = redactText(runtime.agentText);
+  const text = meta.retained === "tail" ? stringTail(redacted, MAX_STREAMED_AGENT_TEXT_CHARS) : stringHead(redacted, MAX_STREAMED_AGENT_TEXT_CHARS);
+  const truncated = meta.truncated || text.length < redacted.length;
+  return { final_result: text, final_result_meta: {
+    complete: meta.sourceComplete && !truncated, source_complete: meta.sourceComplete, truncated,
+    observed_chars: meta.observedChars, retained_chars: text.length, retained: meta.retained,
+  } };
 }
 
 export function sanitizeForTransport(
@@ -383,7 +388,7 @@ function extractAgentText(method: string, params: unknown): string | undefined {
   return undefined;
 }
 
-function extractFinalFromTurn(params: unknown): string | undefined {
+function extractFinalFromTurn(params: unknown): { text: string; id: string | null } | undefined {
   const record = asRecord(params);
   const turn = asRecord(record?.turn);
   const items = turn?.items;
@@ -393,7 +398,7 @@ function extractFinalFromTurn(params: unknown): string | undefined {
   for (let index = items.length - 1; index >= 0; index -= 1) {
     const item = asRecord(items[index]);
     if (item?.type === "agentMessage" && typeof item.text === "string") {
-      return item.text;
+      return { text: item.text, id: stringField(item, "id") ?? null };
     }
   }
   return undefined;
@@ -458,6 +463,7 @@ function hasRawWake(observation: RuntimeObservation): boolean {
 }
 
 export class RuntimeStore {
+  #uxFailureReported = false;
   readonly #threads = new Map<string, ThreadRuntime>();
   readonly #pending = new Map<string, PendingServerRequest>();
   readonly #responding = new Map<string, PendingServerRequest>();
@@ -495,11 +501,12 @@ export class RuntimeStore {
         lastDroppedFact: 0,
         terminal: null,
         agentText: "",
+        agentTextMetadata: emptyAgentTextMetadata(),
         compactPlanSignature: null,
         compactSettingsSignature: null,
         compactBoundarySignature: null,
         agentMessageCursors: new Map(),
-        finalMessageCursor: null,
+        finalMessageDelivery: null,
         finalMessageItemId: null,
         terminalCursor: null,
       });
@@ -516,9 +523,10 @@ export class RuntimeStore {
     runtime.status = "inProgress";
     runtime.terminal = null;
     runtime.agentText = "";
+    runtime.agentTextMetadata = emptyAgentTextMetadata();
     runtime.compactPlanSignature = null;
     runtime.agentMessageCursors.clear();
-    runtime.finalMessageCursor = null;
+    runtime.finalMessageDelivery = null;
     runtime.finalMessageItemId = null;
     runtime.terminalCursor = null;
     this.#turnToThread.set(turnId, threadId);
@@ -587,6 +595,7 @@ export class RuntimeStore {
         runtime.status = "inProgress";
         runtime.terminal = null;
         runtime.agentText = "";
+        runtime.agentTextMetadata = emptyAgentTextMetadata();
         this.#turnToThread.set(input.turnId, input.threadId);
         action = "turn_activated";
         reason = "runtime_idle";
@@ -598,6 +607,7 @@ export class RuntimeStore {
       runtime.status = "inProgress";
       runtime.terminal = null;
       runtime.agentText = "";
+      runtime.agentTextMetadata = emptyAgentTextMetadata();
       this.#turnToThread.set(input.turnId, input.threadId);
       action = "turn_activated";
       reason = "runtime_idle";
@@ -606,7 +616,7 @@ export class RuntimeStore {
     if (action === "turn_activated") {
       runtime.compactPlanSignature = null;
       runtime.agentMessageCursors.clear();
-      runtime.finalMessageCursor = null;
+      runtime.finalMessageDelivery = null;
       runtime.finalMessageItemId = null;
       runtime.terminalCursor = null;
     }
@@ -686,20 +696,38 @@ export class RuntimeStore {
       runtime.status = "inProgress";
       runtime.terminal = null;
       runtime.agentText = "";
+      runtime.agentTextMetadata = emptyAgentTextMetadata();
       runtime.compactPlanSignature = null;
       runtime.agentMessageCursors.clear();
-      runtime.finalMessageCursor = null;
+      runtime.finalMessageDelivery = null;
       runtime.finalMessageItemId = null;
       runtime.terminalCursor = null;
       this.#turnToThread.set(turnId, threadId);
     }
 
+    const notification = asRecord(params);
+    const agentItem = asRecord(notification?.item);
     const agentText = extractAgentText(method, params);
+    const itemId = method === "item/agentMessage/delta"
+      ? stringField(notification, "itemId") : stringField(agentItem, "id");
+    // Installed item lifecycle/delta schemas carry item identity. Never join
+    // a completed commentary with a different message's partial final.
+    if ((agentText !== undefined || (method === "item/started" && agentItem?.type === "agentMessage")) &&
+        itemId !== undefined && itemId !== runtime.agentTextMetadata.itemId) {
+      runtime.agentText = "";
+      runtime.agentTextMetadata = emptyAgentTextMetadata(itemId);
+    }
     if (agentText !== undefined) {
-      if (method.endsWith("/delta")) {
+      if (method === "item/agentMessage/delta") {
+        const before = runtime.agentText.length;
         runtime.agentText = appendStreamedAgentTextTail(runtime.agentText, agentText);
+        const meta = runtime.agentTextMetadata;
+        meta.sourceComplete = false;
+        meta.retained = "tail";
+        meta.observedChars = Math.min(Number.MAX_SAFE_INTEGER, meta.observedChars + agentText.length);
+        meta.truncated ||= before + agentText.length > runtime.agentText.length;
       } else {
-        runtime.agentText = truncateString(agentText, MAX_STREAMED_AGENT_TEXT_CHARS);
+        captureCompletedAgentText(runtime, agentText, itemId ?? null);
       }
     }
 
@@ -709,7 +737,8 @@ export class RuntimeStore {
       if (terminalTurnId) {
         const status = stringField(turn, "status") ?? "unknown";
         const error = turn?.error ?? null;
-        const final = extractFinalFromTurn(params) ?? (runtime.agentText || null);
+        const final = extractFinalFromTurn(params);
+        if (final) captureCompletedAgentText(runtime, final.text, final.id);
         runtime.status = status;
         runtime.activeTurnId = null;
         runtime.compactPlanSignature = null;
@@ -717,7 +746,7 @@ export class RuntimeStore {
           turn_id: terminalTurnId,
           status,
           completed_at: new Date().toISOString(),
-          final_result: final === null ? null : truncateString(redactText(final), 48_000),
+          ...finalTextSnapshot(runtime),
           error: sanitizeForTransport(error),
           turn: sanitizeForTransport(turn),
         };
@@ -742,24 +771,27 @@ export class RuntimeStore {
     if (method === "item/completed" && runtime.events.at(-1)?.compactRoute?.fact?.type === "message") {
       const completedItem = asRecord(asRecord(params)?.item);
       if (completedItem?.type === "agentMessage" && typeof completedItem.id === "string") {
-        runtime.agentMessageCursors.set(completedItem.id, appendedCursor);
+        const fact = runtime.events.at(-1)!.compactRoute!.fact!;
+        const text = redactText(completedItem.text as string);
+        const delivery = { cursor: appendedCursor, digest: textDigest(text),
+          complete: fact.text === text && !fact.text_truncation && !fact.projection_truncated };
+        runtime.agentMessageCursors.set(completedItem.id, delivery);
         if (runtime.agentMessageCursors.size > this.ringLimit) {
           runtime.agentMessageCursors.delete(runtime.agentMessageCursors.keys().next().value!);
         }
         if (completedItem.phase === "final_answer") {
-          runtime.finalMessageCursor = appendedCursor;
+          runtime.finalMessageDelivery = delivery;
           runtime.finalMessageItemId = completedItem.id;
         }
       }
     }
     if (method === "turn/completed") {
       runtime.terminalCursor = appendedCursor;
-      const items = asRecord(asRecord(params)?.turn)?.items;
-      const lastAgent = Array.isArray(items)
-        ? [...items].reverse().map(asRecord).find((candidate) => candidate?.type === "agentMessage")
-        : undefined;
-      if (typeof lastAgent?.id === "string") runtime.finalMessageCursor = runtime.agentMessageCursors.get(lastAgent.id) ??
-        (lastAgent.id === runtime.finalMessageItemId ? runtime.finalMessageCursor : null);
+      const id = runtime.agentTextMetadata.itemId;
+      const delivery = id === null ? null : runtime.agentMessageCursors.get(id) ??
+        (id === runtime.finalMessageItemId ? runtime.finalMessageDelivery : null);
+      runtime.finalMessageDelivery = delivery ?? null;
+      runtime.finalMessageItemId = id;
     }
   }
 
@@ -872,7 +904,7 @@ export class RuntimeStore {
           turn_id: turnId,
           status: "appServerExited",
           completed_at: at,
-          final_result: runtime.agentText || null,
+          ...finalTextSnapshot(runtime),
           error: { message: redactText(message) },
           turn: null,
         };
@@ -1002,12 +1034,17 @@ export class RuntimeStore {
     const scan = new CompactAccumulator(requested, factLimit, {
       threadId, ...(runtime.activeTurnId ? { activeTurnId: runtime.activeTurnId } : {}),
     }, Math.min(requested, initial.current_cursor));
-    const finalIdentity = () => ({
-      itemCursor: runtime.finalMessageCursor,
-      terminalCursor: runtime.terminalCursor,
-      turnId: runtime.terminal?.turn_id ?? null,
-      itemEvicted: runtime.finalMessageCursor !== null && runtime.finalMessageCursor <= runtime.lastDroppedFact,
-    });
+    const finalIdentity = () => {
+      const delivery = runtime.finalMessageDelivery;
+      return {
+        itemCursor: delivery?.cursor ?? null,
+        itemComplete: delivery?.complete === true && runtime.terminal?.final_result_meta?.complete === true &&
+          delivery.digest === textDigest(runtime.terminal.final_result ?? ""),
+        terminalCursor: runtime.terminalCursor,
+        turnId: runtime.terminal?.turn_id ?? null,
+        itemEvicted: delivery !== null && delivery.cursor <= runtime.lastDroppedFact,
+      };
+    };
     let last = initial;
     const result = (more = false): Record<string, unknown> =>
       scan.result(last, finalIdentity(), more, streamLost, factsLost, cursorFloor);
@@ -1093,7 +1130,7 @@ export class RuntimeStore {
   }
 
   closeUxProjection(): void {
-    this.uxProjection?.close();
+    try { this.uxProjection?.close(); } catch { this.#reportUxFailure(); }
   }
 
   #publishUx(signal?: UxSignalInput): void {
@@ -1109,7 +1146,16 @@ export class RuntimeStore {
         counts.terminal += 1;
       }
     }
-    this.uxProjection.publish(counts, signal);
+    // Projection is optional. A later natural publish retries the full snapshot.
+    try { this.uxProjection.publish(counts, signal); } catch { this.#reportUxFailure(); }
+  }
+
+  #reportUxFailure(): void {
+    if (this.#uxFailureReported) return;
+    this.#uxFailureReported = true;
+    // Static text avoids leaking an I/O path or error payload. Diagnostics too
+    // are best-effort and cannot alter native acknowledgement or lifecycle.
+    try { console.error("[local-codex-bridge] Optional UX projection I/O failed; later natural publishes will retry."); } catch { /* diagnostic sink unavailable */ }
   }
 
   #appendEvent(

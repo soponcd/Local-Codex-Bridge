@@ -181,7 +181,7 @@ test("MCP history delivers a 16007-character command output exactly and rejects 
     assert.equal((rejected.result as Record<string, unknown>).isError, true);
     const error = toolPayload(rejected);
     assert.deepEqual(Object.keys(error), ["error"]);
-    assert.match(error.error as string, /^history_page_not_lossless: redaction or sanitizer policy would alter the page$/);
+    assert.match(error.error as string, /^history_page_not_lossless: content_policy:/);
     assert.doesNotMatch(JSON.stringify(rejected), /fixture-only-value|command-1/);
   } finally {
     assert.equal(await client.close(), 0);
@@ -438,7 +438,7 @@ test("MCP models, turn ack, and checkpoint preserve original handler results", {
   }
 });
 
-test("MCP goals traverse native JSONL with exact nulls, responses, notifications and acknowledged delivery errors", async () => {
+test("MCP goals traverse native JSONL with exact nulls, responses, notifications and content round trips", async () => {
   const manager = new AppServerManager(undefined, {
     executable: process.execPath,
     prefixArgs: [fileURLToPath(new URL("../../test/goal-codex.mjs", import.meta.url))],
@@ -488,21 +488,18 @@ test("MCP goals traverse native JSONL with exact nulls, responses, notifications
         assert.deepEqual(events.map(event => event.method), ["thread/goal/updated", "thread/goal/updated", "thread/goal/updated", "thread/goal/cleared"]);
         if (view === "compact") assert.ok(events.every(event => event.type === "diagnostic_passthrough"));
       }
-      const rejected = await invoke("set", { objective: "password=synthetic-test-only", budget_mode: "unlimited" });
-      assert.equal((rejected.result as Record<string, unknown>).isError, true);
-      assert.equal((rejected.result as Record<string, unknown>).structuredContent, undefined);
-      const error = toolPayload(rejected).error as string;
-      assert.match(error, /mutation was acknowledged/);
-      assert.doesNotMatch(error, /UNKNOWN|synthetic-test-only/);
+      const exact = structuredToolPayload(await invoke("set", { objective: "password=synthetic-test-only", budget_mode: "unlimited" }));
+      assert.equal((exact.goal as Record<string, unknown>).objective, "password=synthetic-test-only");
+      assert.deepEqual(structuredToolPayload(await invoke("get")), exact);
       const after = await manager.request("test/requests", {}) as unknown[];
-      assert.equal(after.length, requests.length + 1, "delivery error must not retry/compensate");
+      assert.equal(after.length, requests.length + 2, "one set and one explicit readback only");
     });
   } finally {
     await manager.close();
   }
 });
 
-test("MCP queue actions traverse native JSONL and retain exact pages, queue-change wakes and acknowledged failures", async () => {
+test("MCP queue actions traverse native JSONL and retain exact pages, queue-change wakes and content round trips", async () => {
   const manager = new AppServerManager(undefined, {
     executable: process.execPath,
     prefixArgs: [fileURLToPath(new URL("../../test/queue-codex.mjs", import.meta.url))],
@@ -546,13 +543,11 @@ test("MCP queue actions traverse native JSONL and retain exact pages, queue-chan
         assert.ok(events.every(event => event.method === "thread/queue/changed"));
         if (view === "compact") assert.ok(events.every(event => event.type === "diagnostic_passthrough"));
       }
-      const failedDelivery = await invoke("add", { text: "password=synthetic-only", client_user_message_id: "caller-sensitive" });
-      const error = toolPayload(failedDelivery).error as string;
-      assert.match(error, /queue_result_not_deliverable:.*mutation was acknowledged/);
-      assert.doesNotMatch(error, /UNKNOWN|synthetic-only/);
-      assert.equal((failedDelivery.result as Record<string, unknown>).structuredContent, undefined);
+      const exact = structuredToolPayload(await invoke("add", { text: "password=synthetic-only", client_user_message_id: "caller-sensitive" }));
+      const readback = structuredToolPayload(await invoke("list", {}));
+      assert.deepEqual((readback.data as unknown[]).at(-1), exact.queuedSubmission);
       const after = await manager.request("test/requests", {}) as unknown[];
-      assert.equal(after.length, captured.length + 1);
+      assert.equal(after.length, captured.length + 2);
     });
   } finally { await manager.close(); }
 });
@@ -592,6 +587,13 @@ test("MCP search traverses native JSONL with exact pagination, UTF-16 locators a
       assert.deepEqual(captured[0]!.params, { searchTerm: "Hit", limit: 1, sourceKinds: [], archived: null });
       assert.deepEqual(captured[3]!.params, { threadId: "search-thread", searchTerm: "Hit", limit: 1, cursor: "native-occurrences-next" });
       assert.equal(manager.runtime.observe("search-thread", 0, 20), null);
+      const exact = structuredToolPayload(await invoke("threads", { search_term: "sensitive", content_policy: "exact" }));
+      assert.equal((exact.data as Array<any>)[0].snippet, "password=synthetic-search-only");
+      const protectedAgain = await invoke("threads", { search_term: "sensitive" });
+      assert.match(toolPayload(protectedAgain).error as string, /content_policy:/);
+      const after = await manager.request("test/requests", {}) as Array<{ params: object }>;
+      assert.equal(after.length, captured.length + 2);
+      assert.ok(after.every(entry => !Object.hasOwn(entry.params, "content_policy")));
     });
   } finally { await manager.close(); }
 });

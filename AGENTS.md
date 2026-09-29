@@ -236,7 +236,9 @@ Do not:
 
 Paginated and legacy history modes have different native shapes. Preserve that distinction.
 
-Exact paging, byte-budget, sanitizer, and cursor rules belong in `PROTOCOL-ASSUMPTIONS.md` and the relevant tests; do not duplicate drifting low-level constants into new policy code unless needed.
+Default protected History/Search reads may reject secret-shaped content. Explicit per-call exact reads may expose sensitive native content; the choice is not an access-control or trust level. Goal/Queue exact responses and observe/diagnostic redaction have separate responsibilities.
+
+Exact paging, byte-budget, content-policy, and cursor rules belong in `PROTOCOL-ASSUMPTIONS.md` and the relevant tests; do not duplicate drifting low-level constants into new policy code unless needed.
 
 ## Server requests and approvals
 

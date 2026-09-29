@@ -506,10 +506,68 @@ test("3000 and 10000 character finals deliver once in monotonic cursor stream; o
     assert.equal(first.terminal.final_result, undefined);
     const next = await observe(runtime, first.next_cursor);
     assert.equal(next.events, undefined);
-    assert.equal(next.terminal.final_result, undefined);
+    assert.equal(next.terminal.final_result, length > 4_000 ? text : undefined);
+    assert.equal((await observe(runtime, next.next_cursor)).terminal.final_result, undefined);
     const replay = await observe(runtime, 0);
     assert.equal(replay.events[0].type, "message");
   }
+});
+
+test("compact final completion preserves the middle and real projection completeness", async () => {
+  for (const text of [
+    "HEAD" + "x".repeat(5_000) + "VERDICT_MIDDLE" + "y".repeat(5_000) + "TAIL",
+    "x".repeat(47_980) + "VERDICT_AT_END",
+    "\u0001".repeat(3_000), // Under 4k, but JSON escaping exceeds the event budget.
+  ]) {
+    const runtime = started();
+    message(runtime, "f", text, "final_answer");
+    const first = await observe(runtime);
+    assert.notEqual(first.events[0].text, text);
+    runtime.recordNotification("turn/completed", { threadId: "t", turn: { id: "u", status: "completed", items: [] } });
+    const end = await observe(runtime, first.next_cursor);
+    assert.equal(end.terminal.final_result, text);
+    assert.equal(end.terminal.final_result_meta.complete, true);
+    assert.equal((await observe(runtime, end.next_cursor)).terminal.final_result, undefined);
+  }
+  const changed = started();
+  message(changed, "f", "EARLIER", "final_answer");
+  const earlier = await observe(changed);
+  turnCompleted(changed, "f", "UPDATED_FINAL");
+  assert.equal((await observe(changed, earlier.next_cursor)).terminal.final_result, "UPDATED_FINAL");
+});
+
+test("compact distinguishes a bounded or partial terminal from a complete final", async () => {
+  const text = "HEAD-MARKER " + "x".repeat(60_000) + " TAIL-MARKER";
+  for (const completedItem of [true, false]) {
+    const runtime = started(2);
+    runtime.recordNotification("item/agentMessage/delta", { ...scope, delta: text });
+    if (completedItem) message(runtime, "i", text, "final_answer");
+    runtime.recordNotification("turn/completed", { threadId: "t", turn: { id: "u", status: completedItem ? "completed" : "interrupted", items: [] } });
+    let cursor = 0; let final: Result | undefined;
+    for (let i = 0; i < 5; i++) {
+      const page = await observe(runtime, cursor);
+      cursor = page.next_cursor;
+      if (page.terminal.final_result !== undefined) final = page.terminal;
+      if (!page.has_more) break;
+    }
+    assert.ok(final);
+    assert.equal(final.final_result.length, 48_000);
+    assert.equal(final.final_result_meta.complete, false);
+    assert.equal(final.final_result_meta.source_complete, completedItem);
+    assert.equal(final.final_result_meta.truncated, true);
+    assert.equal(final.final_result_meta.observed_chars, text.length);
+    assert.equal(final.final_result_meta.retained, completedItem ? "head" : "tail");
+    assert.equal((await observe(runtime, cursor)).terminal.final_result, undefined);
+  }
+});
+
+test("compact head/tail clipping does not split surrogate pairs", () => {
+  const text = "a".repeat(1_999) + "🌱" + "b".repeat(3_999) + "🌱" + "c".repeat(1_999);
+  const routed = routeCompactEvent(event("item/completed", { threadId: "t", turnId: "u", completedAtMs: 1,
+    item: { type: "agentMessage", id: "f", phase: "final_answer", text } }));
+  assert.equal((routed.fact!.text as string).isWellFormed(), true);
+  assert.equal((routed.fact!.text_truncation as Result).head_chars, 1_999);
+  assert.equal((routed.fact!.text_truncation as Result).tail_chars, 1_999);
 });
 
 test("split final and evicted final fallback are each delivered once", async () => {

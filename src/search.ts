@@ -1,4 +1,4 @@
-import { sanitizeForTransport } from "./runtime.js";
+import { encodeExactJson, ExactJsonError, type ContentPolicy } from "./exact-json.js";
 
 export const SEARCH_PAGE_LIMIT = 100;
 export const MAX_SEARCH_RESULT_BYTES = 256 * 1024;
@@ -15,9 +15,9 @@ function cursor(value: unknown): boolean {
   return value === null || identifier(value);
 }
 
-export function exactSearchResponse(value: unknown, kind: SearchKind, limit: number): Record<string, unknown> {
+export function exactSearchResponse(value: unknown, kind: SearchKind, limit: number, policy: ContentPolicy = "protected"): Record<string, unknown> {
   const fail = (reason: string): never => {
-    throw new Error(`search_result_not_deliverable: native search returned success but its page cannot be delivered losslessly (${reason}). No partial data/cursor, fallback search or history read was performed.`);
+    throw new Error(`search_result_not_deliverable: native search returned success but its page cannot be delivered losslessly (${reason}). No partial data/cursor, fallback search or history read was performed. Size failures may allow a smaller limit; a single oversized result requires native inspection.`);
   };
   const page = record(value);
   if (!page || !Array.isArray(page.data) || page.data.length > limit || !cursor(page.nextCursor) ||
@@ -37,12 +37,8 @@ export function exactSearchResponse(value: unknown, kind: SearchKind, limit: num
   }
   // Never shorten/redact a snippet while returning native offsets or cursors.
   let encoded: string;
-  let projected: string;
-  try {
-    encoded = JSON.stringify(page);
-    projected = JSON.stringify(sanitizeForTransport(page, { maxArrayItems: SEARCH_PAGE_LIMIT }));
-  } catch { return fail("unrepresentable response"); }
-  if (encoded !== projected) return fail("redaction or transport truncation required");
-  if (Buffer.byteLength(encoded, "utf8") > MAX_SEARCH_RESULT_BYTES) return fail("result exceeds the transport byte bound");
+  try { encoded = encodeExactJson(page, policy); }
+  catch (error) { return fail(error instanceof ExactJsonError ? error.message : "structure: unrepresentable response"); }
+  if (Buffer.byteLength(encoded, "utf8") > MAX_SEARCH_RESULT_BYTES) return fail("size: result exceeds the transport byte bound");
   return page;
 }

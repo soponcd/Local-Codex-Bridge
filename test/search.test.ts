@@ -90,10 +90,9 @@ test("search rejects malformed page identities, cursors and UTF-16 ranges withou
   }
 });
 
-test("search refuses sanitizer or byte-budget changes rather than corrupting snippets and locators", async () => {
+test("search rejects protected content and oversized pages without corrupting snippets or locators", async () => {
   for (const extra of [
     { snippet: "password=synthetic-search-only" }, { futureSecret: "synthetic-search-only" },
-    { future: "x".repeat(12001) }, { future: Array(101).fill("item") },
     { future: Array.from({ length: 8 }, () => "\u0001".repeat(10000)) },
   ]) {
     const manager = new SearchNativeStub(() => ({ data: [occurrence(extra)], nextCursor: "native-next" }));

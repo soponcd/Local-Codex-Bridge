@@ -2,6 +2,13 @@
 
 版本章节记录公共仓库的工程变更；提交与 push 不等于已创建 tag、GitHub Release 或完成部署。当前公开版本为 **V2.3.1**；公共历史中没有单独的 V2.1.0 发布记录。
 
+## 未发布
+
+- 将 History / Goal / Queue / Search 的精确交付判定与 observe 有损投影预算解耦；History / Search 提供默认 protected 与单次显式 exact 内容选择。Goal / Queue 原值往返，并在 mutation 前检查已知回显的字节预算；保留 acknowledged-but-undeliverable 与 UNKNOWN 的区别。
+- 隔离可选 UX projection 的 I/O 失败，后续自然发布可恢复；不污染已接受 mutation、不触发 app-server fatal。
+- 修复 compact 长 final 的终态补全，记录 live 文本是否完整/被裁剪，消除双重截断和跨消息流式拼接；保留普通 compact drainage 预算。
+- 保留最初 app-server fatal 原因，补齐 runtime-loss 未知字段，统一退出 final 脱敏及 UTF-16 截断保护，校验 README release 锚点。
+
 ## V2.3.1（2026-09-28）
 
 - 在最终版本 plist 状态下重新构建并 ad-hoc 签名 macOS Finder bundle，使 plist 与 bundle 签名一致，修复 GitHub macOS CI packaging check；Bridge runtime、MCP 工具与协议语义均未改变。

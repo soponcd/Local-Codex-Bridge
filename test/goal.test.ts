@@ -100,10 +100,6 @@ test("goal success that cannot be delivered reports acknowledgement, never UNKNO
     null, [], {}, { goal: null }, { goal: nativeGoal({ threadId: "other-thread" }) },
     { goal: nativeGoal({ tokensUsed: Number.MAX_SAFE_INTEGER + 1 }) },
     { goal: nativeGoal({ tokenBudget: Number.MAX_SAFE_INTEGER + 1 }) },
-    { goal: nativeGoal({ objective: "password=synthetic-test-only" }) },
-    { goal: nativeGoal(), futureSecret: "synthetic-test-only" },
-    { goal: nativeGoal(), future: Array.from({ length: 51 }, () => "item") },
-    { goal: nativeGoal(), future: "x".repeat(12001) },
     // Escaping exceeds the byte bound while ordinary sanitizer budgets fit.
     { goal: nativeGoal(), future: Array.from({ length: 8 }, () => "\u0001".repeat(10000)) },
   ];

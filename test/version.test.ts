@@ -21,6 +21,7 @@ test("package, platform and changelog version anchors match the canonical code v
     "utf8",
   );
   const changelog = readFileSync(rootFile("CHANGELOG.md"), "utf8");
+  assert.ok(readFileSync(rootFile("README.md"), "utf8").includes(`**Current release: V${VERSION}**`), "README current release drifted");
   const escapedVersion = VERSION.replace(/\./g, "\\.");
   const buildVersion = VERSION.split(".").join("");
 

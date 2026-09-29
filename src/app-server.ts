@@ -758,7 +758,7 @@ export class AppServerManager {
   }
 
   #onChildError(child: ChildProcessWithoutNullStreams, error: Error): void {
-    if (child !== this.#child || this.#closing) {
+    if (child !== this.#child || this.#closing || this.#fatal) {
       return;
     }
     this.#fatal = new Error(`Codex app-server process error: ${redactText(error.message)}`);
@@ -797,7 +797,7 @@ export class AppServerManager {
       return;
     }
     this.#initialized = false;
-    if (this.#closing) {
+    if (this.#closing || this.#fatal) {
       return;
     }
     const failure = new Error(
