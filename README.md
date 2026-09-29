@@ -4,7 +4,7 @@
 
 *A thin supervisory MCP bridge between external AI supervisors and native Codex.*
 
-**Current release: V2.3.3**
+**Current release: V2.3.4**
 
 Local Codex Bridge is a lightweight MCP stdio adapter for Windows and macOS:
 

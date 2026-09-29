@@ -1,6 +1,6 @@
 # AI Agent Guidance
 
-**Release contract: V2.3.3**
+**Release contract: V2.3.4**
 
 This file is guidance for AI agents working on Local Codex Bridge. It is not a product overview and should not be treated as a substitute for the source, tests, or protocol qualification notes.
 
@@ -47,9 +47,9 @@ Primary ownership in the repository:
 
 The Windows Tray, macOS launcher surfaces, and Secure MCP Tunnel integration are outer layers. They are not alternate Bridge runtimes.
 
-## V2.3.3 public surface
+## V2.3.4 public surface
 
-V2.3.3 exposes exactly twelve public MCP tools. Preserve their distinctions unless a requested contract change explicitly requires otherwise.
+V2.3.4 exposes exactly twelve public MCP tools. Preserve their distinctions unless a requested contract change explicitly requires otherwise.
 
 - `codex_threads` — list/filter/read native persisted thread metadata and capability/lineage facts. Filters are not ACLs and capability metadata is not a Bridge writer-lease model.
 - `codex_history` — page native persisted history. Do not create Bridge history state, synthetic cursors, or automatic full-history fallback.
@@ -146,7 +146,7 @@ Parent/ancestor spawned lineage and fork lineage are different concepts.
 
 ## MCP result transport
 
-All successful V2.3.3 tool calls return the full machine-readable result in:
+All successful V2.3.4 tool calls return the full machine-readable result in:
 
 ```text
 result.structuredContent
@@ -293,7 +293,7 @@ Operational diagnostics belong on stderr and still require redaction.
 
 ## Cross-platform behavior
 
-The published V2.3.3 implementation supports Windows and macOS with one shared core.
+The published V2.3.4 implementation supports Windows and macOS with one shared core.
 
 Do not fork core semantics by platform unless the OS boundary actually requires it.
 
@@ -366,7 +366,7 @@ Live Codex probes can create persistent native threads. Keep them separate from 
 
 ## Acceptance expectations
 
-For a normal V2.3.3 code or deployment change, demonstrate the relevant subset of:
+For a normal V2.3.4 code or deployment change, demonstrate the relevant subset of:
 
 - dependency installation succeeds;
 - type checking succeeds;

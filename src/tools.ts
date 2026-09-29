@@ -475,7 +475,7 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
         },
         thread_id: { type: "string", minLength: 1, maxLength: 200, description: "Exact pending-request thread scope." },
         turn_id: { type: "string", minLength: 1, maxLength: 200, description: "Exact turn scope when the pending request has one." },
-        method: { type: "string", minLength: 1, maxLength: 300, description: "Exact app-server request method." },
+        method: { type: "string", minLength: 1, maxLength: 300, description: "Supported: item/commandExecution/requestApproval, item/fileChange/requestApproval, item/permissions/requestApproval, item/tool/requestUserInput; legacy: execCommandApproval, applyPatchApproval." },
         decision: {
           type: "string",
           enum: ["accept", "acceptForSession", "decline", "cancel"],
