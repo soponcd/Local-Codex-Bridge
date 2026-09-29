@@ -710,14 +710,14 @@ export class RuntimeStore {
     const agentText = extractAgentText(method, params);
     const itemId = method === "item/agentMessage/delta"
       ? stringField(notification, "itemId") : stringField(agentItem, "id");
-    // Installed item lifecycle/delta schemas carry item identity. Never join
-    // a completed commentary with a different message's partial final.
-    if ((agentText !== undefined || (method === "item/started" && agentItem?.type === "agentMessage")) &&
-        itemId !== undefined && itemId !== runtime.agentTextMetadata.itemId) {
-      runtime.agentText = "";
-      runtime.agentTextMetadata = emptyAgentTextMetadata(itemId);
-    }
-    if (agentText !== undefined) {
+    // A start or empty delta carries no replacement text. Switch identity only
+    // for actual text or an authoritative completion (which may be empty).
+    if (agentText !== undefined && (method !== "item/agentMessage/delta" || agentText.length > 0)) {
+      // Never join a completed commentary with a different message's partial final.
+      if (itemId !== undefined && itemId !== runtime.agentTextMetadata.itemId) {
+        runtime.agentText = "";
+        runtime.agentTextMetadata = emptyAgentTextMetadata(itemId);
+      }
       if (method === "item/agentMessage/delta") {
         const before = runtime.agentText.length;
         runtime.agentText = appendStreamedAgentTextTail(runtime.agentText, agentText);

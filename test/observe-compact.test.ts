@@ -536,6 +536,73 @@ test("compact final completion preserves the middle and real projection complete
   assert.equal((await observe(changed, earlier.next_cursor)).terminal.final_result, "UPDATED_FINAL");
 });
 
+test("terminal metadata waits for final content when final and terminal arrive together", async () => {
+  for (const wait of [false, true]) for (const terminalItems of [false, true]) {
+    for (const length of [3_000, 10_033, 60_024]) {
+      const runtime = started();
+      const text = "A".repeat(length);
+      const waiting = wait ? observe(runtime, 0, 50, 10_000) : null;
+      // A synchronous burst also exercises an already-waiting observer without timers.
+      message(runtime, "f", text, "final_answer");
+      runtime.recordNotification("turn/completed", { threadId: "t", turn: { id: "u", status: "completed",
+        items: terminalItems ? [{ type: "agentMessage", id: "f", text, phase: "final_answer" }] : [] } });
+      const first = await (waiting ?? observe(runtime));
+      assert.equal(first.terminal.status, "completed");
+      assert.equal(first.has_more, true);
+      assert.equal(first.terminal.final_result, undefined);
+      if (length > 4_000) {
+        assert.notEqual(first.events[0].text, text);
+        assert.equal(first.terminal.final_result_pending, true);
+        assert.equal(first.terminal.final_result_meta, undefined);
+      } else {
+        assert.equal(first.events[0].text, text);
+        assert.equal(first.terminal.final_result_pending, undefined);
+        assert.equal(first.terminal.final_result_meta.complete, true);
+      }
+      const next = await observe(runtime, first.next_cursor);
+      assert.equal(next.terminal.final_result_pending, undefined);
+      assert.equal(next.terminal.final_result, length > 4_000 ? text.slice(0, 48_000) : undefined);
+      assert.equal(next.terminal.final_result_meta.complete, length <= 48_000);
+      assert.equal((await observe(runtime, next.next_cursor)).terminal.final_result, undefined);
+      assert.deepEqual((await observe(runtime, 0)).terminal, first.terminal);
+    }
+  }
+});
+
+test("a terminal snapshot cannot advertise an unscanned short final as complete", async () => {
+  const runtime = started();
+  message(runtime, "earlier", "Still working");
+  message(runtime, "f", "DONE", "final_answer");
+  turnCompleted(runtime, "f", "DONE");
+  const before = await observe(runtime, 0, 1);
+  assert.equal(before.events[0].item_id, "earlier");
+  assert.equal(before.terminal.final_result_pending, true);
+  assert.equal(before.terminal.final_result_meta, undefined);
+  const final = await observe(runtime, before.next_cursor, 1);
+  assert.equal(final.events[0].text, "DONE");
+  assert.equal(final.terminal.final_result_pending, undefined);
+  assert.equal(final.terminal.final_result_meta.complete, true);
+  assert.equal(final.terminal.final_result, undefined);
+});
+
+test("a later empty message start preserves compact final identity and once-only delivery", async () => {
+  for (const status of ["completed", "interrupted"]) for (const length of [3_000, 10_000]) {
+    const runtime = started();
+    const text = "F".repeat(length);
+    message(runtime, "f", text, "final_answer");
+    const first = await observe(runtime);
+    runtime.recordNotification("item/started", { threadId: "t", turnId: "u", startedAtMs: 2,
+      item: { type: "agentMessage", id: "next", text: "", phase: null } });
+    runtime.recordNotification("turn/completed", { threadId: "t", turn: { id: "u", status, items: [] } });
+    const end = await observe(runtime, first.next_cursor);
+    assert.equal(end.terminal.status, status);
+    assert.equal(end.terminal.final_result, length > 4_000 ? text : undefined);
+    assert.equal(end.terminal.final_result_meta.complete, true);
+    assert.equal(end.terminal.final_result_pending, undefined);
+    assert.equal((await observe(runtime, end.next_cursor)).terminal.final_result, undefined);
+  }
+});
+
 test("compact distinguishes a bounded or partial terminal from a complete final", async () => {
   const text = "HEAD-MARKER " + "x".repeat(60_000) + " TAIL-MARKER";
   for (const completedItem of [true, false]) {
@@ -867,9 +934,13 @@ test("an evicted final behind a retained older delta respects scan and replay bo
   const beforeAnchor = projectCompact(runtime.observe("t", 0, 1)!, 0, {}, identity) as Result;
   assert.equal(beforeAnchor.next_cursor, 1);
   assert.equal(beforeAnchor.terminal.final_result, undefined);
+  assert.equal(beforeAnchor.terminal.final_result_pending, true);
+  assert.equal(beforeAnchor.terminal.final_result_meta, undefined);
   const first = await observe(runtime, beforeAnchor.next_cursor, 1);
   assert.equal(first.next_cursor, 4);
   assert.equal(first.terminal.final_result, "FINAL");
+  assert.equal(first.terminal.final_result_pending, undefined);
+  assert.equal(first.terminal.final_result_meta.complete, true);
   const next = await observe(runtime, first.next_cursor, 1);
   assert.equal(next.next_cursor, 5);
   assert.equal(next.terminal.final_result, undefined);

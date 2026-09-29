@@ -1,6 +1,12 @@
 # 更新日志
 
-版本章节记录公共仓库的工程变更；提交与 push 不等于已创建 tag、GitHub Release 或完成部署。当前公开版本为 **V2.3.2**；公共历史中没有单独的 V2.1.0 发布记录。
+版本章节记录公共仓库的工程变更；提交与 push 不等于已创建 tag、GitHub Release 或完成部署。当前公开版本为 **V2.3.3**；公共历史中没有单独的 V2.1.0 发布记录。
+
+## V2.3.3（2026-09-29）
+
+- 修复 compact 终态完整性元数据早于正文交付的问题：尚未读到正文交付游标时返回 `terminal.final_result_pending:true` 并省略 `final_result_meta`；短 final、淘汰补发与旧 cursor 回放保持既有边界。
+- 修复新的 agentMessage 仅有开始通知或空 delta 时清空上一条答复的问题；实际新文本或明确完成的正文才切换累积器，保留消息身份隔离和一次交付。
+- 同步消费者说明与确定性回归，并在最终 V2.3.3 plist 下重建、ad-hoc 签名 macOS Finder bundle。
 
 ## V2.3.2（2026-09-29）
 

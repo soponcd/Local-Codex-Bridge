@@ -450,6 +450,39 @@ test("terminal text tracks truncation once, partial source, message identity and
   }
 });
 
+test("an agent message with only a start preserves the preceding final text", () => {
+  for (const status of ["completed", "interrupted"]) for (const emptyDelta of [false, true]) {
+    const runtime = new RuntimeStore(); runtime.markTurnAccepted("t", "u");
+    const text = "Done: 42/42 tests pass.";
+    runtime.recordNotification("item/completed", { threadId: "t", turnId: "u", completedAtMs: 1,
+      item: { id: "a", type: "agentMessage", phase: "final_answer", text } });
+    runtime.recordNotification("item/started", { threadId: "t", turnId: "u", startedAtMs: 2,
+      item: { id: "b", type: "agentMessage", phase: null, text: "" } });
+    if (emptyDelta) runtime.recordNotification("item/agentMessage/delta", {
+      threadId: "t", turnId: "u", itemId: "b", delta: "" });
+    runtime.recordNotification("turn/completed", { threadId: "t", turn: { id: "u", status, items: [] } });
+    const terminal = runtime.observe("t", 0, 50)!.terminal!;
+    assert.equal(terminal.status, status);
+    assert.equal(terminal.final_result, text);
+    assert.equal(terminal.final_result_meta!.complete, true);
+    assert.equal(terminal.final_result_meta!.observed_chars, text.length);
+  }
+});
+
+test("a new completed message replaces prior text even when its final text is empty", () => {
+  for (const text of ["New final", ""]) {
+    const runtime = new RuntimeStore(); runtime.markTurnAccepted("t", "u");
+    for (const [id, content] of [["a", "Prior message"], ["b", text]]) {
+      runtime.recordNotification("item/completed", { threadId: "t", turnId: "u", completedAtMs: 1,
+        item: { id, type: "agentMessage", phase: "final_answer", text: content } });
+    }
+    runtime.recordNotification("turn/completed", { threadId: "t", turn: { id: "u", status: "completed", items: [] } });
+    const terminal = runtime.observe("t", 0, 50)!.terminal!;
+    assert.equal(terminal.final_result, text);
+    assert.equal(terminal.final_result_meta!.complete, true);
+  }
+});
+
 test("pending app-server request ids preserve typed identity and cannot be replaced while responding", () => {
   const runtime = new RuntimeStore();
   runtime.markTurnAccepted("thread-original", "turn-original");
