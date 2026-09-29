@@ -1,0 +1,30 @@
+name: Package v2.3.4 macOS launcher
+on:
+  push:
+    branches: [codex/v234-macos-package]
+permissions:
+  contents: read
+jobs:
+  package:
+    runs-on: macos-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Build and verify final-version bundle
+        run: |
+          sh launcher/build-launcher.sh
+          codesign --verify --deep --strict "Start Mac Codex Bridge.app"
+          file "Start Mac Codex Bridge.app/Contents/MacOS/StartMacCodexBridge"
+          otool -l "Start Mac Codex Bridge.app/Contents/MacOS/StartMacCodexBridge" | grep -A 4 LC_BUILD_VERSION
+          tar -czf macos-launcher-v2.3.4.tar.gz "Start Mac Codex Bridge.app"
+          shasum -a 256 macos-launcher-v2.3.4.tar.gz > SHA256SUMS
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: macos-launcher-v2.3.4
+          path: |
+            macos-launcher-v2.3.4.tar.gz
+            SHA256SUMS
+          if-no-files-found: error
+          retention-days: 7
