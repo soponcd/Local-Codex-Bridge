@@ -152,7 +152,7 @@ test("MCP stdio initializes idempotently and lists exactly eight fully annotated
       },
     );
 
-    // A second initialize reuses the first negotiated result with its own response id.
+    // An identical second handshake returns the same result with its own response id.
     const repeated = await client.request(0, "initialize", {
       protocolVersion: "2025-03-26",
       capabilities: {
@@ -234,7 +234,7 @@ test("MCP stdio initializes idempotently and lists exactly eight fully annotated
   }
 });
 
-test("MCP rejects materially different repeated initialize identities", async () => {
+test("MCP independently initializes clients with different capabilities and lists eight tools", async () => {
   const client = new TestClient();
   try {
     const first = await client.request(1, "initialize", {
@@ -244,29 +244,16 @@ test("MCP rejects materially different repeated initialize identities", async ()
     });
     assert.equal(first.error, undefined);
 
-    const mismatches: Array<[string, Record<string, unknown>]> = [
-      ["protocolVersion", {
-        protocolVersion: "2025-06-18",
-        capabilities: {},
-        clientInfo: { name: "test", version: "1" },
-      }],
-      ["capabilities", {
-        protocolVersion: "2025-03-26",
-        capabilities: { sampling: {} },
-        clientInfo: { name: "test", version: "1" },
-      }],
-      ["clientInfo", {
-        protocolVersion: "2025-03-26",
-        capabilities: {},
-        clientInfo: { name: "other", version: "1" },
-      }],
-    ];
-    for (const [field, params] of mismatches) {
-      const response = await client.request(field, "initialize", params);
-      const error = response.error as Record<string, unknown>;
-      assert.equal(error.code, -32602);
-      assert.match(error.message as string, new RegExp(field));
-    }
+    const repeated = await client.request(2, "initialize", {
+      protocolVersion: "2025-06-18",
+      capabilities: { sampling: {} },
+      clientInfo: { name: "other", version: "2" },
+    });
+    assert.equal(repeated.error, undefined);
+    assert.equal((repeated.result as Record<string, unknown>).protocolVersion, "2025-06-18");
+    const listed = await client.request(3, "tools/list");
+    assert.equal(listed.error, undefined);
+    assert.equal(((listed.result as Record<string, unknown>).tools as unknown[]).length, 8);
   } finally {
     assert.equal(await client.close(), 0);
   }
