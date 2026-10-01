@@ -7,6 +7,7 @@ import { spawnSync } from 'node:child_process';
 import { trustedRunnerSource } from './release-trust.mjs';
 import { productionIndexIdentity, requireAcceptedIndex } from './production-index-identity.mjs';
 import { verifyDaemon, daemonConfig } from './daemon-attestation.mjs';
+import { validateCurrentHostAcceptance, verifyCurrentHostEvidence } from './current-host-acceptance.mjs';
 const root = fileURLToPath(new URL('../', import.meta.url));
 const version = JSON.parse(readFileSync(join(root, 'package.json'))).version;
 const out = resolve(process.argv[2] ?? join(root, 'releases', version));
@@ -21,7 +22,7 @@ const provenance = JSON.parse(readFileSync(join(root, 'incidents/2026-09-28-json
 // A reseal accepts only an explicitly frozen, independently accepted bootstrap.
 // Historical incident provenance and already sealed candidates remain immutable.
 let reseal;
-let indexAcceptance, sealDaemon;
+let indexAcceptance, sealDaemon, hostAcceptance, acceptedHostHashes;
 if (process.argv[4]) {
   const inputBytes = readFileSync(resolve(process.argv[4]));
   if (!/^[a-f0-9]{64}$/.test(process.argv[5] ?? '') || sha(inputBytes) !== process.argv[5]) throw new Error('Frozen reseal input digest required');
@@ -44,7 +45,6 @@ if (process.argv[4]) {
     const actual = { dev: stat.dev, gid: stat.gid, ino: stat.ino, length: stat.size, mode: '0' + (stat.mode & 0o7777).toString(8), path, sha256: sha(readFileSync(path)), type: stat.isFile() && !stat.isSymbolicLink() ? 'file' : 'other', uid: stat.uid };
     if (JSON.stringify(actual) !== JSON.stringify(expected) || realpathSync(path) !== path) throw new Error('Reseal live host identity mismatch');
   }
-  for (const [path, expected] of Object.entries(receipt.unchanged_host_code_sha256)) if (provenance.production_identity.host_code_hashes[path] !== expected || sha(readFileSync(path)) !== expected) throw new Error('Unchanged host baseline mismatch');
   if (reseal.current_index_acceptance) {
     indexAcceptance = reference(reseal.current_index_acceptance);
     if (indexAcceptance.schema !== 1 || indexAcceptance.task_id !== 'LCB-C9-SEAL-31' || indexAcceptance.evidence_source !== 'controller_supplied_independent_review' || indexAcceptance.review.verdict !== 'GO_FOR_NEW_CANDIDATE9_WITH_EXPLICIT_CURRENT_INDEX_ACCEPTANCE' || indexAcceptance.controller_acceptance.accepted !== true || indexAcceptance.production !== provenance.production || indexAcceptance.historical_index_sha256 !== provenance.production_identity.git_index_hash || indexAcceptance.current_identity.head !== provenance.baseline_head || indexAcceptance.boundary.root_cause !== 'unknown' || indexAcceptance.boundary.old_index_binary_available !== false) throw new Error('Explicit current index acceptance required');
@@ -56,6 +56,21 @@ if (process.argv[4]) {
     if (sealDaemon.ok !== true) throw new Error('Seal daemon deployment readiness unavailable');
     requireAcceptedIndex(productionIndexIdentity(provenance.production), indexAcceptance.current_identity);
   }
+  if (reseal.current_host_acceptance) {
+    hostAcceptance = reference(reseal.current_host_acceptance);
+    if (!indexAcceptance || canonical(hostAcceptance) !== readFileSync(join(root, reseal.current_host_acceptance.path), 'utf8')) throw new Error('Canonical host acceptance and accepted index required');
+    const priorRelease = reference(hostAcceptance.candidate9_release);
+    const priorManifest = reference(hostAcceptance.candidate9_manifest);
+    if (priorRelease.manifest_sha256 !== hostAcceptance.candidate9_manifest.sha256 || priorRelease.source_commit !== priorManifest.source_commit) throw new Error('Prior candidate9 manifest binding mismatch');
+    const probe = reference(hostAcceptance.initialize_probe);
+    if (probe.compatibility.protocol_error !== null || probe.compatibility.methods_sent.join('|') !== 'initialize|initialized' || probe.compatibility.model_turn_started !== false || probe.compatibility.credentials_used !== false || probe.compatibility.real_history_read !== false || canonical(probe.chatgpt) !== canonical(hostAcceptance.host_evidence.chatgpt) || canonical(probe.codex_cli) !== canonical(hostAcceptance.host_evidence.codex_cli)) throw new Error('Current host initialize evidence mismatch');
+    const recovery = reference(hostAcceptance.scratch_cleanup_recovery);
+    if (recovery.task_id !== hostAcceptance.task_id || recovery.ok !== true || recovery.content_read !== false || recovery.retained_paths.length !== 0) throw new Error('Current host scratch cleanup recovery incomplete');
+    acceptedHostHashes = validateCurrentHostAcceptance(hostAcceptance, { provenance, reseal, indexAcceptance, priorManifest });
+    verifyCurrentHostEvidence(hostAcceptance);
+    for (const [path, expected] of Object.entries(acceptedHostHashes)) if (sha(readFileSync(path)) !== expected) throw new Error('Accepted current host live hash mismatch');
+  }
+  for (const [path, expected] of Object.entries(receipt.unchanged_host_code_sha256)) if (provenance.production_identity.host_code_hashes[path] !== expected || sha(readFileSync(path)) !== (acceptedHostHashes?.[path] ?? expected)) throw new Error('Unchanged host baseline mismatch');
 }
 const incidentAllowlist = new Set(['incidents/2026-09-28-jsonl-overflow/README.md', 'incidents/2026-09-28-jsonl-overflow/provenance.json', 'incidents/2026-09-28-jsonl-overflow/acceptance-matrix.json', 'incidents/2026-09-28-jsonl-overflow/local-validation.json', 'incidents/2026-09-28-jsonl-overflow/historical-acceptance.json']);
 const tracked = git(['ls-files', '-z']).split('\0').filter(Boolean).filter(name => !name.startsWith('releases/') && (!name.startsWith('incidents/') || incidentAllowlist.has(name)));
@@ -77,6 +92,7 @@ walk(pkg);
 const manifest = { version, claim: 'candidate', source_commit: git(['rev-parse', 'HEAD']), upstream_commit: provenance.baseline_head, production: provenance.production, agent: provenance.production_identity.agent, git_head: provenance.baseline_head, git_index_hash: provenance.production_identity.git_index_hash, host_code_hashes: provenance.production_identity.host_code_hashes, changed, baseline: { ...provenance.production_files_before }, payload, baseline_links: {}, payload_links: {} };
 if (reseal) {
   manifest.host_code_hashes = { ...manifest.host_code_hashes, ...Object.fromEntries(Object.entries(reseal.host_files).map(([path, identity]) => [path, identity.sha256])) };
+  if (hostAcceptance) { manifest.host_code_hashes = acceptedHostHashes; manifest.current_host_acceptance = reseal.current_host_acceptance; }
   manifest.host_code_metadata = reseal.host_files;
   manifest.bootstrap_acceptance = { ...reseal, reseal_input_sha256: process.argv[5] };
   if (indexAcceptance) {
@@ -101,5 +117,6 @@ const tar = spawnSync('/usr/bin/tar', ['-czf', archive, '-C', out, 'package'], {
 if (tar.status !== 0) throw new Error('Archive creation failed');
 const receipt = { version, claim: 'candidate', source_commit: manifest.source_commit, package: pkg, archive, archive_sha256: sha(readFileSync(archive)), manifest_sha256: sha(readFileSync(join(pkg, 'manifest.json'))), package_root_sha256: rootHash, trust_verifier: join(trust, 'verify-package.mjs'), trust_verifier_sha256: sha(anchor), production_modified: false, sealed_files: Object.keys(payload).length };
 if (indexAcceptance) { receipt.current_index_acceptance = reseal.current_index_acceptance; receipt.deployment_ready = sealDaemon.ok === true; receipt.daemon_at_seal = sealDaemon; }
+if (hostAcceptance) receipt.current_host_acceptance = reseal.current_host_acceptance;
 writeFileSync(join(out, 'release.json'), JSON.stringify(receipt, null, 2) + '\n');
 console.log(JSON.stringify(receipt));
