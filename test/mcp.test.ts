@@ -739,7 +739,10 @@ test("MCP stdio initializes idempotently and lists exactly twelve fully annotate
 });
 
 test("MCP accepts independent Tunnel initialize handshakes on one stdio child", async () => {
-  const client = new TestClient();
+  const client = new TestClient({
+    ...process.env,
+    CODEX_EXE: fileURLToPath(new URL("../../test/fake-codex.mjs", import.meta.url)),
+  });
   try {
     const first = await client.request(1, "initialize", {
       protocolVersion: "2025-03-26",
@@ -774,8 +777,59 @@ test("MCP accepts independent Tunnel initialize handshakes on one stdio child", 
     assert.equal(listed.error, undefined);
     assert.equal(((listed.result as Record<string, unknown>).tools as unknown[]).length, 12);
 
+    const threads = successfulToolPayload(await client.request("threads", "tools/call", {
+      name: "codex_threads", arguments: { limit: 1 },
+    }));
+    assert.equal((threads.data as Array<Record<string, unknown>>)[0]?.id, "stored-thread");
+
     const invalid = await client.request(3, "initialize", { clientInfo: { name: "other" } });
     assert.equal((invalid.error as Record<string, unknown>).code, -32602);
+  } finally {
+    assert.equal(await client.close(), 0);
+  }
+});
+
+test("MCP rejects malformed initialize handshakes before opening or changing readiness", async () => {
+  const client = new TestClient();
+  const valid = {
+    protocolVersion: "2025-03-26",
+    capabilities: {},
+    clientInfo: { name: "test", version: "1" },
+  };
+  const invalid = [
+    { ...valid, capabilities: undefined },
+    { ...valid, capabilities: null },
+    { ...valid, capabilities: [] },
+    { ...valid, capabilities: { sampling: true } },
+    { ...valid, capabilities: { roots: { listChanged: "true" } } },
+    { ...valid, clientInfo: undefined },
+    { ...valid, clientInfo: [] },
+    { ...valid, clientInfo: { name: "test" } },
+    { ...valid, clientInfo: { name: 1, version: "1" } },
+  ];
+  try {
+    let id = 0;
+    for (const params of invalid) {
+      const rejected = await client.request(id++, "initialize", params);
+      assert.equal((rejected.error as Record<string, unknown> | undefined)?.code, -32602);
+      const gated = await client.request(id++, "tools/list", {});
+      assert.equal((gated.error as Record<string, unknown> | undefined)?.code, -32002);
+    }
+    await initialize(client, id++);
+    for (const params of invalid) {
+      const rejected = await client.request(id++, "initialize", params);
+      assert.equal((rejected.error as Record<string, unknown> | undefined)?.code, -32602);
+    }
+    const independent = await client.request(id++, "initialize", {
+      protocolVersion: "2025-06-18",
+      capabilities: { sampling: {}, roots: { listChanged: false }, experimental: { future: {} } },
+      clientInfo: { name: "different-client", version: "2" },
+    });
+    assert.equal(independent.error, undefined);
+    assert.equal((independent.result as Record<string, unknown>).protocolVersion, "2025-06-18");
+    const listed = await client.request(id++, "tools/list", {});
+    assert.equal(listed.error, undefined);
+    assert.equal(((listed.result as Record<string, unknown>).tools as unknown[]).length, 12);
   } finally {
     assert.equal(await client.close(), 0);
   }

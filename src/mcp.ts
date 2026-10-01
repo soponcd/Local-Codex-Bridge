@@ -51,6 +51,26 @@ function initializeProtocolVersion(params: unknown): string | null {
   return record.protocolVersion;
 }
 
+function initializeMetadataError(params: unknown): string | null {
+  const record = asRecord(params);
+  const capabilities = asRecord(record?.capabilities);
+  if (!capabilities) return "initialize requires capabilities object";
+  for (const name of ["roots", "sampling", "elicitation", "experimental"]) {
+    if (Object.hasOwn(capabilities, name) && !asRecord(capabilities[name])) {
+      return `initialize capabilities.${name} must be an object`;
+    }
+  }
+  const roots = asRecord(capabilities.roots);
+  if (roots && Object.hasOwn(roots, "listChanged") && typeof roots.listChanged !== "boolean") {
+    return "initialize capabilities.roots.listChanged must be a boolean";
+  }
+  const clientInfo = asRecord(record?.clientInfo);
+  if (!clientInfo || typeof clientInfo.name !== "string" || typeof clientInfo.version !== "string") {
+    return "initialize requires clientInfo with string name and version";
+  }
+  return null;
+}
+
 export interface McpStdioServerOptions {
   onClose: () => void | Promise<void>;
 }
@@ -212,6 +232,11 @@ export class McpStdioServer {
         await this.#sendError(id, { code: -32602, message: "initialize requires protocolVersion" });
         return;
       }
+      const metadataError = initializeMetadataError(params);
+      if (metadataError) {
+        await this.#sendError(id, { code: -32602, message: metadataError });
+        return;
+      }
       const initializeResult = {
         protocolVersion: SUPPORTED_PROTOCOL_VERSIONS.has(protocolVersion)
           ? protocolVersion
@@ -224,8 +249,9 @@ export class McpStdioServer {
         },
       };
       // Tunnel discovery and calls can forward independent initialize handshakes
-      // through one long-lived stdio child. Bridge has no client-scoped state, so
-      // each handshake can negotiate independently without resetting live state.
+      // through one long-lived stdio child with no downstream session identity.
+      // Validate and negotiate each handshake independently: never cache a
+      // client's capabilities/identity or reset native supervision state here.
       this.#initialized = true;
       await this.#sendResult(id, initializeResult);
       return;
