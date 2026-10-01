@@ -55,10 +55,30 @@ function initializeMetadataError(params: unknown): string | null {
   const record = asRecord(params);
   const capabilities = asRecord(record?.capabilities);
   if (!capabilities) return "initialize requires capabilities object";
-  for (const name of ["roots", "sampling", "elicitation", "experimental"]) {
-    if (Object.hasOwn(capabilities, name) && !asRecord(capabilities[name])) {
-      return `initialize capabilities.${name} must be an object`;
+  // ClientCapabilities 2025-11-25 has an open set of capabilities, but these
+  // known fields (including intermediate containers) must be JSON objects.
+  const objectPaths = [
+    ["roots"], ["experimental"],
+    ["sampling", "context"], ["sampling", "tools"],
+    ["elicitation", "form"], ["elicitation", "url"],
+    ["tasks", "list"], ["tasks", "cancel"],
+    ["tasks", "requests", "sampling", "createMessage"],
+    ["tasks", "requests", "elicitation", "create"],
+  ];
+  for (const path of objectPaths) {
+    let container = capabilities;
+    const traversed: string[] = [];
+    for (const name of path) {
+      if (!Object.hasOwn(container, name)) break;
+      traversed.push(name);
+      const nested = asRecord(container[name]);
+      if (!nested) return `initialize capabilities.${traversed.join(".")} must be an object`;
+      container = nested;
     }
+  }
+  const experimental = asRecord(capabilities.experimental);
+  if (experimental && Object.values(experimental).some(value => !asRecord(value))) {
+    return "initialize capabilities.experimental values must be objects";
   }
   const roots = asRecord(capabilities.roots);
   if (roots && Object.hasOwn(roots, "listChanged") && typeof roots.listChanged !== "boolean") {

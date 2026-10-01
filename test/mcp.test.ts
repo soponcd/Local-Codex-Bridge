@@ -835,6 +835,69 @@ test("MCP rejects malformed initialize handshakes before opening or changing rea
   }
 });
 
+const malformedClientCapabilities: Array<[string, Record<string, unknown>[]]> = [
+  ["sampling", [
+    { sampling: { context: true } }, { sampling: { context: null } },
+    { sampling: { context: [] } }, { sampling: { tools: "enabled" } },
+    { sampling: { tools: 0 } }, { sampling: { tools: [] } },
+  ]],
+  ["elicitation", [
+    { elicitation: { form: true } }, { elicitation: { form: null } },
+    { elicitation: { form: [] } }, { elicitation: { url: "enabled" } },
+    { elicitation: { url: 0 } }, { elicitation: { url: [] } },
+  ]],
+  ["tasks", [
+    { tasks: true }, { tasks: null }, { tasks: [] },
+    { tasks: { list: false } }, { tasks: { cancel: [] } },
+    { tasks: { requests: null } }, { tasks: { requests: [] } },
+    { tasks: { requests: { sampling: false } } },
+    { tasks: { requests: { sampling: { createMessage: [] } } } },
+    { tasks: { requests: { elicitation: null } } },
+    { tasks: { requests: { elicitation: { create: "enabled" } } } },
+  ]],
+  ["experimental", [
+    { experimental: { custom: true } }, { experimental: { custom: null } },
+    { experimental: { custom: [] } }, { experimental: { custom: "enabled" } },
+    { experimental: { custom: 0 } },
+  ]],
+];
+
+for (const [category, invalidCapabilities] of malformedClientCapabilities) {
+  test(`MCP rejects malformed ${category} ClientCapabilities on every handshake`, async () => {
+    const client = new TestClient();
+    const params = (capabilities: Record<string, unknown>) => ({
+      protocolVersion: "2025-11-25", capabilities,
+      clientInfo: { name: "known-shape-test", version: "1" },
+    });
+    try {
+      let id = 0;
+      for (const capabilities of invalidCapabilities) {
+        const rejected = await client.request(id++, "initialize", params(capabilities));
+        assert.equal((rejected.error as Record<string, unknown> | undefined)?.code, -32602);
+        const gated = await client.request(id++, "tools/list", {});
+        assert.equal((gated.error as Record<string, unknown> | undefined)?.code, -32002);
+      }
+      const valid = await client.request(id++, "initialize", params({
+        sampling: { context: {}, tools: {}, future: true },
+        elicitation: { form: {}, url: {}, future: null },
+        tasks: { list: {}, cancel: {}, requests: {
+          sampling: { createMessage: {}, future: [] },
+          elicitation: { create: {}, future: false }, future: "extension",
+        }, future: 1 },
+        experimental: { custom: { options: [1, true, null] } },
+        futureCapability: true,
+      }));
+      assert.equal(valid.error, undefined);
+      for (const capabilities of invalidCapabilities) {
+        const rejected = await client.request(id++, "initialize", params(capabilities));
+        assert.equal((rejected.error as Record<string, unknown> | undefined)?.code, -32602);
+      }
+      const listed = await client.request(id++, "tools/list", {});
+      assert.equal(listed.error, undefined);
+    } finally { assert.equal(await client.close(), 0); }
+  });
+}
+
 test("MCP repeated initialize preserves pending requests and their response scope", { timeout: 3_000 }, async () => {
   const runtime = new RuntimeStore();
   const threadId = "thread-initialize-pending";
