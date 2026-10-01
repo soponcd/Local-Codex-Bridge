@@ -25,6 +25,12 @@ const THREADLESS_REQUEST_ERROR = {
 const MUTATING_REQUEST_METHODS = new Set([
   "thread/start",
   "thread/resume",
+  "thread/goal/set",
+  "thread/goal/clear",
+  "thread/queue/add",
+  "thread/queue/update",
+  "thread/queue/delete",
+  "thread/queue/reorder",
   "turn/start",
   "turn/steer",
   "turn/interrupt",

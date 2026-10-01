@@ -6,7 +6,7 @@ import { join, resolve, dirname } from 'node:path';
 import { spawnSync } from 'node:child_process';
 export const HOOK_VERSION = 'lcb-daemon-attestation/1';
 export const MAX_FRAME = 32768;
-export const MODULES = Object.freeze(['app-server', 'checkpoint', 'index', 'mcp', 'platform', 'runtime', 'tools', 'ux-projection', 'version'].map(name => `dist/src/${name}.js`));
+export const MODULES = Object.freeze(['app-server', 'checkpoint', 'compact-descriptors', 'compact-schema', 'compact-shape', 'exact-json', 'goal', 'history', 'index', 'mcp', 'observe-compact', 'platform', 'queue', 'redaction', 'runtime', 'search', 'tools', 'ux-projection', 'version'].map(name => `dist/src/${name}.js`));
 const keys = (value, expected) => value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).sort().join('|') === [...expected].sort().join('|');
 const positive = n => Number.isSafeInteger(n) && n > 0;
 export function privateDirectory(directory, uid) {

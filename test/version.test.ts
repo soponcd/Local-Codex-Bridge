@@ -8,7 +8,7 @@ import { VERSION, UPSTREAM_LAUNCHER_VERSION } from "../src/version.js";
 const rootFile = (relativePath: string): string =>
   fileURLToPath(new URL(`../../${relativePath}`, import.meta.url));
 
-test("release version anchors match the canonical code version", () => {
+test("package, platform and changelog version anchors match the canonical code version", () => {
   const packageJson = JSON.parse(readFileSync(rootFile("package.json"), "utf8")) as {
     version?: unknown;
   };
@@ -20,8 +20,10 @@ test("release version anchors match the canonical code version", () => {
     rootFile("Start Mac Codex Bridge.app/Contents/Info.plist"),
     "utf8",
   );
-  const readme = readFileSync(rootFile("README.md"), "utf8");
   const changelog = readFileSync(rootFile("CHANGELOG.md"), "utf8");
+  for (const readme of ["README.md", "README.zh-CN.md"]) {
+    assert.ok(readFileSync(rootFile(readme), "utf8").includes(`**Current release: V${VERSION}**`), `${readme} current release drifted`);
+  }
   const escapedVersion = VERSION.replace(/\./g, "\\.");
   const launcherVersion = UPSTREAM_LAUNCHER_VERSION.replace(/\./g, "\\.");
   const buildVersion = UPSTREAM_LAUNCHER_VERSION.split(".").join("");
@@ -42,11 +44,6 @@ test("release version anchors match the canonical code version", () => {
     infoPlist,
     new RegExp(`<key>CFBundleVersion</key>\\s*<string>${buildVersion}</string>`),
     "macOS build version drifted",
-  );
-  assert.match(
-    readme,
-    new RegExp(`当前测试候选版本[\\s\\S]{0,100}\\*\\*V${escapedVersion}\\*\\*`),
-    "README candidate version drifted",
   );
   assert.match(
     changelog,

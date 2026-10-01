@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 const moduleURL = new URL('../../scripts/remote-model-probe.mjs', import.meta.url);
-for (const scenario of ['success', 'native tree', 'auth rotation', 'login missing', 'wrong origin', 'missing tool', 'tool error', 'invalid result', 'deadline', 'symlink scratch', 'partial cleanup']) {
+for (const scenario of ['success', 'structured success', 'structured invalid', 'native tree', 'auth rotation', 'login missing', 'wrong origin', 'missing tool', 'tool error', 'invalid result', 'deadline', 'symlink scratch', 'partial cleanup']) {
   test(`native remote acceptance ${scenario} is verified or fails closed`, async () => {
     const { remoteModels } = await import(moduleURL.href);
     const root = fs.mkdtempSync('/private/tmp/lcb-native-test-');
@@ -36,6 +36,7 @@ for (const scenario of ['success', 'native tree', 'auth rotation', 'login missin
           const expected=['initialize','thread/start','mcpServerStatus/list'];if(scenario==='success')expected.push('mcpServerStatus/list');expected.push('mcpServer/tool/call');
           if(JSON.stringify(calls)!==JSON.stringify(expected))process.exit(14);
           result={isError:scenario==='tool error',content:[{type:'text',text:JSON.stringify({source:'codex_app_server_model_list',data:scenario==='invalid result'?[]:[{id:'synthetic-model'}]})}]};
+          if(scenario.startsWith('structured'))result.structuredContent={source:'codex_app_server_model_list',data:scenario==='structured invalid'?[]:[{id:'synthetic-model'}]};
         }
         if(!['initialize','thread/start','mcpServerStatus/list','mcpServer/tool/call'].includes(q.method))process.exit(15);
         process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:q.id,result})+'\\n');
@@ -52,7 +53,7 @@ for (const scenario of ['success', 'native tree', 'auth rotation', 'login missin
     try {
       const records: any[] = [];
       const options = { authPath, spawnImpl, cli: process.execPath, timeoutMs: scenario === 'deadline' ? 150 : 3000, record: (v: any) => records.push(v), scratchOptions: { scratchParent: root, ...(scenario === 'partial cleanup' ? { beforeDelete: (_item: any, removed: number) => { if (removed === 1) throw new Error('injected partial cleanup'); } } : {}) }, env: { OPENAI_API_KEY: 'synthetic-api-key', LCB_VERIFY_OPENAI_API_KEY: 'synthetic-api-key', NODE_TLS_REJECT_UNAUTHORIZED: '0' } };
-      if (['success', 'native tree', 'auth rotation'].includes(scenario)) {
+      if (['success', 'structured success', 'native tree', 'auth rotation'].includes(scenario)) {
         const result = await remoteModels(options);
         assert.equal(result.ok, true); assert.equal(result.count, 1);
         assert.equal(result.route, 'native app-server -> codex_apps -> local_codex_bridge.codex_models');

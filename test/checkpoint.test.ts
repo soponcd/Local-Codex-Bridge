@@ -27,10 +27,14 @@ import {
 
 const unavailableAppServer = {} as unknown as AppServerManager;
 
-test("checkpoint remains the final tool in the current tool catalog", () => {
+test("tool catalog retains the discovery guardrails", () => {
   assert.deepEqual(TOOL_DEFINITIONS.map((tool) => tool.name), [
     "codex_threads",
+    "codex_history",
+    "codex_search",
     "codex_models",
+    "codex_goal",
+    "codex_queue",
     "codex_turn",
     "codex_observe",
     "codex_steer",
@@ -39,48 +43,55 @@ test("checkpoint remains the final tool in the current tool catalog", () => {
     "codex_checkpoint",
   ]);
   const turn = TOOL_DEFINITIONS.find((tool) => tool.name === "codex_turn");
-  assert.match(
-    turn?.description ?? "",
-    /Prefer continuing the same native thread when its context remains useful, but a fresh thread is allowed/,
-  );
+  assert.match(turn?.description ?? "", /Acceptance is not completion/);
   assert.match(turn?.description ?? "", /thread_id is not a permanent task identity/);
-  assert.match(turn?.description ?? "", /outcome is UNKNOWN/);
+  assert.match(turn?.description ?? "", /UNKNOWN \/ possibly accepted.*observe\/read.*do not retry automatically/);
   const checkpoint = TOOL_DEFINITIONS.at(-1);
-  assert.match(
-    checkpoint?.description ?? "",
-    /Initialization is not tied to crossing a ChatGPT window or round/,
-  );
-  assert.match(
-    checkpoint?.description ?? "",
-    /initialize early when a task is already expected to be sufficiently long or complex/,
-  );
-  assert.match(
-    checkpoint?.description ?? "",
-    /elapsed time, observe\/poll count, token count, or mere silence are not automatic triggers/,
-  );
-  assert.match(checkpoint?.description ?? "", /Do not use for one-shot work/);
-  assert.match(checkpoint?.description ?? "", /keyed to one native Codex thread_id/);
-  assert.match(
-    checkpoint?.description ?? "",
-    /the key is not a permanent task identity and does not require future work to remain on that thread/,
-  );
-  assert.match(
-    checkpoint?.description ?? "",
-    /Before final acceptance of a checkpointed task, read it once/,
-  );
+  assert.match(checkpoint?.description ?? "", /Optional bounded supervisor anchor/);
+  assert.match(checkpoint?.description ?? "", /not a task identity or native Goal/);
+  assert.match(checkpoint?.description ?? "", /Create early.*long\/complex.*context dilution or goal drift/);
+  assert.match(checkpoint?.description ?? "", /skip one-shot work/);
+  for (const trigger of ["Window changes", "elapsed time", "poll count", "silence"]) {
+    assert.ok(checkpoint?.description.includes(trigger), `checkpoint trigger: ${trigger}`);
+  }
+  assert.match(checkpoint?.description ?? "", /not mechanical triggers/);
+  assert.match(checkpoint?.description ?? "", /original goal, constraints, and acceptance unchanged/);
+  assert.match(checkpoint?.description ?? "", /material decisions/);
+  assert.match(checkpoint?.description ?? "", /Before final acceptance.*read it once/);
   const observe = TOOL_DEFINITIONS.find((tool) => tool.name === "codex_observe");
-  assert.match(
-    observe?.description ?? "",
-    /absence of new command activity alone is not evidence of a stall/,
-  );
+  const observeDescription = observe?.description ?? "";
+  for (const guardrail of [
+    /next_cursor.*never substitute cursor_floor/,
+    /stream_lost.*facts_lost.*cursor_lost/,
+    /runtime_available:true.*pending_requests.*absence in compact means empty/,
+    /runtime_available:false.*pending state is unknown/,
+    /terminal.status.*not final_result or error presence/,
+    /final_result_pending.*next_cursor/,
+    /No command output alone does not mean stalled/,
+    /inProgress.*repeated bounded observe/,
+    /wake\/deadline.*inspect new state.*steer, respond, or interrupt/,
+  ]) assert.match(observeDescription, guardrail);
   const steer = TOOL_DEFINITIONS.find((tool) => tool.name === "codex_steer");
-  assert.match(
-    steer?.description ?? "",
-    /steer only for a semantic redirect or correction based on new evidence or changed user intent/,
-  );
-  assert.match(steer?.description ?? "", /outcome is UNKNOWN/);
+  assert.match(steer?.description ?? "", /Redirect or correct the exact active turn/);
+  assert.match(steer?.description ?? "", /Do not steer for silence or elapsed time alone/);
+  assert.match(steer?.description ?? "", /UNKNOWN \/ possibly accepted.*observe\/read.*do not retry automatically/);
   const interrupt = TOOL_DEFINITIONS.find((tool) => tool.name === "codex_interrupt");
-  assert.match(interrupt?.description ?? "", /outcome is UNKNOWN/);
+  assert.match(interrupt?.description ?? "", /UNKNOWN \/ possibly accepted.*observe\/read.*do not retry automatically/);
+  const respond = TOOL_DEFINITIONS.find((tool) => tool.name === "codex_respond");
+  assert.match(respond?.description ?? "", /original typed request id and exact method, thread, and turn scope when applicable/);
+  assert.match(respond?.description ?? "", /Unsupported methods.*remain pending/);
+  const history = TOOL_DEFINITIONS.find((tool) => tool.name === "codex_history");
+  assert.match(history?.description ?? "", /whole page without partial data/);
+  assert.match(history?.description ?? "", /History cursors within the same thread\/mode\/kind\/turn\/sort scope/);
+  const search = TOOL_DEFINITIONS.find((tool) => tool.name === "codex_search");
+  assert.match(search?.description ?? "", /locate message occurrences.*codex_history to read content/);
+  assert.match(search?.description ?? "", /turnCursor anchors same-thread History, not Search continuation/);
+  assert.match(search?.description ?? "", /whole page without partial data\/cursor/);
+  for (const name of ["codex_goal", "codex_queue"]) {
+    const description = TOOL_DEFINITIONS.find((tool) => tool.name === name)?.description ?? "";
+    assert.match(description, /UNKNOWN \/ possibly accepted.*before.*write; do not retry automatically/);
+    assert.match(description, /result_not_deliverable means acknowledged success without lossless delivery/);
+  }
 });
 
 test("Windows checkpoint default preserves legacy data", {

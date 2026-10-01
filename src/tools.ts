@@ -1,3 +1,4 @@
+import { preflightEcho } from "./exact-json.js";
 import { AppServerManager, diagnoseCodexVersion } from "./app-server.js";
 import {
   CHECKPOINT_TEXT_LIMIT,
@@ -10,6 +11,10 @@ import {
   type RpcId,
 } from "./runtime.js";
 import { platformPolicyFor, type PlatformPolicy } from "./platform.js";
+import { exactHistoryResponse, validateHistoryPage } from "./history.js";
+import { exactGoalResponse, MAX_GOAL_RESULT_BYTES, GOAL_STATUSES } from "./goal.js";
+import { exactQueueResponse, MAX_QUEUE_RESULT_BYTES, QUEUE_ACTIONS, QUEUE_PAGE_LIMIT } from "./queue.js";
+import { exactSearchResponse, SEARCH_PAGE_LIMIT } from "./search.js";
 
 export interface ToolDefinition {
   name: string;
@@ -65,6 +70,15 @@ const SUPPORTED_RESPOND_METHODS = new Set([
 const MODEL_LIST_PAGE_LIMIT = 100;
 const MAX_MODEL_CATALOG_PAGES = 100;
 const MAX_MODEL_CATALOG_ENTRIES = 10_000;
+const HISTORY_TURN_LIMIT = 50;
+const HISTORY_ITEM_LIMIT = 20;
+const THREAD_SOURCE_KINDS = [
+  "cli", "vscode", "exec", "appServer", "subAgent", "subAgentReview",
+  "subAgentCompact", "subAgentThreadSpawn", "subAgentOther", "unknown",
+] as const;
+const THREAD_LIST_FIELDS = [
+  "cwd", "search_term", "cursor", "limit", "parent_thread_id", "ancestor_thread_id", "source_kinds",
+] as const;
 
 interface ModelListPage {
   data: Record<string, unknown>[];
@@ -76,7 +90,7 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
     name: "codex_threads",
     title: "Codex Threads",
     description:
-      "List or search persistent local Codex threads through thread/list, or read one thread through thread/read. This does not reconstruct live Bridge events.",
+      "List/search persistent native threads or read one thread's metadata. Use codex_history for turns; include_turns:true alone errors. Local latest_messages is a bounded degraded compatibility view. Capability and lineage fields are native metadata, not writer authorization. Include subagent source_kinds explicitly; native defaults to interactive sources. Metadata cannot reconstruct live Bridge state.",
     inputSchema: {
       type: "object",
       properties: {
@@ -84,7 +98,7 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
           type: "string",
           minLength: 1,
           maxLength: 200,
-          description: "When supplied, read this exact Codex thread instead of listing threads.",
+          description: "Read this exact thread instead of listing.",
         },
         include_turns: {
           type: "boolean",
@@ -100,27 +114,55 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
         cwd: {
           type: "string",
           maxLength: 1000,
-          description: "Optional exact absolute native cwd filter for thread/list.",
+          description: "Exact absolute native cwd filter.",
+        },
+        parent_thread_id: {
+          type: ["string", "null"],
+          minLength: 1,
+          maxLength: 200,
+          pattern: "\\S",
+          description: "Direct spawned children, not forks; select subagent sources separately.",
+        },
+        ancestor_thread_id: {
+          type: ["string", "null"],
+          minLength: 1,
+          maxLength: 200,
+          pattern: "\\S",
+          description: "Spawned descendants at any depth, excluding the ancestor; not forks.",
+        },
+        source_kinds: {
+          type: ["array", "null"],
+          items: { type: "string", enum: THREAD_SOURCE_KINDS },
+          maxItems: 100,
+          description: "Omitted/null/[] keeps native interactive defaults; include subAgentThreadSpawn for spawned threads.",
         },
         search_term: {
           type: "string",
           minLength: 1,
           maxLength: 500,
-          description: "Optional Codex title substring filter for thread/list.",
+          description: "Codex title substring filter.",
         },
         cursor: {
           type: "string",
           minLength: 1,
           maxLength: 10000,
-          description: "Opaque cursor returned by a prior thread/list call.",
+          description: "Thread-list cursor only.",
         },
         limit: {
           type: "integer",
           minimum: 1,
           maximum: 100,
           default: 20,
-          description: "Maximum threads in the returned page.",
+          description: "Thread page size.",
         },
+      },
+      oneOf: [
+        { not: { anyOf: [{ required: ["thread_id"] }, { required: ["include_turns"] }, { required: ["latest_messages"] }] } },
+        { required: ["thread_id"], not: { anyOf: THREAD_LIST_FIELDS.map((key) => ({ required: [key] })) } },
+      ],
+      not: {
+        required: ["parent_thread_id", "ancestor_thread_id"],
+        properties: { parent_thread_id: { type: "string" }, ancestor_thread_id: { type: "string" } },
       },
       additionalProperties: false,
     },
@@ -133,10 +175,69 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
     },
   },
   {
+    name: "codex_history",
+    title: "Codex History",
+    description:
+      "Read one lossless native persisted history page; this does not restore Bridge live state. Paginated mode supports turns or items within a turn; legacy mode supports one full turn, without item paging. Keep History cursors within the same thread/mode/kind/turn/sort scope; only nextCursor:null ends paging. Size, content-policy, or structure failure rejects the whole page without partial data or fallback.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        thread_id: { type: "string", minLength: 1, maxLength: 200, pattern: "\\S" },
+        kind: { type: "string", enum: ["turns", "items"] },
+        content_policy: { type: "string", enum: ["protected", "exact"], default: "protected", description: "protected rejects secret-shaped content; exact exposes unchanged native text for this call. No fallback; neither value is an access-control level." },
+        turn_id: { type: "string", minLength: 1, maxLength: 200, pattern: "\\S" },
+        cursor: { type: "string", minLength: 1, maxLength: 10_000, pattern: "\\S", description: "Native History cursor, not a thread-list, Search, or live Observe cursor." },
+        limit: { type: "integer", minimum: 1, maximum: HISTORY_TURN_LIMIT, description: "Paginated turns default 20; items default 10/max 20; legacy turns require 1." },
+        sort_direction: { type: "string", enum: ["asc", "desc"], description: "Turns default desc; items default asc. Use the opposite direction with a reverse cursor." },
+      },
+      required: ["thread_id", "kind"],
+      oneOf: [
+        { properties: { kind: { const: "turns" } }, not: { required: ["turn_id"] } },
+        { properties: { kind: { const: "items" }, limit: { maximum: HISTORY_ITEM_LIMIT } }, required: ["turn_id"] },
+      ],
+      additionalProperties: false,
+    },
+    annotations: {
+      title: "Codex History",
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+  },
+  {
+    name: "codex_search",
+    title: "Search Native Codex History",
+    description:
+      "Search native threads or locate message occurrences within one paginated thread; use codex_history to read content. Thread search differs from the codex_threads title filter and does not infer a workspace or ACL. Occurrences are case-insensitive literal matches in visible user and final assistant messages, not every item. Preserve query/scope/filters across Search pages; only nextCursor:null ends paging. An occurrence turnCursor anchors same-thread History, not Search continuation. Content-policy, size, or structure failure rejects the whole page without partial data/cursor. Results are locators, not a full history audit.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        kind: { type: "string", enum: ["threads", "occurrences"] },
+        content_policy: { type: "string", enum: ["protected", "exact"], default: "protected", description: "protected rejects secret-shaped content; exact exposes unchanged native text for this call. No fallback; neither value is an access-control level." },
+        search_term: { type: "string", minLength: 1, maxLength: 500, pattern: "\\S", description: "Native query, forwarded unchanged." },
+        thread_id: { type: "string", minLength: 1, maxLength: 200, pattern: "\\S", description: "Occurrences: exact native paginated thread." },
+        cursor: { type: "string", minLength: 1, maxLength: 10_000, pattern: "\\S", description: "Search continuation for the same query/scope/filters; never use occurrence turnCursor." },
+        limit: { type: "integer", minimum: 1, maximum: SEARCH_PAGE_LIMIT, default: 20 },
+        sort_key: { type: ["string", "null"], enum: ["created_at", "updated_at", "recency_at", null], description: "Threads only; omission/null uses native created_at." },
+        sort_direction: { type: ["string", "null"], enum: ["asc", "desc", null], description: "Threads only; omission/null uses native descending order. Use the opposite direction with backwardsCursor." },
+        source_kinds: { type: ["array", "null"], items: { type: "string", enum: THREAD_SOURCE_KINDS }, maxItems: 100, description: "Threads only; omitted/null/[] keeps native interactive defaults. Select subagents explicitly." },
+        archived: { type: ["boolean", "null"], description: "Threads only; true selects archived threads." },
+      },
+      required: ["kind", "search_term"],
+      oneOf: [
+        { properties: { kind: { const: "threads" } }, not: { required: ["thread_id"] } },
+        { properties: { kind: { const: "occurrences" } }, required: ["thread_id"], not: { anyOf: ["sort_key", "sort_direction", "source_kinds", "archived"].map(key => ({ required: [key] })) } },
+      ],
+      additionalProperties: false,
+    },
+    annotations: { title: "Search Native Codex History", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  },
+  {
     name: "codex_models",
     title: "Codex Models",
     description:
-      "Read one current model/list page directly from Codex app-server. Results are bounded and sanitized, cursors are opaque, hidden models are omitted unless include_hidden is true, and the Bridge keeps no model catalog cache or current-model registry.",
+      "Read one current native model/list page. The Bridge keeps no model catalog or current-model registry.",
     inputSchema: {
       type: "object",
       properties: {
@@ -170,10 +271,81 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
     },
   },
   {
+    name: "codex_goal",
+    title: "Manage Native Codex Goal",
+    description:
+      "Get/set/clear one native persisted thread Goal; this does not start a turn or write a checkpoint. Active goals may cause native execution; clear does not interrupt a turn. Set requires budget_mode: preserve omits tokenBudget, unlimited sends null, fixed sends token_budget. goal_result_not_deliverable means acknowledged success without lossless delivery. A sent mutation timeout is UNKNOWN / possibly accepted: read native Goal state before deciding on another write; do not retry automatically.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        action: { type: "string", enum: ["get", "set", "clear"] },
+        thread_id: { type: "string", minLength: 1, maxLength: 200, pattern: "\\S" },
+        objective: {
+          type: ["string", "null"],
+          description: "Set: forwarded unchanged; omission/null preserves the objective. Native enforces its text limit.",
+        },
+        status: { type: ["string", "null"], enum: [...GOAL_STATUSES, null], description: "Set: omission/null preserves native status." },
+        budget_mode: { type: "string", enum: ["preserve", "unlimited", "fixed"], description: "preserve omits native tokenBudget; unlimited sends null; fixed uses token_budget." },
+        token_budget: {
+          type: "integer", minimum: 1, maximum: Number.MAX_SAFE_INTEGER,
+          description: "Native Goal resource ceiling for fixed mode. Maximum is a JavaScript lossless transport bound.",
+        },
+      },
+      required: ["action", "thread_id"],
+      oneOf: [
+        { properties: { action: { const: "set" } }, required: ["budget_mode"], oneOf: [
+          { properties: { budget_mode: { const: "fixed" } }, required: ["token_budget"] },
+          { properties: { budget_mode: { enum: ["preserve", "unlimited"] } }, not: { required: ["token_budget"] } },
+        ] },
+        { properties: { action: { enum: ["get", "clear"] } }, not: { anyOf: ["objective", "status", "budget_mode", "token_budget"].map(key => ({ required: [key] })) } },
+      ],
+      additionalProperties: false,
+    },
+    annotations: {
+      title: "Manage Native Codex Goal",
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+      openWorldHint: true,
+    },
+  },
+  {
+    name: "codex_queue",
+    title: "Codex Native Queue",
+    description:
+      "List/add/update/delete/reorder native queued follow-up text. Queue runs after active work; codex_steer redirects the current turn. Enqueue acknowledgement is not execution or completion. Native may consume entries while you inspect them. queue_result_not_deliverable means acknowledged success without lossless delivery. A sent mutation timeout is UNKNOWN / possibly accepted: inspect queue and execution state before another write; do not retry automatically.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        action: { type: "string", enum: QUEUE_ACTIONS },
+        thread_id: { type: "string", minLength: 1, maxLength: 200, pattern: "\\S" },
+        text: { type: "string", minLength: 1, maxLength: 200_000, pattern: "\\S", description: "Add text or full input replacement for update." },
+        client_user_message_id: { type: "string", minLength: 1, maxLength: 200, pattern: "\\S", description: "Caller-provided native clientUserMessageId for add; Bridge never generates it." },
+        queued_submission_id: { type: "string", minLength: 1, maxLength: 200, pattern: "\\S", description: "Native queuedSubmission.id, not a turn or client message id." },
+        queued_submission_ids: { type: "array", maxItems: QUEUE_PAGE_LIMIT, items: { type: "string", minLength: 1, maxLength: 200, pattern: "\\S" }, description: "Full intended order of native pending submission IDs; no Bridge merge or deduplication." },
+        cursor: { type: "string", minLength: 1, maxLength: 10_000, pattern: "\\S", description: "Native Queue-list cursor only." },
+        limit: { type: "integer", minimum: 1, maximum: QUEUE_PAGE_LIMIT, default: 20, description: "Queue page size." },
+      },
+      required: ["action", "thread_id"],
+      oneOf: [
+        { properties: { action: { const: "list" } }, not: { anyOf: ["text", "client_user_message_id", "queued_submission_id", "queued_submission_ids"].map(key => ({ required: [key] })) } },
+        { properties: { action: { const: "add" } }, required: ["text", "client_user_message_id"], not: { anyOf: ["queued_submission_id", "queued_submission_ids", "cursor", "limit"].map(key => ({ required: [key] })) } },
+        { properties: { action: { const: "update" } }, required: ["text", "queued_submission_id"], not: { anyOf: ["client_user_message_id", "queued_submission_ids", "cursor", "limit"].map(key => ({ required: [key] })) } },
+        { properties: { action: { const: "delete" } }, required: ["queued_submission_id"], not: { anyOf: ["text", "client_user_message_id", "queued_submission_ids", "cursor", "limit"].map(key => ({ required: [key] })) } },
+        { properties: { action: { const: "reorder" } }, required: ["queued_submission_ids"], not: { anyOf: ["text", "client_user_message_id", "queued_submission_id", "cursor", "limit"].map(key => ({ required: [key] })) } },
+      ],
+      additionalProperties: false,
+    },
+    annotations: {
+      title: "Codex Native Queue", readOnlyHint: false, destructiveHint: true,
+      idempotentHint: false, openWorldHint: true,
+    },
+  },
+  {
     name: "codex_turn",
     title: "Start or Continue Codex Turn",
     description:
-      "Start a persistent Codex thread and turn, or resume an existing thread and start a turn. Prefer continuing the same native thread when its context remains useful, but a fresh thread is allowed; thread_id is not a permanent task identity. Explicit model or effort overrides are validated against a fresh model/list catalog without caching. Effort alone is checked only against efforts advertised somewhere in that catalog; the Bridge does not infer the current thread model, so app-server remains authoritative for current-model compatibility. Returns as soon as turn/start is accepted; observe separately for events and completion. If an already-sent mutating acknowledgement times out, the outcome is UNKNOWN and the request was possibly accepted; observe/read before any retry, and never directly retry it.",
+      "Start a native persistent thread and turn, or resume a thread and start a turn. Acceptance is not completion; use codex_observe. A thread_id is not a permanent task identity. Model/effort overrides use a fresh native catalog; Codex decides current-model compatibility. A sent mutation timeout is UNKNOWN / possibly accepted: observe/read before another write; do not retry automatically.",
     inputSchema: {
       type: "object",
       properties: {
@@ -198,13 +370,13 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
           type: "string",
           minLength: 1,
           maxLength: 100,
-          description: "Optional model/list id or model identifier, validated on demand and passed through unchanged.",
+          description: "Native model/list id or identifier; validated on demand.",
         },
         effort: {
           type: "string",
           minLength: 1,
           maxLength: 32,
-          description: "Optional reasoning effort. With no model, only catalog-wide token existence is checked; current-model compatibility remains native-authoritative.",
+          description: "Without model, only catalog-wide availability is checked; Codex decides compatibility.",
         },
         sandbox: sandboxSchema,
         approval_policy: approvalPolicySchema,
@@ -225,22 +397,22 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
     name: "codex_observe",
     title: "Observe Codex Turn",
     description:
-      "Read bounded incremental sanitized Bridge runtime events, pending requests, and terminal output for a thread. Optional wait_ms performs one bounded event-driven wait only when the live turn is active and the current snapshot has nothing useful; it is not polling or stall detection. After Bridge process loss, falls back to persistent thread/read history and marks live state unreconstructable. A long interval with no new command or output can still mean Codex is actively reasoning; absence of new command activity alone is not evidence of a stall. When actively supervising an in-progress turn, use repeated bounded-wait observe calls until terminal unless the user explicitly pauses or stops; do not end supervision merely because one snapshot is inProgress. After every wake or deadline return, inspect the newly available events/state and decide whether steer, respond, or interruption is needed before starting the next bounded wait.",
+      "Read bounded live Bridge events, pending requests, and terminal output; persistent content belongs to codex_history. Continue with next_cursor, never substitute cursor_floor after loss. stream_lost means evicted streaming deltas; facts_lost means evicted other supervision events; cursor_lost summarizes either. Raw shows retained events, not a complete native stream. When runtime_available:true, pending_requests is a full snapshot and absence in compact means empty; when runtime_available:false, pending state is unknown. Judge terminals by terminal.status, not final_result or error presence. terminal.final_result_pending means continue via next_cursor for final content; incomplete final_result_meta needs History/native inspection. wait_ms is one bounded wait. No command output alone does not mean stalled. While inProgress, continue repeated bounded observe calls; after each wake/deadline inspect new state before choosing steer, respond, or interrupt.",
     inputSchema: {
       type: "object",
       properties: {
-        thread_id: { type: "string", minLength: 1, maxLength: 200, description: "Codex thread to observe." },
+        thread_id: { type: "string", minLength: 1, maxLength: 200, description: "Thread with live Bridge state." },
         cursor: {
           type: "integer",
           minimum: 0,
-          description: "Return runtime events with a cursor greater than this value.",
+          description: "Live numeric cursor; continue from next_cursor. Older values replay retained events; cursor_floor is not continuation.",
         },
         limit: {
           type: "integer",
           minimum: 1,
           maximum: 100,
           default: 50,
-          description: "Maximum runtime events to return.",
+          description: "Returned fact/event page size; loss may cover more than this page.",
         },
         wait_ms: {
           type: "integer",
@@ -248,7 +420,13 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
           maximum: MAX_OBSERVE_WAIT_MS,
           default: 0,
           description:
-            "Optional per-call wait for the next live runtime change when nothing useful is ready; 0 returns immediately. This is event-driven waiting, not stall detection.",
+            "One bounded wait; 0 reads immediately. Compact wakes for supervision facts or facts_lost, not stream_lost alone; waiting is not stall detection.",
+        },
+        view: {
+          type: "string",
+          enum: ["compact", "raw"],
+          default: "compact",
+          description: "Raw shows retained sanitized events with possible cursor gaps; neither view restores evicted events.",
         },
       },
       required: ["thread_id"],
@@ -266,7 +444,7 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
     name: "codex_steer",
     title: "Steer Active Codex Turn",
     description:
-      "Append text to the same active Codex turn using turn/steer with an expected turn-id precondition. This does not create a new turn. Do not steer merely because reasoning is taking a long time or no new command has appeared; steer only for a semantic redirect or correction based on new evidence or changed user intent. If an already-sent mutating acknowledgement times out, the outcome is UNKNOWN and the request was possibly accepted; observe/read before any retry, and never directly retry it.",
+      "Redirect or correct the exact active turn; this does not start a new turn. Do not steer for silence or elapsed time alone. A sent mutation timeout is UNKNOWN / possibly accepted: observe/read before another write; do not retry automatically.",
     inputSchema: {
       type: "object",
       properties: {
@@ -294,7 +472,7 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
     name: "codex_respond",
     title: "Respond to Codex Request",
     description:
-      "Answer one currently pending app-server server request by its original raw JSON-RPC id and exact thread/method scope. Supports stable item/commandExecution/requestApproval, item/fileChange/requestApproval, item/permissions/requestApproval, and item/tool/requestUserInput contracts, plus existing legacy execCommandApproval/applyPatchApproval compatibility. Unsupported or unknown methods fail locally and remain pending; do not guess a future response contract.",
+      "Answer one pending native request using its original typed request id and exact method, thread, and turn scope when applicable. Supported approval and user-input methods use their native response shapes. Unsupported methods fail locally and remain pending; do not guess a response shape.",
     inputSchema: {
       type: "object",
       properties: {
@@ -304,17 +482,27 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
         },
         thread_id: { type: "string", minLength: 1, maxLength: 200, description: "Exact pending-request thread scope." },
         turn_id: { type: "string", minLength: 1, maxLength: 200, description: "Exact turn scope when the pending request has one." },
-        method: { type: "string", minLength: 1, maxLength: 300, description: "Exact app-server request method." },
+        method: { type: "string", minLength: 1, maxLength: 300, description: "Supported: item/commandExecution/requestApproval, item/fileChange/requestApproval, item/permissions/requestApproval, item/tool/requestUserInput; legacy: execCommandApproval, applyPatchApproval." },
         decision: {
           type: "string",
           enum: ["accept", "acceptForSession", "decline", "cancel"],
-          description: "Command or file approval decision.",
+          description: "Command or file approval decision. decline rejects the action and continues the current turn; cancel rejects the action and immediately interrupts the current turn.",
         },
         execpolicy_amendment: {
           type: "array",
           minItems: 1,
           items: { type: "string" },
           description: "Command approval exec-policy amendment; encoded in app-server's native decision shape.",
+        },
+        network_policy_amendment: {
+          type: "object",
+          properties: {
+            host: { type: "string", minLength: 1 },
+            action: { type: "string", enum: ["allow", "deny"] },
+          },
+          required: ["host", "action"],
+          additionalProperties: false,
+          description: "Future network policy amendment for item/commandExecution/requestApproval only; use one response field per call.",
         },
         answers: {
           type: "object",
@@ -341,13 +529,14 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
         response: {
           type: "object",
           additionalProperties: true,
-          description: "Exact generic result object for item/tool/requestUserInput; unsupported or future methods remain pending and are rejected locally.",
+          description: "Exact result object for item/tool/requestUserInput; unsupported methods remain pending.",
         },
       },
       required: ["request_id", "thread_id", "method"],
       anyOf: [
         { required: ["decision"] },
         { required: ["execpolicy_amendment"] },
+        { required: ["network_policy_amendment"] },
         { required: ["answers"] },
         { required: ["permissions"] },
         { required: ["response"] },
@@ -366,7 +555,7 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
     name: "codex_interrupt",
     title: "Interrupt Codex Turn",
     description:
-      "Directly request turn/interrupt for the specified active Codex thread and turn. It does not stop or restart the Bridge or Codex app-server processes. If an already-sent mutating acknowledgement times out, the outcome is UNKNOWN and the request was possibly accepted; observe/read before any retry, and never directly retry it.",
+      "Interrupt the exact active native turn, without stopping Bridge or app-server. A sent mutation timeout is UNKNOWN / possibly accepted: observe/read before another write; do not retry automatically.",
     inputSchema: {
       type: "object",
       properties: {
@@ -388,7 +577,7 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
     name: "codex_checkpoint",
     title: "Checkpoint Codex Supervision",
     description:
-      "Optional, bounded supervisor cognition memory keyed to one native Codex thread_id; the key is not a permanent task identity and does not require future work to remain on that thread. Use it to protect the original goal, constraints, and acceptance plus concise supervisor state during long or complex supervision when context dilution or goal drift makes an external anchor worthwhile. Initialization is not tied to crossing a ChatGPT window or round, starting another Codex turn, or switching native threads; initialize early when a task is already expected to be sufficiently long or complex for that protection. Do not use for one-shot work, and do not turn duration into a hard threshold: elapsed time, observe/poll count, token count, or mere silence are not automatic triggers. Later updates remain semantic-event driven and require a material change in understanding or root cause, constraint or scope interpretation, steering decision, user-authorized amendment or effective goal, or acceptance judgment or an explicit decision not to accept yet. Before final acceptance of a checkpointed task, read it once to re-anchor the original goal, constraints, acceptance, and current supervisor frame. This tool is optional and uncoupled from all other tools. Store concise supervisor summaries only; never prompts, transcripts, raw events, command output, final answers, or raw event streams. Updates preserve only immutable original plus bounded previous/current supervisor state.",
+      "Optional bounded supervisor anchor keyed to a native thread; it is not a task identity or native Goal. Create early for long/complex supervision with expected context dilution or goal drift; skip one-shot work. Window changes, elapsed time, poll count, and silence are not mechanical triggers. Preserve original goal, constraints, and acceptance unchanged; update concise supervisor state only on material decisions. Do not store transcripts, raw events, or command output. Before final acceptance of a checkpointed task, read it once.",
     inputSchema: {
       type: "object",
       properties: {
@@ -396,41 +585,41 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
           type: "string",
           enum: ["read", "update"],
           description:
-            "Read the checkpoint, or initialize/update it at a material supervisor decision point.",
+            "Read or initialize/update at a material supervisor decision.",
         },
         thread_id: {
           type: "string",
           minLength: 1,
           maxLength: CHECKPOINT_THREAD_ID_LIMIT,
-          description: "Native Codex thread id; no second task identifier is created.",
+          description: "Native thread id; not a separate task identity.",
         },
         original_goal: {
           type: "string",
           minLength: 1,
           maxLength: CHECKPOINT_TEXT_LIMIT,
           description:
-            "Concise original user goal. Required only on initialization and immutable thereafter.",
+            "Original user goal; required on initialization, immutable afterward.",
         },
         original_constraints: {
           type: "string",
           minLength: 1,
           maxLength: CHECKPOINT_TEXT_LIMIT,
           description:
-            "Concise original constraints. Required only on initialization and immutable thereafter.",
+            "Original constraints; required on initialization, immutable afterward.",
         },
         original_acceptance: {
           type: "string",
           minLength: 1,
           maxLength: CHECKPOINT_TEXT_LIMIT,
           description:
-            "Concise original acceptance criteria. Required only on initialization and immutable thereafter.",
+            "Original acceptance criteria; required on initialization, immutable afterward.",
         },
         effective_goal: {
           type: "string",
           minLength: 1,
           maxLength: CHECKPOINT_TEXT_LIMIT,
           description:
-            "Current effective goal after legitimate user amendments; defaults to original_goal on initialization.",
+            "Effective goal after user amendments; initially original_goal.",
         },
         current_amendment: {
           oneOf: [
@@ -438,7 +627,7 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
             { type: "null" },
           ],
           description:
-            "Latest concise user-authorized requirement amendment, or null to clear it, without changing the immutable original.",
+            "Latest user-authorized amendment; null clears it without changing the original.",
         },
         current_understanding: {
           type: "string",
@@ -457,7 +646,7 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
           minLength: 1,
           maxLength: CHECKPOINT_TEXT_LIMIT,
           description:
-            "Concise acceptance assessment, not a task lifecycle or job status.",
+            "Acceptance assessment, not a task lifecycle status.",
         },
         next_step: {
           type: "string",
@@ -694,43 +883,6 @@ function extractApprovalPolicy(
   return effectiveApprovalPolicy;
 }
 
-function storedTerminal(threadResult: unknown): unknown {
-  const result = asObject(threadResult, "thread/read result");
-  const thread = asObject(result.thread, "thread/read result.thread");
-  const turns = Array.isArray(thread.turns) ? thread.turns : [];
-  const turn = turns.length > 0 ? asObject(turns.at(-1), "stored turn") : null;
-  if (!turn || typeof turn.id !== "string") {
-    return null;
-  }
-  const status = typeof turn.status === "string" ? turn.status : "unknown";
-  if (!["completed", "failed", "interrupted"].includes(status)) {
-    return null;
-  }
-  const items = Array.isArray(turn.items) ? turn.items : [];
-  let finalResult: string | null = null;
-  for (let index = items.length - 1; index >= 0; index -= 1) {
-    const item = items[index];
-    if (
-      item !== null &&
-      typeof item === "object" &&
-      !Array.isArray(item) &&
-      (item as Record<string, unknown>).type === "agentMessage" &&
-      typeof (item as Record<string, unknown>).text === "string"
-    ) {
-      finalResult = (item as Record<string, unknown>).text as string;
-      break;
-    }
-  }
-  return sanitizeForTransport({
-    turn_id: turn.id,
-    status,
-    completed_at: null,
-    final_result: finalResult,
-    error: turn.error ?? null,
-    source: "codex_app_server_thread_read",
-  });
-}
-
 function throwIfAborted(signal?: AbortSignal): void {
   if (signal?.aborted) {
     throw new Error("MCP request cancelled");
@@ -762,7 +914,7 @@ export class ControlSurface {
         ...binary,
         thread_cli_version: typeof thread.cliVersion === "string" ? thread.cliVersion : null,
         version_diagnostic: diagnoseCodexVersion(binary.cli_version, typeof thread.cliVersion === "string" ? thread.cliVersion : ""),
-        remediation: "Full history is unavailable: thread/read has no limit/cursor. Use codex_threads with thread_id and latest_messages (1..100) for bounded native items pagination, or the Desktop UI. No full turns or terminal are reconstructed.",
+        remediation: "Full history is unavailable: thread/read has no limit/cursor. Use codex_history for native persisted history, codex_threads with thread_id and latest_messages (1..100) for the bounded local compatibility view, or the Desktop UI. No full turns or terminal are reconstructed.",
       },
     } };
   }
@@ -775,10 +927,18 @@ export class ControlSurface {
   async call(name: string, rawArguments: unknown, signal?: AbortSignal): Promise<unknown> {
     const args = asObject(rawArguments ?? {});
     switch (name) {
+      case "codex_history":
+        return this.#history(args);
       case "codex_threads":
         return await this.#threads(args);
       case "codex_models":
         return await this.#models(args);
+      case "codex_goal":
+        return await this.#goal(args);
+      case "codex_queue":
+        return this.#queue(args);
+      case "codex_search":
+        return this.#search(args);
       case "codex_turn":
         return await this.#turn(args);
       case "codex_observe":
@@ -884,30 +1044,131 @@ export class ControlSurface {
     return this.checkpoints;
   }
 
+  async #history(args: Record<string, unknown>): Promise<unknown> {
+    onlyKeys(args, ["thread_id", "kind", "turn_id", "cursor", "limit", "sort_direction", "content_policy"]);
+    const policy = enumValue(args, "content_policy", ["protected", "exact"] as const) ?? "protected";
+    const threadId = requiredString(args, "thread_id", 200);
+    const kind = enumValue(args, "kind", ["turns", "items"]);
+    if (kind === undefined) throw new Error("kind is required");
+    if (kind === "turns" && Object.hasOwn(args, "turn_id")) {
+      throw new Error("turn_id is valid only for items");
+    }
+    const turnId = kind === "items" ? requiredString(args, "turn_id", 200) : undefined;
+    const cursor = optionalString(args, "cursor", 10_000);
+    const requestedLimit = optionalInteger(args, "limit", 1, kind === "turns" ? HISTORY_TURN_LIMIT : HISTORY_ITEM_LIMIT);
+    const sortDirection = enumValue(args, "sort_direction", ["asc", "desc"])
+      ?? (kind === "turns" ? "desc" : "asc");
+
+    // Native mode is read on demand, never cached in Bridge live state.
+    const metadata = await this.appServer.request("thread/read", { threadId, includeTurns: false });
+    const thread = asObject(responseRecord(metadata, "thread/read").thread, "thread/read result.thread");
+    const historyMode = thread.historyMode;
+    if (thread.id !== threadId || (historyMode !== "paginated" && historyMode !== "legacy")) {
+      throw new Error("history_upstream_invalid: metadata must identify the requested thread and a supported historyMode");
+    }
+    if (historyMode === "legacy") {
+      if (kind === "items") {
+        throw new Error("history_legacy_item_paging_unsupported: use codex_history with kind:'turns' for native one-full-turn pages; legacy has no item cursor");
+      }
+      if (requestedLimit !== undefined && requestedLimit !== 1) {
+        throw new Error("legacy history turn pages require limit:1");
+      }
+    }
+    const limit = requestedLimit ?? (historyMode === "legacy" ? 1 : kind === "turns" ? 20 : 10);
+    const itemsView = historyMode === "legacy" ? "full" : "notLoaded";
+    const page = validateHistoryPage(await this.appServer.request(
+      kind === "turns" ? "thread/turns/list" : "thread/items/list",
+      {
+        threadId,
+        ...(turnId ? { turnId } : {}),
+        ...(cursor ? { cursor } : {}),
+        limit,
+        sortDirection,
+        ...(kind === "turns" ? { itemsView } : {}),
+      },
+    ), limit, kind);
+    return exactHistoryResponse({
+      source: "codex_app_server",
+      mode: "history",
+      coverage: "native_persisted_history",
+      history_mode: historyMode,
+      kind,
+      page_granularity: kind === "turns" ? "turn" : "item",
+      ...(kind === "turns" ? { items_view: itemsView } : {}),
+      thread_id: threadId,
+      ...(turnId ? { turn_id: turnId } : {}),
+      data: page.data,
+      nextCursor: page.nextCursor,
+      backwardsCursor: page.backwardsCursor,
+    }, policy);
+  }
+
+  async #search(args: Record<string, unknown>): Promise<unknown> {
+    const kind = enumValue(args, "kind", ["threads", "occurrences"] as const);
+    if (!kind) throw new Error("kind is required");
+    const policy = enumValue(args, "content_policy", ["protected", "exact"] as const) ?? "protected";
+    onlyKeys(args, ["kind", "search_term", "cursor", "limit", "content_policy", ...(kind === "threads"
+      ? ["sort_key", "sort_direction", "source_kinds", "archived"] : ["thread_id"])]);
+    const limit = optionalInteger(args, "limit", 1, SEARCH_PAGE_LIMIT) ?? 20;
+    const params: Record<string, unknown> = { searchTerm: requiredString(args, "search_term", 500), limit };
+    const cursor = optionalString(args, "cursor", 10_000);
+    if (cursor !== undefined) params.cursor = cursor;
+    if (kind === "occurrences") {
+      params.threadId = requiredString(args, "thread_id", 200);
+    } else {
+      const sortKey = args.sort_key === null ? null : enumValue(args, "sort_key", ["created_at", "updated_at", "recency_at"] as const);
+      const sortDirection = args.sort_direction === null ? null : enumValue(args, "sort_direction", ["asc", "desc"] as const);
+      const archived = args.archived === null ? null : optionalBoolean(args, "archived");
+      const sourceKinds = args.source_kinds;
+      if (sourceKinds !== undefined && sourceKinds !== null && (
+        !Array.isArray(sourceKinds) || sourceKinds.length > 100 ||
+        sourceKinds.some(value => typeof value !== "string" || !(THREAD_SOURCE_KINDS as readonly string[]).includes(value))
+      )) throw new Error("source_kinds must be null or an array of at most 100 native source kinds");
+      if (sortKey !== undefined) params.sortKey = sortKey;
+      if (sortDirection !== undefined) params.sortDirection = sortDirection;
+      if (archived !== undefined) params.archived = archived;
+      if (sourceKinds !== undefined) params.sourceKinds = sourceKinds;
+    }
+    const method = kind === "threads" ? "thread/search" : "thread/searchOccurrences";
+    return exactSearchResponse(await this.appServer.request(method, params), kind, limit, policy);
+  }
+
   async #threads(args: Record<string, unknown>): Promise<unknown> {
-    onlyKeys(args, ["thread_id", "include_turns", "latest_messages", "cwd", "search_term", "cursor", "limit"]);
+    onlyKeys(args, ["thread_id", "include_turns", "latest_messages", ...THREAD_LIST_FIELDS]);
     const threadId = optionalString(args, "thread_id", 200);
     if (threadId) {
-      if (args.cwd !== undefined || args.search_term !== undefined || args.cursor !== undefined || args.limit !== undefined) {
+      if (THREAD_LIST_FIELDS.some((key) => Object.hasOwn(args, key))) {
         throw new Error("thread_id cannot be combined with list/search fields");
       }
       const includeTurns = optionalBoolean(args, "include_turns") ?? false;
       const latestMessages = optionalInteger(args, "latest_messages", 1, 100);
       if (includeTurns && latestMessages === undefined) {
-        throw new Error("Unbounded include_turns is disabled; provide latest_messages (1..100) for explicitly degraded bounded history");
+        throw new Error("include_turns:true unbounded history is disabled; use codex_history or provide latest_messages (1..100) for explicitly degraded bounded history");
       }
       const { result, degradation } = await this.#readHistory(threadId, includeTurns);
       const recent = latestMessages === undefined ? {} : { recent_messages: await this.#latestMessages(threadId, latestMessages) };
       return sanitizeForTransport({ source: "codex_app_server", mode: "read", ...responseRecord(result, "thread/read"), ...degradation, ...recent }, { maxArrayItems: 100 });
     }
     if (args.latest_messages !== undefined) throw new Error("latest_messages is valid only with thread_id");
-    if (args.include_turns !== undefined) {
+    if (Object.hasOwn(args, "include_turns")) {
       throw new Error("include_turns is valid only with thread_id");
     }
     const cwd = this.#cwd(args);
     const searchTerm = optionalString(args, "search_term", 500);
     const cursor = optionalString(args, "cursor", 10_000);
     const limit = optionalInteger(args, "limit", 1, 100) ?? 20;
+    const parentThreadId = args.parent_thread_id === null ? null : optionalString(args, "parent_thread_id", 200);
+    const ancestorThreadId = args.ancestor_thread_id === null ? null : optionalString(args, "ancestor_thread_id", 200);
+    if (parentThreadId != null && ancestorThreadId != null) {
+      throw new Error("parent_thread_id and ancestor_thread_id are mutually exclusive");
+    }
+    const sourceKinds = args.source_kinds;
+    if (sourceKinds !== undefined && sourceKinds !== null && (
+      !Array.isArray(sourceKinds) || sourceKinds.length > 100 ||
+      sourceKinds.some((kind) => typeof kind !== "string" || !(THREAD_SOURCE_KINDS as readonly string[]).includes(kind))
+    )) {
+      throw new Error("source_kinds must be null or an array of at most 100 native source kinds");
+    }
     const result = await this.appServer.request("thread/list", {
       limit,
       sortKey: "updated_at",
@@ -915,6 +1176,9 @@ export class ControlSurface {
       ...(cwd ? { cwd } : {}),
       ...(searchTerm ? { searchTerm } : {}),
       ...(cursor ? { cursor } : {}),
+      ...(parentThreadId !== undefined ? { parentThreadId } : {}),
+      ...(ancestorThreadId !== undefined ? { ancestorThreadId } : {}),
+      ...(sourceKinds !== undefined ? { sourceKinds } : {}),
     });
     const page = responseRecord(result, "thread/list");
     if (!Array.isArray(page.data)) {
@@ -1072,6 +1336,89 @@ export class ControlSurface {
     }
   }
 
+  async #goal(args: Record<string, unknown>): Promise<unknown> {
+    const action = enumValue(args, "action", ["get", "set", "clear"] as const);
+    if (!action) throw new Error("action is required");
+    onlyKeys(args, action === "set"
+      ? ["action", "thread_id", "objective", "status", "budget_mode", "token_budget"]
+      : ["action", "thread_id"]);
+    const threadId = requiredString(args, "thread_id", 200);
+    const params: Record<string, unknown> = { threadId };
+    if (action === "set") {
+      const mode = enumValue(args, "budget_mode", ["preserve", "unlimited", "fixed"] as const);
+      if (!mode) throw new Error("budget_mode is required for set: choose preserve, unlimited, or fixed explicitly");
+      if (mode === "fixed") {
+        if (!Number.isSafeInteger(args.token_budget) || (args.token_budget as number) < 1) {
+          throw new Error("fixed budget_mode requires a positive safe-integer token_budget; the maximum is a lossless transport bound");
+        }
+        params.tokenBudget = args.token_budget;
+      } else {
+        if (Object.hasOwn(args, "token_budget")) throw new Error("token_budget is accepted only with budget_mode=fixed");
+        if (mode === "unlimited") params.tokenBudget = null;
+      }
+      if (args.objective !== undefined) {
+        if (args.objective !== null && typeof args.objective !== "string") {
+          throw new Error("objective must be a string or null");
+        }
+        // Native validates objective length/emptiness; do not introduce a
+        // competing JavaScript character count, trim, or truncation rule.
+        params.objective = args.objective;
+      }
+      if (args.status !== undefined) {
+        params.status = args.status === null ? null : enumValue(args, "status", GOAL_STATUSES);
+      }
+    }
+    if (action === "set" && typeof params.objective === "string") {
+      preflightEcho({ goal: { threadId, objective: params.objective } }, MAX_GOAL_RESULT_BYTES, "goal");
+    }
+    const response = await this.appServer.request(`thread/goal/${action}`, params);
+    return exactGoalResponse(response, action, threadId);
+  }
+
+  async #queue(args: Record<string, unknown>): Promise<unknown> {
+    const action = enumValue(args, "action", QUEUE_ACTIONS);
+    if (!action) throw new Error("action is required");
+    const fields = {
+      list: ["cursor", "limit"], add: ["text", "client_user_message_id"],
+      update: ["text", "queued_submission_id"], delete: ["queued_submission_id"],
+      reorder: ["queued_submission_ids"],
+    };
+    onlyKeys(args, ["action", "thread_id", ...fields[action]]);
+    const params: Record<string, unknown> = { threadId: requiredString(args, "thread_id", 200) };
+    const expected: { submissionId?: string; clientUserMessageId?: string } = {};
+    if (action === "list") {
+      params.limit = optionalInteger(args, "limit", 1, QUEUE_PAGE_LIMIT) ?? 20;
+      const cursor = optionalString(args, "cursor", 10_000);
+      if (cursor !== undefined) params.cursor = cursor;
+    }
+    if (action === "add" || action === "update") {
+      params.input = [{ type: "text", text: requiredString(args, "text"), text_elements: [] }];
+    }
+    if (action === "add") {
+      expected.clientUserMessageId = requiredString(args, "client_user_message_id", 200);
+      params.clientUserMessageId = expected.clientUserMessageId;
+    }
+    if (action === "update" || action === "delete") {
+      expected.submissionId = requiredString(args, "queued_submission_id", 200);
+      params.queuedSubmissionId = expected.submissionId;
+    }
+    if (action === "reorder") {
+      const ids = args.queued_submission_ids;
+      if (!Array.isArray(ids) || ids.length > QUEUE_PAGE_LIMIT || ids.some(id =>
+        typeof id !== "string" || id.trim().length === 0 || id.length > 200)) {
+        throw new Error("queued_submission_ids must be an array of at most 100 non-empty native IDs, each at most 200 characters");
+      }
+      params.queuedSubmissionIds = ids;
+    }
+    if (action === "add" || action === "update") {
+      const item = { id: expected.submissionId ?? "", input: params.input, clientUserMessageId: expected.clientUserMessageId ?? "" };
+      // A one-item list must fit too; reserve covers currently unknown fields.
+      preflightEcho({ data: [item], nextCursor: null }, MAX_QUEUE_RESULT_BYTES, "queue");
+    }
+    const response = await this.appServer.request("thread/queue/" + action, params);
+    return exactQueueResponse(response, action, expected);
+  }
+
   async #turn(args: Record<string, unknown>): Promise<unknown> {
     onlyKeys(args, ["text", "thread_id", "cwd", "model", "effort", "sandbox", "approval_policy"]);
     const text = requiredString(args, "text");
@@ -1097,6 +1444,7 @@ export class ControlSurface {
     const threadResult = requestedThreadId
       ? await this.appServer.request("thread/resume", {
           threadId: requestedThreadId,
+          excludeTurns: true,
           ...overrides,
         })
       : await this.appServer.request("thread/start", {
@@ -1138,14 +1486,18 @@ export class ControlSurface {
 
   async #observe(args: Record<string, unknown>, signal?: AbortSignal): Promise<unknown> {
     throwIfAborted(signal);
-    onlyKeys(args, ["thread_id", "cursor", "limit", "wait_ms"]);
+    onlyKeys(args, ["thread_id", "cursor", "limit", "wait_ms", "view"]);
     const threadId = requiredString(args, "thread_id", 200);
     const cursor = optionalInteger(args, "cursor", 0, Number.MAX_SAFE_INTEGER);
     const limit = optionalInteger(args, "limit", 1, 100) ?? 50;
     const waitMs = optionalInteger(args, "wait_ms", 0, MAX_OBSERVE_WAIT_MS) ?? 0;
-    const runtime = waitMs === 0
-      ? this.appServer.runtime.observe(threadId, cursor, limit)
-      : await this.appServer.runtime.observeWithWait(threadId, cursor, limit, waitMs, signal);
+    const view = args.view ?? "compact";
+    if (view !== "compact" && view !== "raw") throw new Error("view must be compact or raw");
+    const runtime = view === "compact"
+      ? await this.appServer.runtime.observeCompactWithWait(threadId, cursor, limit, waitMs, signal)
+      : waitMs === 0
+        ? this.appServer.runtime.observe(threadId, cursor, limit)
+        : await this.appServer.runtime.observeWithWait(threadId, cursor, limit, waitMs, signal);
     throwIfAborted(signal);
     if (runtime) {
       return runtime;
@@ -1153,10 +1505,11 @@ export class ControlSurface {
     throwIfAborted(signal);
     const { result, degradation } = await this.#readHistory(threadId, true);
     throwIfAborted(signal);
+    const storedThread = asObject(responseRecord(result, "thread/read").thread, "thread/read result.thread");
     return sanitizeForTransport({
       runtime_available: false,
       live_state_reconstructable: false,
-      note: "This Bridge process has no in-memory runtime for the thread. Live event ring and pending requests cannot be reconstructed after process loss.",
+      note: "This Bridge process has no live runtime for the thread. Live events, pending requests, live cursor, active turn, and terminal are unknown. Page persisted history with codex_history.",
       runtime_status: "not_reconstructable",
       active_turn_id: null,
       events: [],
@@ -1164,11 +1517,14 @@ export class ControlSurface {
       current_cursor: 0,
       cursor_floor: 0,
       cursor_lost: false,
+      stream_lost: false,
+      facts_lost: false,
       has_more: false,
       pending_requests: [],
-      terminal: degradation ? null : storedTerminal(result),
-      stored_thread: responseRecord(result, "thread/read").thread,
-      source: "codex_app_server_thread_read",
+      terminal: null,
+      unavailable_live_fields: ["active_turn_id", "terminal", "events", "next_cursor", "current_cursor", "cursor_floor", "cursor_lost", "stream_lost", "facts_lost", "has_more", "pending_requests"],
+      stored_thread: { ...storedThread, turns: [] },
+      source: "codex_app_server_thread_read_metadata",
       ...degradation,
     });
   }
@@ -1203,6 +1559,7 @@ export class ControlSurface {
       "method",
       "decision",
       "execpolicy_amendment",
+      "network_policy_amendment",
       "answers",
       "permissions",
       "scope",
@@ -1226,10 +1583,14 @@ export class ControlSurface {
     }
     const decision = enumValue(args, "decision", ["accept", "acceptForSession", "decline", "cancel"] as const);
     const amendment = args.execpolicy_amendment;
+    const networkAmendment = args.network_policy_amendment;
     const answers = args.answers;
     const permissions = args.permissions;
     const scope = enumValue(args, "scope", ["turn", "session"] as const);
     const generic = args.response;
+    if (networkAmendment !== undefined && method !== "item/commandExecution/requestApproval") {
+      throw new Error("network_policy_amendment is valid only for item/commandExecution/requestApproval");
+    }
 
     let response: Record<string, unknown> | undefined;
     if (method === "item/permissions/requestApproval") {
@@ -1255,11 +1616,12 @@ export class ControlSurface {
       const supplied = [
         decision !== undefined,
         amendment !== undefined,
+        networkAmendment !== undefined,
         answers !== undefined,
         generic !== undefined,
       ].filter(Boolean).length;
       if (supplied !== 1) {
-        throw new Error("Provide exactly one of decision, execpolicy_amendment, answers, or response");
+        throw new Error("Provide exactly one of decision, execpolicy_amendment, network_policy_amendment, answers, or response");
       }
     }
 
@@ -1271,7 +1633,16 @@ export class ControlSurface {
       method === "execCommandApproval" ||
       method === "applyPatchApproval"
     ) {
-      if (amendment !== undefined) {
+      if (networkAmendment !== undefined) {
+        const value = asObject(networkAmendment, "network_policy_amendment");
+        onlyKeys(value, ["host", "action"]);
+        const host = requiredString(value, "host");
+        const action = enumValue(value, "action", ["allow", "deny"] as const);
+        if (action === undefined) {
+          throw new Error("network_policy_amendment requires action");
+        }
+        response = { decision: { applyNetworkPolicyAmendment: { network_policy_amendment: { host, action } } } };
+      } else if (amendment !== undefined) {
         if (method !== "item/commandExecution/requestApproval" && method !== "execCommandApproval") {
           throw new Error("execpolicy_amendment is valid only for command approval");
         }
@@ -1307,7 +1678,7 @@ export class ControlSurface {
           response = { decision };
         }
       } else {
-        throw new Error("Approval requests require decision or execpolicy_amendment");
+        throw new Error("Approval requests require decision, execpolicy_amendment, or network_policy_amendment");
       }
     } else if (method === "item/tool/requestUserInput") {
       response = answers !== undefined ? { answers: asObject(answers, "answers") } : asObject(generic, "response");

@@ -144,7 +144,7 @@ lines.on("line", (line) => {
       id: message.id,
       result: {
         thread: {
-          id: message.params.threadId,
+          id: message.params.threadId, historyMode: "paginated",
           status: { type: "notLoaded" },
           turns: message.params.includeTurns
             ? [{ id: "stored-turn", status: "completed", items: [{ type: "agentMessage", text: "STORED_OK" }] }]
@@ -152,6 +152,10 @@ lines.on("line", (line) => {
         },
       },
     });
+    return;
+  }
+  if (message.method === "thread/turns/list" && message.params.cursor === "oversized-inbound") {
+    send({ id: message.id, result: { data: [{ id: "turn-big", text: "x".repeat(10 * 1024 * 1024 + 1) }], nextCursor: null, backwardsCursor: null } });
     return;
   }
   if (message.method === "test/exit") {

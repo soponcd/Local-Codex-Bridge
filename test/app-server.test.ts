@@ -19,6 +19,31 @@ const pendingWriteCodex = fileURLToPath(new URL("../../test/pending-write-codex.
 const lateResponseCodex = fileURLToPath(new URL("../../test/late-response-codex.mjs", import.meta.url));
 const duplicateRequestCodex = fileURLToPath(new URL("../../test/duplicate-request-codex.mjs", import.meta.url));
 
+test("history response above 10 MiB remains a fatal app-server inbound limitation", async () => {
+  const manager = new AppServerManager(undefined, {
+    executable: process.execPath,
+    prefixArgs: [fakeCodex],
+    requestTimeoutMs: 5_000,
+  });
+  try {
+    await assert.rejects(
+      new ControlSurface(manager).call("codex_history", {
+        thread_id: "thread-big", kind: "turns", cursor: "oversized-inbound", limit: 1,
+      }),
+      /app-server JSONL line exceeded 10 MiB/,
+    );
+    // Let the fixture exit after protocol failure; it must not replace the cause.
+    await delay(100);
+    await assert.rejects(manager.request("thread/resume", { threadId: "thread-big", excludeTurns: true }),
+      /unavailable and will not be auto-restarted: app-server JSONL line exceeded 10 MiB/);
+    const metadata = await manager.request("thread/read", { threadId: "thread-big", includeTurns: false });
+    assert.ok(metadata);
+    assert.equal(manager.transportDiagnostics.recovery_used, true);
+  } finally {
+    await manager.close();
+  }
+});
+
 function delay(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
@@ -122,11 +147,21 @@ test("control surface starts asynchronously, steers the same turn, uses raw requ
     );
 
     await delay(30);
-    const completed = await control.call("codex_observe", {
-      thread_id: "thread-1",
-    }) as Record<string, unknown>;
-    assert.equal(completed.runtime_status, "completed");
-    assert.equal((completed.terminal as Record<string, unknown>).final_result, "FAKE_FINAL");
+    let cursor = active.next_cursor as number;
+    let observedFinal: string | undefined;
+    for (let attempt = 0; attempt < 10 && observedFinal === undefined; attempt += 1) {
+      const completed = await control.call("codex_observe", {
+        thread_id: "thread-1", cursor,
+      }) as Record<string, unknown>;
+      assert.equal(completed.runtime_status, "completed");
+      const events = (completed.events ?? []) as Array<Record<string, unknown>>;
+      const message = events.find((entry) => entry.type === "message");
+      observedFinal = (message?.text ?? (completed.terminal as Record<string, unknown>)?.final_result) as string | undefined;
+      const next = completed.next_cursor as number;
+      if (next === cursor) break;
+      cursor = next;
+    }
+    assert.equal(observedFinal, "FAKE_FINAL");
   } finally {
     await manager.close();
   }
@@ -191,6 +226,119 @@ test("failed app-server response write restores the original pending request", a
     const pending = manager.runtime.pendingForThread("thread-restore") as Array<Record<string, unknown>>;
     assert.equal(pending.length, 1);
     assert.equal(pending[0]?.request_id, 41);
+  } finally {
+    await manager.close();
+  }
+});
+
+test("codex_respond maps network allow/deny and preserves distinct stable and legacy decisions", async () => {
+  const manager = new CapturingResponseManager();
+  const control = new ControlSurface(manager, undefined, WINDOWS_PLATFORM_POLICY);
+  const command = "item/commandExecution/requestApproval";
+  const cases: Array<{ method: string; input: Record<string, unknown>; decision: unknown }> = [];
+  for (const action of ["allow", "deny"]) {
+    const amendment = { host: "api.example.com", action };
+    cases.push({ method: command, input: { network_policy_amendment: amendment },
+      decision: { applyNetworkPolicyAmendment: { network_policy_amendment: amendment } } });
+  }
+  for (const method of [command, "item/fileChange/requestApproval", "execCommandApproval", "applyPatchApproval"]) {
+    for (const decision of ["accept", "acceptForSession", "decline", "cancel"]) {
+      const legacy: Record<string, unknown> = {
+        accept: "approved", acceptForSession: "approved_for_session",
+        decline: { denied: { rejection: "declined by MCP client" } }, cancel: "abort",
+      };
+      cases.push({ method, input: { decision }, decision: method.startsWith("item/") ? decision : legacy[decision] });
+    }
+  }
+  for (const method of [command, "execCommandApproval"]) {
+    cases.push({ method, input: { execpolicy_amendment: ["npm", "test"] },
+      decision: method === command
+        ? { acceptWithExecpolicyAmendment: { execpolicy_amendment: ["npm", "test"] } }
+        : { approved_execpolicy_amendment: { proposed_execpolicy_amendment: ["npm", "test"] } } });
+  }
+  manager.runtime.markTurnAccepted("thread-network", "turn-network");
+  try {
+    for (const [id, current] of cases.entries()) {
+      manager.runtime.recordServerRequest(id, current.method, { threadId: "thread-network", turnId: "turn-network" });
+      await control.call("codex_respond", {
+        request_id: id, thread_id: "thread-network", turn_id: "turn-network", method: current.method, ...current.input,
+      });
+      assert.deepEqual(manager.responses.at(-1), { id, result: { decision: current.decision } });
+      assert.deepEqual(manager.runtime.pendingForThread("thread-network"), []);
+    }
+  } finally {
+    await manager.close();
+  }
+});
+
+test("codex_respond rejects invalid network amendments before claiming pending requests", async (t) => {
+  const command = "item/commandExecution/requestApproval";
+  const valid = { host: "api.example.com", action: "allow" };
+  const cases: Array<{ name: string; method?: string; input: Record<string, unknown>; error: RegExp }> = [];
+  for (const [name, amendment, error] of [
+    ["missing host", { action: "allow" }, /host must be a non-empty string/],
+    ["empty host", { host: "", action: "allow" }, /host must be a non-empty string/],
+    ["blank host", { host: "  ", action: "allow" }, /host must be a non-empty string/],
+    ["non-string host", { host: 7, action: "allow" }, /host must be a non-empty string/],
+    ["missing action", { host: valid.host }, /requires action/],
+    ["invalid action", { host: valid.host, action: "accept" }, /action must be one of: allow, deny/],
+    ["non-string action", { host: valid.host, action: true }, /action must be one of: allow, deny/],
+    ["extra property", { ...valid, persist: true }, /Unknown argument field: persist/],
+    ["null amendment", null, /network_policy_amendment must be an object/],
+    ["array amendment", [], /network_policy_amendment must be an object/],
+    ["string amendment", "allow", /network_policy_amendment must be an object/],
+  ] as const) {
+    cases.push({ name, input: { network_policy_amendment: amendment }, error });
+  }
+  for (const method of ["item/fileChange/requestApproval", "execCommandApproval", "applyPatchApproval",
+    "item/tool/requestUserInput", "item/permissions/requestApproval", "future/requestApproval"]) {
+    cases.push({ name: `wrong method ${method}`, method, input: { network_policy_amendment: valid },
+      error: /valid only for item\/commandExecution\/requestApproval|Unsupported app-server request method/ });
+  }
+  for (const [selector, value] of Object.entries({ decision: "accept", execpolicy_amendment: ["npm"],
+    answers: {}, permissions: {}, response: {}, scope: "session" })) {
+    cases.push({ name: `conflicting ${selector}`, input: { network_policy_amendment: valid, [selector]: value },
+      error: /Provide exactly one|permissions and scope are valid only/ });
+  }
+  for (const current of cases) {
+    await t.test(current.name, async (t) => {
+      const manager = new CapturingResponseManager();
+      const control = new ControlSurface(manager, undefined, WINDOWS_PLATFORM_POLICY);
+      const method = current.method ?? command;
+      manager.runtime.markTurnAccepted("thread-network", "turn-network");
+      manager.runtime.recordServerRequest(41, method, { threadId: "thread-network", turnId: "turn-network" });
+      const before = manager.runtime.pendingForThread("thread-network");
+      const claim = t.mock.method(manager.runtime, "claimPending");
+      try {
+        await assert.rejects(control.call("codex_respond", {
+          request_id: 41, thread_id: "thread-network", turn_id: "turn-network", method, ...current.input,
+        }), current.error);
+        assert.equal(claim.mock.callCount(), 0);
+        assert.deepEqual(manager.responses, []);
+        assert.deepEqual(manager.runtime.pendingForThread("thread-network"), before);
+      } finally {
+        await manager.close();
+      }
+    });
+  }
+});
+
+test("failed network amendment response write retains the same pending request", async () => {
+  const manager = new RejectingResponseManager();
+  const control = new ControlSurface(manager, undefined, WINDOWS_PLATFORM_POLICY);
+  const method = "item/commandExecution/requestApproval";
+  manager.runtime.markTurnAccepted("thread-network", "turn-network");
+  manager.runtime.recordServerRequest(41, method, { threadId: "thread-network", turnId: "turn-network" });
+  const before = manager.runtime.pendingForThread("thread-network");
+  try {
+    await assert.rejects(control.call("codex_respond", {
+      request_id: 41, thread_id: "thread-network", turn_id: "turn-network", method,
+      network_policy_amendment: { host: "api.example.com", action: "deny" },
+    }), /synthetic app-server response write failure/);
+    assert.equal(manager.lastResponseId, 41);
+    assert.deepEqual(manager.runtime.pendingForThread("thread-network"), before);
+    const pending = manager.runtime.claimPending(41, { threadId: "thread-network", turnId: "turn-network", method });
+    manager.runtime.releasePending(pending);
   } finally {
     await manager.close();
   }
@@ -351,7 +499,7 @@ test("mutating app-server acknowledgement timeouts report unknown outcome withou
     requestTimeoutMs: 20,
   });
   try {
-    for (const method of ["thread/start", "thread/resume", "turn/start", "turn/steer", "turn/interrupt"]) {
+    for (const method of ["thread/start", "thread/resume", "turn/start", "turn/steer", "turn/interrupt", "thread/goal/set", "thread/goal/clear", "thread/queue/add", "thread/queue/update", "thread/queue/delete", "thread/queue/reorder"]) {
       await assert.rejects(
         manager.request(method, {}),
         (error: unknown) => {
@@ -366,9 +514,17 @@ test("mutating app-server acknowledgement timeouts report unknown outcome withou
       manager.request("thread/list", {}),
       /Codex app-server request timed out: thread\/list/,
     );
+    await assert.rejects(manager.request("thread/goal/get", {}), /Codex app-server request timed out: thread\/goal\/get/);
+    await assert.rejects(manager.request("thread/queue/list", {}), /Codex app-server request timed out: thread\/queue\/list/);
+    for (const method of ["thread/search", "thread/searchOccurrences"]) {
+      await assert.rejects(manager.request(method, {}), error => {
+        assert.match(String(error), /Codex app-server request timed out:/);
+        assert.doesNotMatch(String(error), /UNKNOWN|possibly accepted/); return true;
+      });
+    }
     const count = await manager.request("test/count", {}) as Record<string, unknown>;
     // App-server startup sends initialize plus the initialized notification.
-    assert.equal(count.requestCount, 9);
+    assert.equal(count.requestCount, 19);
   } finally {
     await manager.close();
   }
@@ -675,11 +831,11 @@ test("unsupported elicitation requests remain observable and are never answered"
 
 test("codex_respond metadata does not advertise generic future-method responses", () => {
   const respondTool = TOOL_DEFINITIONS.find((tool) => tool.name === "codex_respond");
-  assert.match(respondTool?.description ?? "", /Unsupported or unknown methods fail locally and remain pending/);
-  assert.match(respondTool?.description ?? "", /item\/permissions\/requestApproval/);
+  assert.match(respondTool?.description ?? "", /original typed request id and exact method, thread, and turn scope when applicable/);
+  assert.match(respondTool?.description ?? "", /Unsupported methods fail locally and remain pending/);
   assert.doesNotMatch(respondTool?.description ?? "", /elicitation/i);
   const response = (respondTool?.inputSchema.properties as Record<string, unknown>).response as Record<string, unknown>;
-  assert.match(response.description as string, /unsupported or future methods remain pending/);
+  assert.match(response.description as string, /unsupported methods remain pending/);
 });
 
 test("serialized app-server writes preserve order and wait for drain", async () => {

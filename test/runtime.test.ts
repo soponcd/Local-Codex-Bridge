@@ -46,6 +46,244 @@ function controlFor(runtime: RuntimeStore): ControlSurface {
   return new ControlSurface(appServer);
 }
 
+const RING_THREAD = "thread-retention";
+const RING_TURN = "turn-retention";
+const OUTPUT_DELTA = "item/commandExecution/outputDelta";
+
+function appendRingDelta(runtime: RuntimeStore, index: number): void {
+  runtime.recordNotification(OUTPUT_DELTA, {
+    threadId: RING_THREAD,
+    turnId: RING_TURN,
+    itemId: `command-${index % 5}`,
+    delta: `output-${index}`,
+  });
+}
+
+function appendRingFact(runtime: RuntimeStore, index: number): void {
+  runtime.recordNotification("warning", {
+    threadId: RING_THREAD,
+    turnId: RING_TURN,
+    message: `fact-${index}`,
+  });
+}
+
+function retainedCursors(runtime: RuntimeStore): number[] {
+  return runtime.observe(RING_THREAD, 0, 100)!.events.map((event) => event.cursor);
+}
+
+test("class-aware ring keeps recent facts through large interleaved delta bursts", () => {
+  const runtime = new RuntimeStore(4);
+  const facts: number[] = [];
+  for (let fact = 0; fact < 8; fact += 1) {
+    appendRingFact(runtime, fact);
+    facts.push(runtime.currentCursor(RING_THREAD));
+    for (let delta = 0; delta < 300; delta += 1) {
+      appendRingDelta(runtime, fact * 300 + delta);
+      const observed = runtime.observe(RING_THREAD, 0, 100)!;
+      assert.ok(observed.events.length <= 4);
+      assert.deepEqual(
+        observed.events.filter((event) => event.method !== OUTPUT_DELTA).map((event) => event.cursor),
+        facts.slice(-3),
+      );
+      assert.equal(observed.events.at(-1)?.cursor, runtime.currentCursor(RING_THREAD));
+    }
+  }
+  const observed = runtime.observe(RING_THREAD, 0, 100)!;
+  assert.equal(observed.stream_lost, true);
+  assert.equal(observed.facts_lost, true);
+  assert.equal(observed.events.at(-1)?.method, OUTPUT_DELTA);
+  assert.deepEqual(observed.events.at(-1)?.data, {
+    threadId: RING_THREAD, turnId: RING_TURN, itemId: "command-4", delta: "output-2399",
+  });
+});
+
+test("class-aware ring uses FIFO within each class and keeps the last delta through fact pressure", () => {
+  const runtime = new RuntimeStore(4);
+  appendRingDelta(runtime, 1);
+  appendRingDelta(runtime, 2);
+  appendRingDelta(runtime, 3);
+  appendRingDelta(runtime, 4);
+  assert.deepEqual(retainedCursors(runtime), [1, 2, 3, 4]);
+  appendRingFact(runtime, 5);
+  assert.deepEqual(retainedCursors(runtime), [2, 3, 4, 5]);
+  appendRingFact(runtime, 6);
+  assert.deepEqual(retainedCursors(runtime), [3, 4, 5, 6]);
+  appendRingFact(runtime, 7);
+  assert.deepEqual(retainedCursors(runtime), [4, 5, 6, 7]);
+  appendRingFact(runtime, 8);
+  assert.deepEqual(retainedCursors(runtime), [4, 6, 7, 8]);
+  appendRingDelta(runtime, 9);
+  assert.deepEqual(retainedCursors(runtime), [6, 7, 8, 9]);
+});
+
+test("unknown, malformed delta, warning, and ordinary status remain facts", () => {
+  const cases: Array<[string, Record<string, unknown>]> = [
+    ["future/outputDelta", { itemId: "unknown", delta: "ordinary output" }],
+    [OUTPUT_DELTA, { itemId: "malformed", delta: 17 }],
+    [OUTPUT_DELTA, { delta: "missing item identity" }],
+    ["warning", { message: "ordinary output" }],
+    ["thread/status/changed", { status: { type: "active", activeFlags: [] } }],
+    ["item/reasoning/summaryPartAdded", { itemId: "reasoning", summaryIndex: 0 }],
+    ["item/mcpToolCall/progress", { itemId: "tool", message: "ordinary output" }],
+  ];
+  for (const [method, params] of cases) {
+    const runtime = new RuntimeStore(2);
+    runtime.recordNotification(method, { threadId: RING_THREAD, turnId: RING_TURN, ...params });
+    for (let index = 0; index < 20; index += 1) appendRingDelta(runtime, index);
+    const observed = runtime.observe(RING_THREAD, 0, 100)!;
+    assert.deepEqual(observed.events.map((event) => event.cursor), [1, 21], method);
+    assert.equal(observed.events[0]?.method, method);
+    assert.equal(observed.facts_lost, false, method);
+    assert.equal(observed.stream_lost, true, method);
+  }
+});
+
+test("only valid allowlisted pure delta shapes share stream capacity", () => {
+  const itemScope = { threadId: RING_THREAD, turnId: RING_TURN, itemId: "stream" };
+  const cases: Array<[string, Record<string, unknown>]> = [
+    ["item/agentMessage/delta", { ...itemScope, delta: "warning approval ERROR" }],
+    ["item/plan/delta", { ...itemScope, delta: "plan" }],
+    [OUTPUT_DELTA, { ...itemScope, delta: "output" }],
+    ["item/fileChange/outputDelta", { ...itemScope, delta: "patch" }],
+    ["item/reasoning/summaryTextDelta", { ...itemScope, delta: "summary", summaryIndex: 0 }],
+    ["item/reasoning/textDelta", { ...itemScope, delta: "thinking", contentIndex: 0 }],
+    ["command/exec/outputDelta", { processId: "process", stream: "stdout", deltaBase64: "eA==", capReached: false }],
+    ["process/outputDelta", { processHandle: "process", stream: "stderr", deltaBase64: "eA==", capReached: false }],
+  ];
+  for (const [method, params] of cases) {
+    const runtime = new RuntimeStore(2);
+    runtime.markTurnAccepted(RING_THREAD, RING_TURN);
+    appendRingFact(runtime, 0);
+    for (let index = 0; index < 12; index++) runtime.recordNotification(method, params);
+    const observed = runtime.observe(RING_THREAD, 0, 100)!;
+    assert.deepEqual(observed.events.map((entry) => entry.cursor), [1, 13], method);
+    assert.equal(observed.stream_lost, true, method);
+    assert.equal(observed.facts_lost, false, method);
+    assert.equal(observed.events[1]?.method, method);
+    assert.deepEqual(observed.events[1]?.data, params);
+    assert.equal(JSON.stringify(observed.events).includes('"streamDelta"'), false);
+  }
+  for (const [method, params] of cases.slice(-2)) {
+    const runtime = new RuntimeStore(2);
+    runtime.markTurnAccepted(RING_THREAD, RING_TURN);
+    runtime.recordNotification(method, { ...params, capReached: true });
+    for (let index = 0; index < 12; index++) runtime.recordNotification(method, params);
+    const observed = runtime.observe(RING_THREAD, 0, 100)!;
+    assert.deepEqual(observed.events.map((entry) => entry.cursor), [1, 13], `${method} cap flag is a fact`);
+    assert.equal(observed.facts_lost, false);
+    assert.equal((observed.events[0]?.data as Record<string, unknown>).capReached, true);
+  }
+  for (const capacity of [0, 1, 1.5]) assert.throws(() => new RuntimeStore(capacity), /at least 2/);
+});
+
+test("sparse raw pagination preserves internal records and reports loss over the unread suffix", () => {
+  const runtime = new RuntimeStore(4);
+  for (const [index, kind] of [..."FDFDDFDD"].entries()) {
+    if (kind === "F") appendRingFact(runtime, index);
+    else appendRingDelta(runtime, index);
+  }
+  assert.deepEqual(retainedCursors(runtime), [1, 3, 6, 8]);
+  for (let start = 0; start <= 8; start += 1) {
+    for (const limit of [1, 2, 3, 4]) {
+      let cursor = start;
+      const seen: number[] = [];
+      for (let page = 0; page < 5; page += 1) {
+        const observed = runtime.observe(RING_THREAD, cursor, limit)!;
+        assert.equal(observed.cursor_floor, 0);
+        assert.equal(observed.stream_lost, cursor < 7);
+        assert.equal(observed.facts_lost, false);
+        assert.equal(observed.cursor_lost, observed.stream_lost);
+        assert.deepEqual(observed.events.map((event) => event.cursor), [1, 3, 6, 8].filter((value) => value > cursor).slice(0, limit));
+        seen.push(...observed.events.map((event) => event.cursor));
+        if (observed.events.length > 0) assert.equal(observed.next_cursor, observed.events.at(-1)?.cursor);
+        if (!observed.has_more) break;
+        assert.ok(observed.next_cursor > cursor, "a sparse page must make progress");
+        cursor = observed.next_cursor;
+        assert.ok(page < 4, "sparse pagination must terminate");
+      }
+      assert.deepEqual(seen, [1, 3, 6, 8].filter((value) => value > start));
+    }
+  }
+  appendRingFact(runtime, 9);
+  assert.deepEqual(retainedCursors(runtime), [3, 6, 8, 9]);
+  assert.equal(runtime.observe(RING_THREAD, 0, 1)?.facts_lost, true);
+  assert.equal(runtime.observe(RING_THREAD, 1, 1)?.facts_lost, false);
+  assert.equal(runtime.observe(RING_THREAD, 1, 1)?.stream_lost, true);
+  assert.equal(runtime.observe(RING_THREAD, 7, 1)?.cursor_lost, false);
+});
+
+test("small actual runtime rings satisfy retention and cursor properties for every short D/F sequence", () => {
+  const length = 7;
+  for (let capacity = 2; capacity <= 5; capacity += 1) {
+    for (let bits = 0; bits < 2 ** length; bits += 1) {
+      const runtime = new RuntimeStore(capacity);
+      const facts: number[] = [];
+      const deltas: number[] = [];
+      for (let index = 0; index < length; index += 1) {
+        if ((bits & (1 << index)) === 0) {
+          appendRingFact(runtime, index);
+          facts.push(index + 1);
+        } else {
+          appendRingDelta(runtime, index);
+          deltas.push(index + 1);
+        }
+        assert.equal(runtime.currentCursor(RING_THREAD), index + 1);
+        const retainedFacts = facts.slice(-(capacity - 1));
+        const retainedDeltas = deltas.slice(-(capacity - retainedFacts.length));
+        const expected = [...retainedFacts, ...retainedDeltas].sort((a, b) => a - b);
+        assert.deepEqual(retainedCursors(runtime), expected, `R=${capacity}, bits=${bits}, prefix=${index + 1}`);
+        assert.ok(expected.length <= capacity);
+      }
+      const retained = retainedCursors(runtime);
+      const lastDroppedD = deltas.filter((cursor) => !retained.includes(cursor)).at(-1) ?? 0;
+      const lastDroppedF = facts.filter((cursor) => !retained.includes(cursor)).at(-1) ?? 0;
+      for (let start = 0; start <= length; start += 1) {
+        for (let limit = 1; limit <= capacity; limit += 1) {
+          let cursor = start;
+          const seen: number[] = [];
+          for (let page = 0; page <= capacity; page += 1) {
+            const observed = runtime.observe(RING_THREAD, cursor, limit)!;
+            assert.equal(observed.stream_lost, lastDroppedD > cursor);
+            assert.equal(observed.facts_lost, lastDroppedF > cursor);
+            assert.equal(observed.cursor_lost, lastDroppedD > cursor || lastDroppedF > cursor);
+            seen.push(...observed.events.map((event) => event.cursor));
+            if (!observed.has_more) break;
+            assert.ok(observed.next_cursor > cursor);
+            cursor = observed.next_cursor;
+            assert.ok(page < capacity, "actual runtime pagination must terminate");
+          }
+          assert.deepEqual(seen, retained.filter((value) => value > start));
+        }
+      }
+      assert.deepEqual(retainedCursors(runtime), retained, "observers must not mutate retention");
+    }
+  }
+});
+
+test("pending request remains actionable after its original fact is evicted", () => {
+  const runtime = new RuntimeStore(3);
+  runtime.markTurnAccepted(RING_THREAD, RING_TURN);
+  runtime.recordServerRequest("approval-retained-state", "item/fileChange/requestApproval", {
+    threadId: RING_THREAD, turnId: RING_TURN, itemId: "file-change",
+  });
+  appendRingDelta(runtime, 2);
+  appendRingFact(runtime, 3);
+  appendRingFact(runtime, 4);
+  const observed = runtime.observe(RING_THREAD, 0, 10)!;
+  assert.equal(observed.facts_lost, true);
+  assert.equal(observed.events.some((event) => event.method === "item/fileChange/requestApproval"), false);
+  assert.equal(observed.pending_requests.length, 1);
+  const pending = runtime.claimPending("approval-retained-state", {
+    threadId: RING_THREAD, turnId: RING_TURN, method: "item/fileChange/requestApproval",
+  });
+  assert.equal(pending.rawId, "approval-retained-state");
+  runtime.completePending(pending);
+  assert.deepEqual(runtime.pendingForThread(RING_THREAD), []);
+  assert.throws(() => runtime.claimPending("approval-retained-state", {
+    threadId: RING_THREAD, turnId: RING_TURN, method: "item/fileChange/requestApproval",
+  }), /No pending/);
+});
+
 test("sanitizer redacts obvious secrets and bounds strings", () => {
   const result = sanitizeForTransport(
     {
@@ -108,7 +346,10 @@ test("runtime ring uses monotonic cursors, scopes pending raw ids, and captures 
   });
   const observed = runtime.observe("thread-1", 0, 10)!;
   assert.equal(observed.cursor_lost, true);
-  assert.equal(observed.events.length, 2);
+  assert.equal(observed.facts_lost, true);
+  assert.equal(observed.stream_lost, false);
+  assert.equal(observed.events.length, 1);
+  assert.equal(observed.events[0]?.method, "turn/completed");
   assert.equal(observed.terminal?.final_result, "DONE");
   assert.equal(observed.runtime_status, "completed");
 });
@@ -174,6 +415,73 @@ test("streamed agent text stays unchanged under its bound and retains the tail o
     retained,
     `${"x".repeat(MAX_STREAMED_AGENT_TEXT_CHARS - conclusion.length)}${conclusion}`,
   );
+});
+
+test("terminal text tracks truncation once, partial source, message identity and exit redaction", () => {
+  for (const length of [48_000, 48_001, 60_024]) {
+    const runtime = new RuntimeStore(); runtime.markTurnAccepted("t", "u");
+    const text = "x".repeat(length);
+    runtime.recordNotification("item/completed", { threadId: "t", turnId: "u", completedAtMs: 1,
+      item: { id: "f", type: "agentMessage", phase: "final_answer", text } });
+    runtime.recordNotification("turn/completed", { threadId: "t", turn: { id: "u", status: "completed", items: [] } });
+    const terminal = runtime.observe("t", 0, 50)!.terminal!;
+    assert.equal(terminal.final_result, text.slice(0, 48_000));
+    assert.equal(terminal.final_result_meta!.observed_chars, length);
+    assert.equal(terminal.final_result_meta!.truncated, length > 48_000);
+    assert.equal(terminal.final_result_meta!.complete, length <= 48_000);
+  }
+  for (const startedItem of [false, true]) {
+    const runtime = new RuntimeStore(); runtime.markTurnAccepted("t", "u");
+    runtime.recordNotification("item/completed", { threadId: "t", turnId: "u", completedAtMs: 1,
+      item: { id: "comment", type: "agentMessage", phase: "commentary", text: "Running the migration now." } });
+    if (startedItem) runtime.recordNotification("item/started", { threadId: "t", turnId: "u", startedAtMs: 2,
+      item: { id: "f", type: "agentMessage", phase: "final_answer", text: "" } });
+    runtime.recordNotification("item/agentMessage/delta", { threadId: "t", turnId: "u", itemId: "f", delta: "Final: partial" });
+    runtime.recordNotification("turn/completed", { threadId: "t", turn: { id: "u", status: "interrupted", items: [] } });
+    const terminal = runtime.observe("t", 0, 50)!.terminal!;
+    assert.equal(terminal.final_result, "Final: partial");
+    assert.equal(terminal.final_result_meta!.source_complete, false);
+    assert.equal(terminal.final_result_meta!.truncated, false);
+    assert.equal(terminal.final_result_meta!.complete, false);
+    runtime.markTurnAccepted("t", "v");
+    runtime.recordNotification("item/agentMessage/delta", { threadId: "t", turnId: "v", itemId: "g", delta: "Bearer synthetic-fixture-only" });
+    runtime.markAppServerExited("fixture exit");
+    assert.equal(runtime.observe("t", 0, 50)!.terminal!.final_result, "Bearer [REDACTED]");
+    assert.equal(runtime.observe("t", 0, 50)!.terminal!.final_result_meta!.observed_chars, 29);
+  }
+});
+
+test("an agent message with only a start preserves the preceding final text", () => {
+  for (const status of ["completed", "interrupted"]) for (const emptyDelta of [false, true]) {
+    const runtime = new RuntimeStore(); runtime.markTurnAccepted("t", "u");
+    const text = "Done: 42/42 tests pass.";
+    runtime.recordNotification("item/completed", { threadId: "t", turnId: "u", completedAtMs: 1,
+      item: { id: "a", type: "agentMessage", phase: "final_answer", text } });
+    runtime.recordNotification("item/started", { threadId: "t", turnId: "u", startedAtMs: 2,
+      item: { id: "b", type: "agentMessage", phase: null, text: "" } });
+    if (emptyDelta) runtime.recordNotification("item/agentMessage/delta", {
+      threadId: "t", turnId: "u", itemId: "b", delta: "" });
+    runtime.recordNotification("turn/completed", { threadId: "t", turn: { id: "u", status, items: [] } });
+    const terminal = runtime.observe("t", 0, 50)!.terminal!;
+    assert.equal(terminal.status, status);
+    assert.equal(terminal.final_result, text);
+    assert.equal(terminal.final_result_meta!.complete, true);
+    assert.equal(terminal.final_result_meta!.observed_chars, text.length);
+  }
+});
+
+test("a new completed message replaces prior text even when its final text is empty", () => {
+  for (const text of ["New final", ""]) {
+    const runtime = new RuntimeStore(); runtime.markTurnAccepted("t", "u");
+    for (const [id, content] of [["a", "Prior message"], ["b", text]]) {
+      runtime.recordNotification("item/completed", { threadId: "t", turnId: "u", completedAtMs: 1,
+        item: { id, type: "agentMessage", phase: "final_answer", text: content } });
+    }
+    runtime.recordNotification("turn/completed", { threadId: "t", turn: { id: "u", status: "completed", items: [] } });
+    const terminal = runtime.observe("t", 0, 50)!.terminal!;
+    assert.equal(terminal.final_result, text);
+    assert.equal(terminal.final_result_meta!.complete, true);
+  }
 });
 
 test("pending app-server request ids preserve typed identity and cannot be replaced while responding", () => {
@@ -359,8 +667,15 @@ test("observe wait defaults to immediate and buffered events bypass waiting", as
   const immediate = await within(control.call("codex_observe", {
     thread_id: "thread-immediate",
     cursor: 0,
+    view: "raw",
   }));
-  assert.deepEqual((immediate as Record<string, unknown>).events, []);
+  assert.deepEqual(immediate, runtime.observe("thread-immediate", 0, 50));
+  assert.deepEqual(await within(control.call("codex_observe", {
+    thread_id: "thread-immediate",
+    cursor: 0,
+    wait_ms: 0,
+    view: "raw",
+  })), immediate);
 
   runtime.recordNotification("item/started", {
     threadId: "thread-immediate",
@@ -371,6 +686,7 @@ test("observe wait defaults to immediate and buffered events bypass waiting", as
     thread_id: "thread-immediate",
     cursor: 0,
     wait_ms: MAX_OBSERVE_WAIT_MS,
+    view: "raw",
   }));
   const events = (buffered as Record<string, unknown>).events as Array<Record<string, unknown>>;
   assert.equal(events.length, 1);
@@ -385,7 +701,7 @@ test("active observe wait wakes on an injected runtime event and otherwise times
   const waiting = control.call("codex_observe", {
     thread_id: "thread-wait",
     cursor: 0,
-    wait_ms: 1_000,
+    wait_ms: 120_000,
   });
   runtime.recordNotification("item/started", {
     threadId: "thread-wait",
@@ -406,7 +722,139 @@ test("active observe wait wakes on an injected runtime event and otherwise times
   const elapsed = performance.now() - startedAt;
   assert.ok(elapsed >= 25, `observe returned too early after ${elapsed.toFixed(1)} ms`);
   assert.ok(elapsed < 500, `observe exceeded its bounded deadline: ${elapsed.toFixed(1)} ms`);
-  assert.deepEqual((timedOut as Record<string, unknown>).events, []);
+  assert.deepEqual(timedOut, {
+    runtime_available: true,
+    runtime_status: "inProgress",
+    active_turn_id: "turn-wait",
+    next_cursor: runtime.currentCursor("thread-wait"),
+    no_change: true,
+  });
+});
+
+test("observe no-change deadlines omit seen output and preserve the continuation cursor", async () => {
+  const runtime = new RuntimeStore();
+  runtime.markTurnAccepted("thread-quiet", "turn-quiet");
+  runtime.recordNotification("item/completed", {
+    threadId: "thread-quiet",
+    turnId: "turn-quiet",
+    item: { type: "commandExecution", id: "seen-command", aggregatedOutput: "SEEN_OUTPUT" },
+  });
+  const control = controlFor(runtime);
+  const seen = await control.call("codex_observe", {
+    thread_id: "thread-quiet",
+    cursor: 0,
+    view: "raw",
+  }) as RuntimeObservation;
+  assert.match(JSON.stringify(seen), /SEEN_OUTPUT/);
+
+  for (let index = 0; index < 2; index += 1) {
+    const quiet = await within(control.call("codex_observe", {
+      thread_id: "thread-quiet",
+      cursor: seen.next_cursor,
+      wait_ms: 10,
+      view: "raw",
+    }));
+    assert.deepEqual(quiet, {
+      runtime_available: true,
+      runtime_status: "inProgress",
+      active_turn_id: "turn-quiet",
+      next_cursor: seen.next_cursor,
+      no_change: true,
+    });
+    assert.equal(runtime.currentCursor("thread-quiet"), seen.next_cursor);
+  }
+
+  const waiting = control.call("codex_observe", {
+    thread_id: "thread-quiet",
+    cursor: seen.next_cursor,
+    wait_ms: 40,
+    view: "raw",
+  });
+  runtime.recordNotification("item/commandExecution/outputDelta", {
+    threadId: "thread-quiet",
+    turnId: "turn-quiet",
+    itemId: "new-command",
+    delta: "NEW_OUTPUT",
+  });
+  const changed = await within(waiting);
+  assert.deepEqual(changed, runtime.observe("thread-quiet", seen.next_cursor, 50));
+  assert.match(JSON.stringify(changed), /NEW_OUTPUT/);
+  assert.doesNotMatch(JSON.stringify(changed), /SEEN_OUTPUT/);
+});
+
+test("observe waits preserve full snapshots on native and revision-only changes", async () => {
+  const changes: Array<{ name: string; mutate: (runtime: RuntimeStore) => void }> = [
+    {
+      name: "native status event",
+      mutate: (runtime) => runtime.recordNotification("thread/status/changed", {
+        threadId: "thread-change",
+        status: { type: "active" },
+      }),
+    },
+    {
+      name: "pending request",
+      mutate: (runtime) => runtime.recordServerRequest(7, "item/fileChange/requestApproval", {
+        threadId: "thread-change",
+        turnId: "turn-change",
+      }),
+    },
+    {
+      name: "terminal result",
+      mutate: (runtime) => runtime.recordNotification("turn/completed", {
+        threadId: "thread-change",
+        turn: {
+          id: "turn-change",
+          status: "completed",
+          items: [{ type: "agentMessage", text: "NEW_FINAL_OUTPUT" }],
+        },
+      }),
+    },
+    {
+      name: "turn accepted without a native event",
+      mutate: (runtime) => runtime.markTurnAccepted("thread-change", "turn-next"),
+    },
+    {
+      name: "app-server exit",
+      mutate: (runtime) => runtime.markAppServerExited("test exit"),
+    },
+  ];
+  for (const { name, mutate } of changes) {
+    const runtime = new RuntimeStore();
+    runtime.markTurnAccepted("thread-change", "turn-change");
+    const waiting = controlFor(runtime).call("codex_observe", {
+      thread_id: "thread-change",
+      cursor: 0,
+      wait_ms: 40,
+      view: "raw",
+    });
+    mutate(runtime);
+    assert.deepEqual(await within(waiting), runtime.observe("thread-change", 0, 50), name);
+  }
+});
+
+test("observe cursor recovery and buffered pagination retain full snapshots", async () => {
+  const runtime = new RuntimeStore(3);
+  runtime.markTurnAccepted("thread-cursors", "turn-cursors");
+  for (let index = 0; index < 3; index += 1) {
+    runtime.recordNotification("item/started", {
+      threadId: "thread-cursors",
+      turnId: "turn-cursors",
+      item: { type: "commandExecution", id: "command-" + index },
+    });
+  }
+  const control = controlFor(runtime);
+  for (const cursor of [0, 1]) {
+    const observed = await within(control.call("codex_observe", {
+      thread_id: "thread-cursors",
+      cursor,
+      limit: 1,
+      wait_ms: MAX_OBSERVE_WAIT_MS,
+      view: "raw",
+    }));
+    assert.deepEqual(observed, runtime.observe("thread-cursors", cursor, 1));
+    assert.equal((observed as RuntimeObservation).cursor_lost, cursor === 0);
+    assert.equal((observed as RuntimeObservation).has_more, true);
+  }
 });
 
 test("cancelling one same-thread observe wait leaves the other waiter intact", async () => {
@@ -485,8 +933,9 @@ test("observe wait handoff cannot lose a mutation between snapshot and registrat
   const observed = await within(
     runtime.observeWithWait("thread-handoff", 0, 10, 1_000),
   );
-  assert.equal(observed?.events.length, 1);
-  assert.equal(observed?.events[0]?.method, "item/started");
+  assert.ok(observed && "events" in observed);
+  assert.equal(observed.events.length, 1);
+  assert.equal(observed.events[0]?.method, "item/started");
 });
 
 test("completed, pending, inactive, and unavailable observe states do not wait", async () => {
@@ -540,29 +989,41 @@ test("completed, pending, inactive, and unavailable observe states do not wait",
 test("observe wait schema and validation preserve bounded optional semantics", async () => {
   const observeTool = TOOL_DEFINITIONS.find((tool) => tool.name === "codex_observe");
   const properties = (observeTool?.inputSchema.properties ?? {}) as Record<string, unknown>;
-  assert.deepEqual(properties.wait_ms, {
+  const { description: waitDescription, ...waitSchema } = properties.wait_ms as Record<string, unknown>;
+  assert.deepEqual(waitSchema, {
     type: "integer",
     minimum: 0,
-    maximum: MAX_OBSERVE_WAIT_MS,
+    maximum: 120_000,
     default: 0,
-    description:
-      "Optional per-call wait for the next live runtime change when nothing useful is ready; 0 returns immediately. This is event-driven waiting, not stall detection.",
   });
-  assert.match(observeTool?.description ?? "", /Optional wait_ms performs one bounded event-driven wait/);
-  assert.match(observeTool?.description ?? "", /absence of new command activity alone is not evidence of a stall/);
-  assert.match(observeTool?.description ?? "", /repeated bounded-wait observe calls until terminal.*one snapshot is inProgress/);
-  assert.match(observeTool?.description ?? "", /After every wake or deadline return, inspect the newly available events\/state.*before starting the next bounded wait/);
+  assert.match(String(waitDescription), /One bounded wait; 0 reads immediately/);
+  assert.match(String(waitDescription), /facts_lost, not stream_lost alone/);
+  assert.match(String(waitDescription), /not stall detection/);
+  assert.match(observeTool?.description ?? "", /wait_ms is one bounded wait/);
+  assert.match(observeTool?.description ?? "", /No command output alone does not mean stalled/);
+  const { description: viewDescription, ...viewSchema } = properties.view as Record<string, unknown>;
+  assert.deepEqual(viewSchema, {
+    type: "string",
+    enum: ["compact", "raw"],
+    default: "compact",
+  });
+  assert.match(String(viewDescription), /Raw shows retained sanitized events with possible cursor gaps/);
+  assert.match(String(viewDescription), /neither view restores evicted events/);
 
   const runtime = new RuntimeStore();
   runtime.ensureThread("thread-validation");
   const control = controlFor(runtime);
-  for (const waitMs of [-1, MAX_OBSERVE_WAIT_MS + 1, 1.5]) {
+  for (const waitMs of [-1, 120_001, 1.5]) {
     await assert.rejects(
       control.call("codex_observe", {
         thread_id: "thread-validation",
         wait_ms: waitMs,
       }),
-      /wait_ms must be an integer from 0 to 10000/,
+      /wait_ms must be an integer from 0 to 120000/,
+    );
+    await assert.rejects(
+      runtime.observeWithWait("thread-validation", undefined, 50, waitMs),
+      /wait_ms must be an integer from 0 to 120000/
     );
   }
   await within(control.call("codex_observe", {

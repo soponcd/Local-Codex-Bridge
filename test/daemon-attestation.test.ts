@@ -15,7 +15,7 @@ test('daemon acceptance requires two fresh nonces and three unchanged OS snapsho
   let calls = 0; const nonces: string[] = [];
   const proof = await api.verifyDaemon({ hashes: expected }, { snapshot: () => { calls++; return snapshot; }, challenge: async (_path: string, nonce: string) => { nonces.push(nonce); return response(nonce); } });
   assert.equal(calls, 3); assert.equal(new Set(nonces).size, 2);
-  assert.equal(proof.scope, 'tunnel_direct_bridge_daemon'); assert.equal(Object.keys(proof.loaded_sha256).length, 9);
+  assert.equal(proof.scope, 'tunnel_direct_bridge_daemon'); assert.equal(Object.keys(proof.loaded_sha256).length, 19);
 });
 for (const field of ['nonce', 'pid', 'uid', 'initial_ppid', 'start', 'root', 'hook_version', 'instance_id', 'extra', 'missing module', 'extra module', 'hash']) {
   test(`daemon rejects ${field}`, async () => {
@@ -75,7 +75,7 @@ test('daemon baseline failure stops deploy and rollback before backup, stage, bu
     await assert.rejects(rollback.rollback({ production: join(root, 'production'), backup: join(root, 'backup'), backup_baseline_sha256: sha(baseline), expected_current: hashes, changed: ['package.json'] }, ops), /Daemon loaded runtime proof/);
   } finally { rmSync(root, { recursive: true }); }
 });
-test('real preloaded Bridge captures nine loaded modules in memory; disk edits cannot alter attestation; stdout stays MCP', { skip: process.platform !== 'darwin' }, async () => {
+test('real preloaded Bridge captures the exact merged runtime inventory in memory; disk edits cannot alter attestation; stdout stays MCP', { skip: process.platform !== 'darwin' }, async () => {
   const root = mkdtempSync('/private/tmp/lcb-daemon-'), directory = join(root, 'ipc');
   mkdirSync(directory, { mode: 0o700 });
   const repository = fileURLToPath(new URL('../../', import.meta.url));
@@ -117,7 +117,9 @@ test('real preloaded Bridge captures nine loaded modules in memory; disk edits c
     assert.ok(spawnSync('/usr/sbin/lsof', ['-a', '-p', String(child.pid), '-U', '-Fn'], { encoding: 'utf8' }).stdout.split('\n').includes('n' + path));
     for (const line of stdout.trim().split('\n')) assert.equal(JSON.parse(line).jsonrpc, '2.0');
     const catalog = stdout.trim().split('\n').map(line => JSON.parse(line)).find(row => row.id === 2);
-    assert.equal(catalog.result.tools.length, 8);
+    assert.equal(catalog.result.tools.length, 12);
+    assert.equal(Object.keys(first.loaded_sha256).length, 19);
+    assert.deepEqual(Object.keys(first.loaded_sha256).sort(), api.MODULES.slice().sort());
     assert.equal(stderr, '');
     // This probe is not launched by the exact Tunnel and must not pass native binding.
     await assert.rejects(api.verifyDaemon({ root, hashes, agent: `gui/${process.getuid!()}/com.openai.tunnel-client.lcb-remote`, node: realpathSync(process.execPath), hook, directory, hook_sha256: sha(readFileSync(hook)), capture_sha256: sha(readFileSync(new URL('../../scripts/runtime-load-proof.mjs', import.meta.url))) }), /Bridge child|hook|Tunnel|identity|socket|directory/);

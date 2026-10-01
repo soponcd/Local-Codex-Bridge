@@ -177,6 +177,24 @@ test("latest_messages invalid values and list/read combinations reject before RP
   });
 });
 
+test("resume excludes hydrated turns and errors never retry without excludeTurns", async () => {
+  for (const fail of [false, true]) {
+    const manager = new StubAppServerManager((method, params) => {
+      if (method === "thread/resume") {
+        assert.deepEqual(params, { threadId: "thread-resume", excludeTurns: true });
+        if (fail) throw new Error("native resume rejected");
+        return { thread: { id: "thread-resume", turns: [] } };
+      }
+      if (method === "turn/start") return { turn: { id: "turn-next", status: "inProgress" } };
+      throw new Error(`unexpected ${method}`);
+    });
+    const result = new ControlSurface(manager).call("codex_turn", { thread_id: "thread-resume", text: "continue" });
+    if (fail) await assert.rejects(result, /native resume rejected/);
+    else await result;
+    assert.deepEqual(manager.requests.map(request => request.method), fail ? ["thread/resume"] : ["thread/resume", "turn/start"]);
+  }
+});
+
 test("codex_turn forwards each requested raw sandbox and the exact returned native policy", async (t) => {
   const cases = [
     {
@@ -276,6 +294,7 @@ test("codex_turn uses the newly resolved policy when the same thread changes san
   assert.strictEqual(object(manager.requests[1]?.params).sandboxPolicy, workspacePolicy);
   assert.deepEqual(object(manager.requests[2]?.params), {
     threadId: "thread-shared",
+    excludeTurns: true,
     sandbox: "read-only",
   });
   assert.strictEqual(object(manager.requests[3]?.params).sandboxPolicy, readOnlyPolicy);
