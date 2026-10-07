@@ -1,0 +1,10 @@
+model = "gpt-6-astra"
+model_reasoning_effort = "low"
+
+[models.new_thread]
+model = "gpt-6-astra"
+model_reasoning_effort = "low"
+
+[agents]
+default_subagent_model = "gpt-6-luna"
+default_subagent_reasoning_effort = "medium"

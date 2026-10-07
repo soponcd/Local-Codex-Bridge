@@ -411,3 +411,7 @@ CHANGELOG records released engineering changes.
 Do not make one file carry all four roles.
 
 When public behavior changes, update the smallest set of documents that actually owns that information. Avoid copying unstable protocol detail into README or AGENTS when a durable invariant plus a pointer to `PROTOCOL-ASSUMPTIONS.md` is sufficient.
+
+<!-- AGILITE:START -->
+项目使用 .agilite/policy.md 中固定版本的 AGILite 规则。当前用户授权优先；默认单写者；恢复与完成请通过同一 Git common-dir 中的 TaskStore CLI 读回证据。新增资产、模块或功能在编码/claim 前先按 $find-wheel Phase 1 查现成方案并绑定记录。涉及UI时使用 .agilite/ui-workflow.md，先确认目标、环境/产品形态及结构树/核心流程，随后选栈与表达。技术架构与真实UI实现/验收引用该文档#ui-four-layers单一规则源。
+<!-- AGILITE:END -->
