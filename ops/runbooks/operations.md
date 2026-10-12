@@ -18,6 +18,14 @@ OPERATION 为 `--verify`、`--check`、`--deploy` 或 `--rollback CONTRACT.json`
 运行证明必须包含实际模块 SHA-256、wrapper 子进程身份、Tunnel PID变化、MCP initialize/8 tools/codex_models 和真实远程路由。`probe_loaded_runtime` 仅证明验证器启动的短命 wrapper 所加载字节，不能提升为 Tunnel 长驻 Bridge 的 loaded-instance claim；后者须独立 `daemon_loaded_runtime` 证明。
 自动安装的额外历史验证目前需要显式 `LCB_ALLOW_HISTORY_VERIFICATION=1`、`LCB_TEST_HISTORY_ID`、`LCB_TEST_HISTORY_FILE`，且先批准专用隔离 fixture；没有配置会 fail-closed 并回滚。
 
+### 已有 ChatGPT 插件包的版本同步
+
+如果本次发布维护了现有 ChatGPT 插件目录条目，先以安装包版本和长驻 Bridge 的 `daemon_loaded_runtime` 证明共同确定已部署版本；两者不一致时先停止版本同步并查明目标，不以源码候选或计划版本替代实际运行版本。MCP `initialize.serverInfo.version` 描述服务端版本；插件目录显示的包版本来自插件 manifest 的 `version`，二者分别核对。
+
+在已授权的发布范围内，使用该条目的现有管理入口下载当前 ZIP 留作回退证据，仅修改 `.codex-plugin/plugin.json` 中的 `version` 为已核实的安装且已加载版本，然后从原条目上传新插件包。保留原插件身份、`.app.json` / app ID 绑定、其余 manifest 字段、连接和工具配置；不得删除重建条目或重连。工具扫描/刷新不更新插件包版本，也不能代替此步骤。
+
+上传后从管理页读回目标版本，并核实原 app ID 绑定及现有连接仍在；保存上传包摘要与页面读回截图或等效证据，作为独立的目录同步验收。只有页面显示该版本可用时才记为同步完成；若上传、审核、发布或读回未完成，将目录版本同步标为 `pending`，整体 release 标为未完整，但仍按独立的部署回执和 loaded-instance 证明如实报告已安装及 runtime effective。回滚后按同一规则使用最终实际安装且已证明加载的版本；若平台不接受该版本，保留 `pending`，不得虚报目录同步。
+
 ## 只读健康与正常启动
 
 正常启动依外部 LaunchAgent；本项目不安装、替换或修改现有 Tunnel profile。
